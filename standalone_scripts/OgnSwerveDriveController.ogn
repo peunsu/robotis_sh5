@@ -1,0 +1,99 @@
+{
+    "SwerveDriveController": {
+        "version": 1,
+        "description": "Swerve Drive Controller for omnidirectional robots with independently steerable wheels",
+        "language": "Python",
+        "categories": {
+            "isaacWheeledRobots": "robot controller inside Isaac Sim"
+        },
+        "metadata": {
+            "uiName": "Swerve Drive Controller"
+        },
+        "$comment": "Calculating the desired wheel steering angles and drive speeds when given a desired vehicle velocity.",
+        "inputs": {
+            "execIn": {
+                "type": "execution",
+                "description": "The input execution"
+            },
+            "wheelRadius": {
+                "type": "double[]",
+                "description": "An array of wheel radius in meters (one per wheel module)"
+            },
+            "wheelPositions": {
+                "type": "double[3][]",
+                "description": "Position of each wheel module with respect to chassis center of mass in meters [x, y, z]"
+            },
+            "wheelBaseLength": {
+                "type": "double",
+                "description": "Distance between front and rear axles in meters",
+                "default": 1.0
+            },
+            "wheelBaseWidth": {
+                "type": "double",
+                "description": "Distance between left and right wheels in meters",
+                "default": 1.0
+            },
+            "upAxis": {
+                "type": "double[3]",
+                "description": "The up axis of the vehicle",
+                "default": [0.0, 0.0, 1.0]
+            },
+            "inputVelocity": {
+                "type": "double[3]", 
+                "description": "Velocity command: [vx (m/s), vy (m/s), omega (rad/s)]",
+                "metadata": {
+                    "uiName": "Velocity Commands for the vehicle"
+                }
+            },
+            "maxLinearSpeed": {
+                "type": "double",
+                "description": "Maximum linear speed allowed for the vehicle in m/s",
+                "optional": true,
+                "default": 100000
+            },
+            "maxAngularSpeed": {
+                "type": "double",
+                "description": "Maximum angular rotation speed allowed for the vehicle in rad/s",
+                "optional": true,
+                "default": 100000               
+            },
+            "maxWheelSpeed": {
+                "type": "double",
+                "description": "Maximum rotation speed allowed for the drive wheels in rad/s",
+                "optional": true,
+                "default": 100000
+            },
+            "maxSteeringSpeed": {
+                "type": "double",
+                "description": "Maximum steering angular velocity in rad/s",
+                "optional": true,
+                "default": 10.0
+            },
+            "linearGain": {
+                "type": "double",
+                "description": "Linear velocity gain",
+                "default": 1.0
+            },
+            "angularGain": {
+                "type": "double",
+                "description": "Angular velocity gain",
+                "default": 1.0
+            },
+            "optimizeSteeringAngles": {
+                "type": "bool",
+                "description": "Optimize steering angles to minimize rotation (flip wheel direction if needed)",
+                "default": true
+            }
+        },
+        "outputs": {
+            "driveVelocityCommand": {
+                "type": "double[]",
+                "description": "Drive velocity commands for the wheel joints in rad/s"
+            },
+            "steeringAngleCommand": {
+                "type": "double[]",
+                "description": "Steering angle commands for the steering joints in radians"
+            }
+        }
+    }
+}
