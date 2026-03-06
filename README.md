@@ -1,4 +1,4 @@
-# Template for Isaac Lab Projects
+# robotis_sh5
 
 ## Overview
 
@@ -133,3 +133,8 @@ Some examples of packages that can likely be excluded are:
 "<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
 ...
 ```
+
+## Acknowledgement
+- [Isaac Lab](https://github.com/isaac-sim/IsaacLab)
+- [robotis_lab](https://github.com/ROBOTIS-GIT/robotis_lab)
+- [ai_worker (feature-sh5-release)](https://github.com/ROBOTIS-GIT/ai_worker/tree/feature-sh5-release)
