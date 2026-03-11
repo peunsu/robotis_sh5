@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import math
 import torch
 
 if TYPE_CHECKING:
@@ -53,28 +54,35 @@ def reset_goal_position(env: ManagerBasedRLEnv, env_ids: torch.Tensor, pos_range
     # 위치 적용 (indices가 위치 개수와 맞아야 함)
     view.set_world_poses(positions=random_pos, indices=indices)
 
-def reset_root_at_random_pos_2d(env: ManagerBasedRLEnv, env_ids: torch.Tensor, pos_range: dict, yaw_range: tuple):
-    """에피소드 리셋 시 로봇을 2D 평면 상의 랜덤한 위치와 방향으로 배치."""
+def reset_root_around_goal_2d(
+    env: ManagerBasedRLEnv, 
+    env_ids: torch.Tensor, 
+    min_dist: float = 1.0, 
+    max_dist: float = 4.0, 
+    yaw_range: tuple = (-math.pi, math.pi)
+):
     num_resets = len(env_ids)
     if num_resets == 0: return
 
-    # 위치 랜덤 샘플링 (x, y)
-    ranges = [
-        (pos_range["x"][0], pos_range["x"][1]),
-        (pos_range["y"][0], pos_range["y"][1]),
-    ]
-    random_pos = torch.zeros((num_resets, 3), device=env.device)
-    for i in range(2):
-        random_pos[:, i] = torch.rand(num_resets, device=env.device) * (ranges[i][1] - ranges[i][0]) + ranges[i][0]
-    random_pos[:, 2] = 0.1 # 지면 높이
-
-    # 방향(Yaw) 랜덤 샘플링
-    random_yaw = torch.rand(num_resets, device=env.device) * (yaw_range[1] - yaw_range[0]) + yaw_range[0]
+    # 1. 로컬 좌표계에서의 랜덤 위치 계산 (원점 기준)
+    r = torch.sqrt(torch.rand(num_resets, device=env.device) * (max_dist**2 - min_dist**2) + min_dist**2)
+    theta = torch.rand(num_resets, device=env.device) * 2 * math.pi
     
-    # 쿼터니언으로 변환 (간단한 yaw-to-quat 수식 적용)
+    local_pos = torch.zeros((num_resets, 3), device=env.device)
+    local_pos[:, 0] = r * torch.cos(theta)
+    local_pos[:, 1] = r * torch.sin(theta)
+    local_pos[:, 2] = 0.1 
+
+    # --- 핵심 수정 사항: 각 환경의 월드 원점 더하기 ---
+    # env.scene.env_origins는 각 환경 인덱스에 해당하는 월드 좌표상의 원점을 가지고 있어.
+    env_origins = env.scene.env_origins[env_ids]
+    world_pos = local_pos + env_origins # 로컬 랜덤 위치를 월드 위치로 변환
+
+    # 2. 방향(Yaw) 계산
+    random_yaw = torch.rand(num_resets, device=env.device) * (yaw_range[1] - yaw_range[0]) + yaw_range[0]
     random_quat = torch.zeros((num_resets, 4), device=env.device)
     random_quat[:, 0] = torch.cos(random_yaw / 2)
     random_quat[:, 3] = torch.sin(random_yaw / 2)
 
-    # 로봇의 물리 상태 업데이트
-    env.scene["robot"].write_root_pose_to_sim(torch.cat([random_pos, random_quat], dim=-1), env_ids)
+    # 3. 월드 좌표계 기준으로 포즈 업데이트
+    env.scene["robot"].write_root_pose_to_sim(torch.cat([world_pos, random_quat], dim=-1), env_ids)

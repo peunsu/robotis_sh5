@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.utils.math import quat_apply_inverse
+from isaaclab.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -17,12 +18,19 @@ if TYPE_CHECKING:
 ##
 # 종료 조건 (Terminations) 구현
 ##
-def root_pos_distance_from_origin(env: ManagerBasedRLEnv, threshold: float) -> torch.Tensor:
-    """원점으로부터의 거리가 threshold를 넘으면 종료."""
-    # 로봇의 위치 (x, y, z)
-    pos = env.scene["robot"].data.root_pos_w
-    # 평면 거리 계산 (x, y 만 사용)
-    distance = torch.norm(pos[:, :2], dim=-1)
+def root_pos_distance_from_env_origin(env: ManagerBasedRLEnv, threshold: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    """로봇이 자기 환경의 원점으로부터 일정 거리 이상 멀어지면 종료."""
+    # 1. 로봇의 현재 월드 위치 (x, y, z)
+    asset = env.scene[asset_cfg.name]
+    robot_world_pos = asset.data.root_pos_w[:, :2] # x, y만 사용
+    
+    # 2. 각 환경의 월드 원점 위치
+    env_origins = env.scene.env_origins[:, :2] # x, y만 사용
+    
+    # 3. 환경 원점으로부터의 상대 거리 계산
+    distance = torch.norm(robot_world_pos - env_origins, dim=-1)
+    
+    # 4. 문턱값(threshold)을 넘었는지 판단
     return distance > threshold
 
 def is_near_goal(env: ManagerBasedRLEnv, threshold: float):

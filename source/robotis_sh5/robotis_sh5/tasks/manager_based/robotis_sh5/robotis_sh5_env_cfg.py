@@ -14,7 +14,6 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
@@ -76,11 +75,12 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
 
     # Goal Marker (Visual only)
     goal_marker = AssetBaseCfg(
-        prim_path="/World/Visuals/Goal",
+        prim_path="{ENV_REGEX_NS}/Goal", 
         spawn=sim_utils.SphereCfg(
             radius=0.15, 
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
         ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)), # 중앙 고정
     )
     
     # lights
@@ -145,23 +145,24 @@ class EventCfg:
     
     # 로봇 위치 리셋 (중앙 부근 랜덤)
     reset_robot_position = EventTerm(
-        func=mdp.reset_root_at_random_pos_2d,
+        func=mdp.reset_root_around_goal_2d,
         mode="reset",
         params={
-            "pos_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
+            "min_dist": 1.0,
+            "max_dist": 2.0,
             "yaw_range": (-math.pi, math.pi),
         },
     )
 
     # 목표 지점 위치 리셋 (랜덤한 곳으로 이동)
-    reset_goal_position = EventTerm(
-        func=mdp.reset_goal_position,
-        mode="reset",
-        params={
-            "asset_name": "goal_marker", # 함수 인자 이름과 같아야 함
-            "pos_range": {"x": (-5.0, 5.0), "y": (-5.0, 5.0)},
-        },
-    )
+    # reset_goal_position = EventTerm(
+    #     func=mdp.reset_goal_position,
+    #     mode="reset",
+    #     params={
+    #         "asset_name": "goal_marker", # 함수 인자 이름과 같아야 함
+    #         "pos_range": {"x": (-5.0, 5.0), "y": (-5.0, 5.0)},
+    #     },
+    # )
 
 
 @configclass
@@ -220,10 +221,10 @@ class TerminationsCfg:
     )
 
     # 3. 맵 밖으로 너무 멀리 나갔을 때 (Out of Bounds)
-    # 중앙(0,0)에서 반경 10m 이상 벗어나면 리셋
+    # 중앙(0,0)에서 반경 2m 이상 벗어나면 리셋
     out_of_track = DoneTerm(
-        func=mdp.root_pos_distance_from_origin,
-        params={"threshold": 10.0}
+        func=mdp.root_pos_distance_from_env_origin,
+        params={"threshold": 2.0}
     )
 
     # 4. 목표 도달 성공 (성공 리셋)
