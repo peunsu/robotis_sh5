@@ -41,7 +41,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     
     # ground plane
     ground = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/ground",
+        prim_path="World/ground",
         spawn=sim_utils.GroundPlaneCfg(),
     )
 
@@ -87,7 +87,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     
     # lights
     dome_light = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/DomeLight",
+        prim_path="World/DomeLight",
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
     )
 
