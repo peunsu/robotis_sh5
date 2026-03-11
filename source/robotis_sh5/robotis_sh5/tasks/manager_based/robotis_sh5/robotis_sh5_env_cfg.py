@@ -167,42 +167,53 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
+    """경험적으로 최적화된 Swerve Reach Task 가중치 구성"""
 
-    ## --- Task Rewards (잘하면 주는 상) ---
-    # 1. 목표와의 거리 기반 (Exponential이 Linear보다 학습 초기에 수렴이 빨라)
+    # --- [1. Primary Task: 목표 도달] ---
+    # 가장 높은 비중을 두되, 학습 전반에 걸쳐 일관된 가이드를 제공
     reaching_goal = RewTerm(
         func=mdp.goal_distance_reward, 
-        weight=2.0,
-        params={"std": 0.5} # 거리에 따른 감쇄 정도 조절
+        weight=2.5,  # 20.0 -> 2.5로 하향 (안정적 수렴 유도)
+        params={"std": 1.0} 
     )
     
-    # 2. 목표 도달 보너스 (충분히 가까워졌을 때 한 번에 크게!)
+    # 목표 도달 성공 시 보너스 (종료 시 1회성)
+    # 너무 크면 '도박'을 하고, 너무 작으면 목표를 무시함. 10.0 정도가 적당해.
     target_reached_bonus = RewTerm(
-        func=mdp.is_terminated, 
-        weight=50.0
+        func=mdp.is_near_goal, # 별도 성공 체크 함수 사용 권장
+        weight=10.0 
     )
 
-    # --- Constraint & Penalty (못하면 주는 벌) ---
-    # 3. 넘어짐 방지 (Orientation Penalty)
-    # 로봇의 Up-vector(z축)가 하늘을 보지 않으면 페널티
+    # --- [2. Shaping: 주행 가이드] ---
+    # Swerve의 장점을 살리기 위해 방향 정렬은 '힌트' 정도로만 제공
+    heading_alignment = RewTerm(
+        func=mdp.heading_alignment_reward,
+        weight=0.2  # 5.0 -> 0.2로 대폭 하향 (옆으로 가는 기동 허용)
+    )
+
+    # 생존 보상: 로봇이 죽지 않고 탐험하도록 유도 (상수값)
+    alive = RewTerm(func=mdp.is_alive, weight=0.5)
+
+    # --- [3. Regularization: 안정성 및 에너지 효율] ---
+    # 이 항목들은 보상 총합을 갉아먹지 않을 정도로 미세하게 설정 (0.01 ~ 1.0)
+    
+    # 넘어짐 페널티: 로봇이 서 있는 것의 가치를 목표만큼 중요하게 설정
     tilt_penalty = RewTerm(
         func=mdp.base_orientation_l2,
-        weight=-1.0,
-        params={"target_quat": (1.0, 0.0, 0.0, 0.0)} # 똑바로 서 있는 상태
+        weight=-1.0, # 밸런스 유지
+        params={"target_quat": (1.0, 0.0, 0.0, 0.0)}
     )
 
-    # 4. 급격한 제어 입력 페널티 (모터 보호 및 부드러운 주행)
+    # 조인트 한계 페널티: '벽'에 부딪히는 느낌만 주도록 설정
+    joint_limit_penalty = RewTerm(
+        func=mdp.joint_limits_penalty_l2,
+        weight=-1.0 
+    )
+
+    # 부드러운 제어: 하드웨어 진동 방지 (가장 작은 가중치)
     action_rate = RewTerm(
         func=mdp.action_rate_l2, 
-        weight=-0.05
-    )
-
-    # 5. 조인트 한계 임계점 페널티
-    # Steer 각도가 물리적 한계에 가까워지면 페널티를 줘서 무리한 조향 방지
-    joint_limit_penalty = RewTerm(
-        func=mdp.joint_pos_limits,
-        weight=-0.1,
+        weight=-0.01 
     )
 
 
@@ -217,7 +228,7 @@ class TerminationsCfg:
     # 예: 로봇의 z축과 세계 좌표 z축 사이의 각도가 45도 이상 벌어지면 종료
     robot_fell = DoneTerm(
         func=mdp.bad_orientation,
-        params={"threshold": 0.7} # cos(45도) 정도의 값으로 튜닝 필요
+        params={"threshold": 0.5} # cos(45도) 정도의 값으로 튜닝 필요
     )
 
     # 3. 맵 밖으로 너무 멀리 나갔을 때 (Out of Bounds)

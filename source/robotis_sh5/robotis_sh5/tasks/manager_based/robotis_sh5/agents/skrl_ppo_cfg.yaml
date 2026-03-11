@@ -11,11 +11,11 @@ models:
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: 0.5
+    initial_log_std: 0.0
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [512, 256, 128]
+        layers: [512, 512, 256]
         activations: elu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [512, 256, 128]
+        layers: [512, 512, 256]
         activations: elu
     output: ONE
 
@@ -48,7 +48,7 @@ agent:
   learning_rate: 5.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.01
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
@@ -68,8 +68,9 @@ agent:
   experiment:
     directory: "robotis_sh5_reach"
     experiment_name: "swerve_v1"
-    write_interval: auto
-    checkpoint_interval: auto
+    write_interval: 50
+    checkpoint_interval: 200
+    wandb: False
 
 
 # Sequential trainer

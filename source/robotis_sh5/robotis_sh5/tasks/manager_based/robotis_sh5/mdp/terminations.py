@@ -4,53 +4,43 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 import torch
-
-from isaaclab.utils.math import quat_apply_inverse
-from isaaclab.managers import SceneEntityCfg
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-##
-# 종료 조건 (Terminations) 구현
-##
-def root_pos_distance_from_env_origin(env: ManagerBasedRLEnv, threshold: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
-    """로봇이 자기 환경의 원점으로부터 일정 거리 이상 멀어지면 종료."""
-    # 1. 로봇의 현재 월드 위치 (x, y, z)
-    asset = env.scene[asset_cfg.name]
-    robot_world_pos = asset.data.root_pos_w[:, :2] # x, y만 사용
-    
-    # 2. 각 환경의 월드 원점 위치
-    env_origins = env.scene.env_origins[:, :2] # x, y만 사용
-    
-    # 3. 환경 원점으로부터의 상대 거리 계산
-    distance = torch.norm(robot_world_pos - env_origins, dim=-1)
-    
-    # 4. 문턱값(threshold)을 넘었는지 판단
-    return distance > threshold
-
-def is_near_goal(env: ManagerBasedRLEnv, threshold: float):
-    """로봇이 목표 지점에 충분히 가까워졌는지 확인 (종료 조건 용)."""
-    # 로봇 위치 (Articulation이라서 .data 사용 가능)
+def is_near_goal(env: ManagerBasedRLEnv, threshold: float = 0.2) -> torch.Tensor:
+    """로봇이 목표 지점의 임계치 안에 들어왔는지 확인 (성공 종료)"""
+    # 로봇 현재 위치 (XY)
     robot_pos_w = env.scene["robot"].data.root_pos_w[:, :2]
     
-    # --- 수정 부분 ---
-    # goal_marker가 XformPrimView이므로 .get_world_poses() 사용
+    # 목표 지점 위치 (XY)
     goal_pos_w, _ = env.scene["goal_marker"].get_world_poses()
     goal_pos_w = goal_pos_w[:, :2]
     
-    # 거리 계산 후 threshold 이내인지 확인
+    # 거리 계산
     distance = torch.norm(goal_pos_w - robot_pos_w, dim=-1)
+    
+    # 임계치 이내이면 True 반환
     return distance < threshold
 
 def bad_orientation(env: ManagerBasedRLEnv, threshold: float = 0.5) -> torch.Tensor:
-    """로봇이 일정 각도 이상 기울어졌는지 판단 (넘어짐 종료)."""
-    up_v = torch.tensor([0.0, 0.0, 1.0], device=env.device).repeat(env.num_envs, 1)
-    robot_up_v = quat_apply_inverse(env.scene["robot"].data.root_quat_w, up_v)
+    """
+    로봇의 몸체가 일정 각도 이상 기울어졌는지 확인.
     
-    # z성분이 threshold(cos(angle))보다 낮으면 너무 많이 기울어진 것
-    return robot_up_v[:, 2] < threshold
+    - projected_gravity_b[:, 2]는 로봇의 상단(Z)축과 중력 방향의 일치도를 나타냄.
+    - 1.0: 수직으로 잘 서 있음
+    - 0.0: 90도로 완전히 누움
+    - threshold 0.5는 약 60도 정도의 기울기를 의미함 (cos(60°) = 0.5)
+    """
+    # 불필요한 up_proj, z_axis 변수를 제거하고 바로 계산
+    return env.scene["robot"].data.projected_gravity_b[:, 2] < threshold
+
+def root_pos_distance_from_env_origin(env: ManagerBasedRLEnv, threshold: float = 4.5) -> torch.Tensor:
+    """로봇이 환경 원점으로부터 너무 멀리 벗어났는지 확인"""
+    # 환경 원점 대비 상대 위치 (Local Pos)
+    relative_pos = env.scene["robot"].data.root_pos_w - env.scene.env_origins
+    distance = torch.norm(relative_pos[:, :2], dim=-1)
+    
+    return distance > threshold
