@@ -7,7 +7,7 @@ import math
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, VisualObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -32,8 +32,6 @@ from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
 # Scene definition
 ##
 
-current_script_path = os.path.dirname(os.path.abspath(__file__))
-
 
 @configclass
 class RobotisSh5SceneCfg(InteractiveSceneCfg):
@@ -49,7 +47,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{current_script_path}/../../../../data/robots/FFW/FFW_SH5.usd",
+            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5.usd",
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False,
                 solver_position_iteration_count=8,
@@ -77,8 +75,8 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     )
 
     # Goal Marker (Visual only)
-    goal_marker = VisualObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Goal",
+    goal_marker = AssetBaseCfg(
+        prim_path="/World/Visuals/Goal",
         spawn=sim_utils.SphereCfg(
             radius=0.15, 
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
