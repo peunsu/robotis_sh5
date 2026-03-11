@@ -41,7 +41,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     
     # ground plane
     ground = AssetBaseCfg(
-        prim_path="/World/ground",
+        prim_path="{ENV_REGEX_NS}/ground",
         spawn=sim_utils.GroundPlaneCfg(),
     )
 
@@ -78,7 +78,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
 
     # Goal Marker (Visual only)
     goal_marker = AssetBaseCfg(
-        prim_path="/World/Visuals/Goal",
+        prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.SphereCfg(
             radius=0.15, 
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
@@ -87,7 +87,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     
     # lights
     dome_light = AssetBaseCfg(
-        prim_path="/World/DomeLight",
+        prim_path="{ENV_REGEX_NS}/DomeLight",
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
     )
 
