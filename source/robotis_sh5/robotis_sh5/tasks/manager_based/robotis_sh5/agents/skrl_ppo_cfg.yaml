@@ -68,8 +68,8 @@ agent:
   experiment:
     directory: "robotis_sh5_reach"
     experiment_name: "swerve_v1"
-    write_interval: 50
-    checkpoint_interval: 200
+    write_interval: 100
+    checkpoint_interval: 1000
     wandb: False
 
 
