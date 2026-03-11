@@ -6,6 +6,7 @@ from isaacsim import SimulationApp
 # 1. 앱 초기화 (렌더링 설정)
 simulation_app = SimulationApp({"headless": False})
 
+import os
 import omni.kit.commands
 import omni.ui as ui
 import numpy as np
@@ -112,9 +113,11 @@ class SwerveApp:
         self._world = World(stage_units_in_meters=1.0)
         self._world.scene.add_default_ground_plane()
         
+        current_script_path = os.path.dirname(os.path.abspath(__file__))
+        
         self._robot_name = "FFW_SH5"
         self._robot_prim_path = f"/World/{self._robot_name}/base_link"
-        self._robot_asset_path = f"C:/Users/peuns/Downloads/{self._robot_name}.usd"
+        self._robot_asset_path = f"{current_script_path}/../source/robotis_sh5/data/robots/FFW/FFW_SH5.usd"
         
         self._command = np.zeros(3)
         self._speed = 0.5
