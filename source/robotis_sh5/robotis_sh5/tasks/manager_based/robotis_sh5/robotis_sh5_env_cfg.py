@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
+import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -31,11 +32,13 @@ from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
 # Scene definition
 ##
 
+current_script_path = os.path.dirname(os.path.abspath(__file__))
+
 
 @configclass
 class RobotisSh5SceneCfg(InteractiveSceneCfg):
     """Configuration for a cart-pole scene."""
-
+    
     # ground plane
     ground = AssetBaseCfg(
         prim_path="/World/ground",
@@ -46,7 +49,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path="C:/Users/peuns/Downloads/FFW_SH5.usd",
+            usd_path=f"{current_script_path}/../../../../data/robots/FFW/FFW_SH5.usd",
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False,
                 solver_position_iteration_count=8,
