@@ -7,7 +7,7 @@ import math
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, VisualObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -77,7 +77,7 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
     )
 
     # Goal Marker (Visual only)
-    goal_marker = AssetBaseCfg(
+    goal_marker = VisualObjectCfg(
         prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.SphereCfg(
             radius=0.15, 
