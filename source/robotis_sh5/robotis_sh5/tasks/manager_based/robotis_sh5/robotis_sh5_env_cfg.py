@@ -95,22 +95,33 @@ class RobotisSh5SceneCfg(InteractiveSceneCfg):
 ##
 
 
+# @configclass
+# class ActionsCfg:
+#     """Action specifications for the MDP."""
+
+#     # 조향(Steer) 조인트 제어 (3개)
+#     steer_pos = mdp.JointPositionActionCfg(
+#         asset_name="robot", 
+#         joint_names=[".*_steer"], 
+#         scale=1.0
+#     )
+    
+#     # 구동(Drive) 조인트 제어 (3개)
+#     drive_vel = mdp.JointVelocityActionCfg(
+#         asset_name="robot", 
+#         joint_names=[".*_drive"], 
+#         scale=2.0
+#     )
+
 @configclass
 class ActionsCfg:
-    """Action specifications for the MDP."""
+    """Swerve Drive 베이스 제어 전용 액션 설정"""
 
-    # 조향(Steer) 조인트 제어 (3개)
-    steer_pos = mdp.JointPositionActionCfg(
-        asset_name="robot", 
-        joint_names=[".*_steer"], 
-        scale=1.0
-    )
-    
-    # 구동(Drive) 조인트 제어 (3개)
-    drive_vel = mdp.JointVelocityActionCfg(
-        asset_name="robot", 
-        joint_names=[".*_drive"], 
-        scale=10.0
+    # 에이전트는 [vx, vy, w] 총 3차원의 액션을 출력함
+    base_velocity = mdp.SwerveDriveActionCfg(
+        asset_name="robot",
+        joint_names=[".*_steer", ".*_drive"],
+        scale=(1.0, 1.0, 2.0)  # vx, vy 스케일은 1.0, 회전(w) 스케일은 2.0
     )
 
 
@@ -122,13 +133,15 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
-        # 로봇의 현재 상태
+        # 1. 조인트 상태 (Position & Velocity)
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        
+        # 2. 로봇 베이스의 선속도 및 각속도
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         
-        # 목표 지점까지의 상대적 위치 (mdp 폴더에 구현 필요)
+        # 4. 목표 지점까지의 상대적 위치
         rel_goal_pos = ObsTerm(func=mdp.get_rel_pos_to_goal)
 
         def __post_init__(self) -> None:
@@ -173,26 +186,29 @@ class RewardsCfg:
     # 가장 높은 비중을 두되, 학습 전반에 걸쳐 일관된 가이드를 제공
     reaching_goal = RewTerm(
         func=mdp.goal_distance_reward, 
-        weight=2.5,  # 20.0 -> 2.5로 하향 (안정적 수렴 유도)
-        params={"std": 1.0} 
+        weight=50.0,
+        params={"std": 0.5} 
     )
     
     # 목표 도달 성공 시 보너스 (종료 시 1회성)
     # 너무 크면 '도박'을 하고, 너무 작으면 목표를 무시함. 10.0 정도가 적당해.
     target_reached_bonus = RewTerm(
         func=mdp.is_near_goal, # 별도 성공 체크 함수 사용 권장
-        weight=10.0 
+        weight=50.0 
     )
 
     # --- [2. Shaping: 주행 가이드] ---
     # Swerve의 장점을 살리기 위해 방향 정렬은 '힌트' 정도로만 제공
     heading_alignment = RewTerm(
         func=mdp.heading_alignment_reward,
-        weight=0.2  # 5.0 -> 0.2로 대폭 하향 (옆으로 가는 기동 허용)
+        weight=1.0
     )
 
     # 생존 보상: 로봇이 죽지 않고 탐험하도록 유도 (상수값)
-    alive = RewTerm(func=mdp.is_alive, weight=0.5)
+    alive = RewTerm(func=mdp.is_alive, weight=1.0)
+    
+    # 종료 패널티
+    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
 
     # --- [3. Regularization: 안정성 및 에너지 효율] ---
     # 이 항목들은 보상 총합을 갉아먹지 않을 정도로 미세하게 설정 (0.01 ~ 1.0)
@@ -200,20 +216,30 @@ class RewardsCfg:
     # 넘어짐 페널티: 로봇이 서 있는 것의 가치를 목표만큼 중요하게 설정
     tilt_penalty = RewTerm(
         func=mdp.base_orientation_l2,
-        weight=-1.0, # 밸런스 유지
+        weight=-0.5, # 밸런스 유지
         params={"target_quat": (1.0, 0.0, 0.0, 0.0)}
     )
 
     # 조인트 한계 페널티: '벽'에 부딪히는 느낌만 주도록 설정
     joint_limit_penalty = RewTerm(
         func=mdp.joint_limits_penalty_l2,
-        weight=-1.0 
+        weight=-0.2
     )
 
     # 부드러운 제어: 하드웨어 진동 방지 (가장 작은 가중치)
     action_rate = RewTerm(
-        func=mdp.action_rate_l2, 
-        weight=-0.01 
+        func=mdp.action_rate_l2,
+        weight=-0.05
+    )
+    
+    # 몸체가 이동 중일 때 바퀴의 과도한 조향 회전 억제
+    steer_action_suppression = RewTerm(
+        func=mdp.steer_velocity_penalty_while_moving,
+        weight=-0.01,
+        params={
+            "asset_name": "robot",
+            "joint_name_expr": ".*_steer"  # 이름으로 알아서 찾아가게 함!
+        }
     )
 
 
@@ -235,7 +261,7 @@ class TerminationsCfg:
     # 중앙(0,0)에서 반경 2m 이상 벗어나면 리셋
     out_of_track = DoneTerm(
         func=mdp.root_pos_distance_from_env_origin,
-        params={"threshold": 2.0}
+        params={"threshold": 3.0}
     )
 
     # 4. 목표 도달 성공 (성공 리셋)

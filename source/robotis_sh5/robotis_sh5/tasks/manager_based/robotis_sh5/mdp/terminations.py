@@ -27,15 +27,12 @@ def is_near_goal(env: ManagerBasedRLEnv, threshold: float = 0.2) -> torch.Tensor
 
 def bad_orientation(env: ManagerBasedRLEnv, threshold: float = 0.5) -> torch.Tensor:
     """
-    로봇의 몸체가 일정 각도 이상 기울어졌는지 확인.
-    
-    - projected_gravity_b[:, 2]는 로봇의 상단(Z)축과 중력 방향의 일치도를 나타냄.
-    - 1.0: 수직으로 잘 서 있음
-    - 0.0: 90도로 완전히 누움
-    - threshold 0.5는 약 60도 정도의 기울기를 의미함 (cos(60°) = 0.5)
+    로봇이 일정 각도 이상 기울어지면 True 반환.
+    - 서 있을 때 projected_gravity_b[:, 2]는 -1.0에 가까움.
+    - threshold가 0.5라면, -0.5보다 커지는 순간(0.0에 가까워지는 순간) 리셋.
     """
-    # 불필요한 up_proj, z_axis 변수를 제거하고 바로 계산
-    return env.scene["robot"].data.projected_gravity_b[:, 2] < threshold
+    # 중력의 Z성분이 -0.5보다 크다 = 약 60도 이상 기울어졌다
+    return env.scene["robot"].data.projected_gravity_b[:, 2] > -threshold
 
 def root_pos_distance_from_env_origin(env: ManagerBasedRLEnv, threshold: float = 4.5) -> torch.Tensor:
     """로봇이 환경 원점으로부터 너무 멀리 벗어났는지 확인"""

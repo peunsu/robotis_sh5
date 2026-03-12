@@ -65,3 +65,21 @@ def joint_limits_penalty_l2(env: ManagerBasedRLEnv):
     
     # L2 Norm을 사용하여 한계를 많이 벗어날수록 페널티가 기하급수적으로 증가
     return torch.sum(torch.square(too_low + too_high), dim=-1)
+
+def steer_velocity_penalty_while_moving(env: ManagerBasedRLEnv, asset_name: str, joint_name_expr: str) -> torch.Tensor:
+    # 1. 로봇 에셋 가져오기
+    robot = env.scene[asset_name]
+    
+    # 2. 정규표현식(예: ".*_steer")으로 조향 조인트 인덱스 자동 추출
+    # 이 작업은 매 스텝 일어나지만, find_joints 결과는 캐싱되므로 성능 저하가 거의 없어.
+    steer_joint_ids, _ = robot.find_joints(joint_name_expr)
+    
+    # 3. 베이스 선속도 계산
+    base_lin_vel = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=-1)
+    
+    # 4. 조향 조인트 각속도 추출 (추출한 인덱스 활용)
+    steer_vels = torch.abs(robot.data.joint_vel[:, steer_joint_ids])
+    avg_steer_vel = torch.mean(steer_vels, dim=-1)
+    
+    # 5. 페널티 계산 (이동 중 조향 억제)
+    return base_lin_vel * avg_steer_vel
