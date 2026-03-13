@@ -17,72 +17,122 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 class SwerveDriveAction(ActionTerm):
+    """
+    Action term for controlling a swerve drive robot.
+    This term processes high-level velocity commands from the agent and translates them into joint position and velocity targets for the robot's steering and drive joints.
+    """
+    
     def __init__(self, cfg: SwerveDriveActionCfg, env: ManagerBasedRLEnv):
+        """
+        Initialize the SwerveDriveAction.
+
+        Args:
+            cfg (SwerveDriveActionCfg): The configuration for the swerve drive action term, including joint names and scaling factors.
+            env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
+        """
+        
         super().__init__(cfg, env)
         
-        # 1. 조인트 인덱스 추출
+        # Extract joint IDs for the steering and drive joints based on the provided joint name patterns in the configuration
         self.steer_joint_ids, _ = self._asset.find_joints(cfg.joint_names[0]) # ".*_steer"
         self.drive_joint_ids, _ = self._asset.find_joints(cfg.joint_names[1]) # ".*_drive"
         
-        # 2. Vectorized 컨트롤러 생성
-        # 이제 단 하나의 컨트롤러 인스턴스가 모든 환경을 한 번에 처리해.
+        # Initialize the swerve controller which will handle the kinematics and control logic for the swerve drive
         self.controller = SwerveController(num_envs=self.num_envs, device=self.device)
         
-        # 3. 설정 및 버퍼
+        # Initialize tensors for raw and processed actions, and store the time step for control updates
         self.dt = env.physics_dt * env.cfg.decimation
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._processed_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         
-        # scale 텐서화
+        # Store the scaling factors for the actions as a tensor for efficient GPU computation
         self._scale = torch.tensor(cfg.scale, device=self.device)
 
     @property
     def action_dim(self) -> int:
+        """
+        Get the dimension of the action space.
+
+        Returns:
+            int: The dimension of the action space.
+        """
         return 3 # [vx, vy, w]
 
     def raw_actions(self) -> torch.Tensor:
+        """
+        Get the raw actions.
+
+        Returns:
+            torch.Tensor: The raw actions tensor.
+        """
         return self._raw_actions
 
     def processed_actions(self) -> torch.Tensor:
+        """
+        Get the processed actions after scaling.
+
+        Returns:
+            torch.Tensor: The processed actions tensor.
+        """
         return self._processed_actions
 
     def process_actions(self, actions: torch.Tensor):
+        """
+        Process the raw actions from the agent by applying scaling and preparing them for the swerve controller.
+
+        Args:
+            actions (torch.Tensor): The raw actions output by the agent, expected to be in the form [vx, vy, w] for each environment.
+        """
+        
         self._raw_actions[:] = actions
-        # 에이전트 출력에 scale 적용 (모두 텐서 연산)
+        
+        # Scale the actions according to the configuration.
         self._processed_actions[:] = actions * self._scale
 
     def apply_actions(self):
-        # 현재 조향 각도 (이미 텐서)
+        """Apply the processed actions to the robot."""
+        
+        # Current steering joint positions
         curr_steer = self._asset.data.joint_pos[:, self.steer_joint_ids]
         
-        # 컨트롤러의 vectorized forward 호출
-        # 더 이상 루프나 numpy 변환 없이 GPU에서 한 번에 계산됨!
+        # Use the swerve controller to compute the desired drive velocities and steering positions
+        # based on the processed actions and current steering state
         drive_vels, steer_pos = self.controller.forward(
             self._processed_actions, 
             curr_steer, 
             self.dt
         )
 
-        # 실제 시뮬레이션에 명령 전달
+        # Send the computed drive velocities and steering positions to the robot's joints
         self._asset.set_joint_velocity_target(drive_vels, joint_ids=self.drive_joint_ids)
         self._asset.set_joint_position_target(steer_pos, joint_ids=self.steer_joint_ids)
 
     def reset(self, env_ids: torch.Tensor | None = None):
+        """
+        Reset the action term for the specified environment IDs.
+        This typically involves resetting any internal state of the controller and clearing the action buffers.
+
+        Args:
+            env_ids (torch.Tensor | None, optional): The environment IDs to reset. If None, all environments will be reset. Defaults to None.
+        """
+        
+        
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         
-        # 컨트롤러 내부의 이전 상태 값들도 해당 환경 ID만 골라서 리셋
+        # Reset the previous drive velocities and steering positions in the controller for the specified environment IDs
         self.controller._prev_drive_vels[env_ids] = 0.0
         self.controller._prev_steer_pos[env_ids] = 0.0
         
+        # Reset the raw and processed action buffers to zero for the specified environment IDs
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
 
 @configclass
 class SwerveDriveActionCfg(ActionTermCfg):
-    """Swerve Drive 액션 설정"""
+    """Configuration for the SwerveDriveAction."""
+        
     class_type: type = SwerveDriveAction
     asset_name: str = "robot"
-    # 조인트 이름은 리스트 형태로 전달 [steer_pattern, drive_pattern]
     joint_names: list[str] = MISSING  
     scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
