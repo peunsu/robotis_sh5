@@ -12,7 +12,7 @@ import isaaclab.utils.math as math_utils
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
     
-def get_rel_pos_to_current_waypoint(env) -> torch.Tensor:
+def get_rel_pos_to_current_waypoint(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """로봇 베이스를 기준으로 현재 타겟 웨이포인트까지의 상대적 위치 (x, y, z)"""
     # env에 할당된 waypoint_manager 가져오기
     wm = getattr(env, "waypoint_manager", None)
@@ -38,7 +38,7 @@ def get_rel_pos_to_current_waypoint(env) -> torch.Tensor:
 
     # return rel_pos_w
 
-def get_target_waypoint_index(env) -> torch.Tensor:
+def get_target_waypoint_index(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """전체 웨이포인트 중 현재 몇 번째 타겟인지 정규화된 인덱스 반환 [0, 1]"""
     wm = getattr(env, "waypoint_manager", None)
     if wm is None:
@@ -50,7 +50,7 @@ def get_target_waypoint_index(env) -> torch.Tensor:
     
     return normalized_idx
 
-def get_waypoint_heading_error_sin_cos(env):
+def get_waypoint_heading_error_sin_cos(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """타겟과의 헤딩 오차를 sin, cos 값으로 반환 (2-dim)"""
     wm = getattr(env, "waypoint_manager", None)
     if wm is None: return torch.zeros((env.num_envs, 2), device=env.device)

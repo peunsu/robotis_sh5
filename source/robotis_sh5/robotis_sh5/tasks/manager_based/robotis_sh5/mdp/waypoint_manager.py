@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 class WaypointManager:
-    def __init__(self, env, num_waypoints):
+    def __init__(self, env: "ManagerBasedRLEnv", num_waypoints: int):
         self.env = env
         self.num_envs = env.num_envs
         self.num_waypoints = num_waypoints
@@ -69,10 +69,9 @@ class WaypointManager:
             )
             self.update_visuals()
             
-def get_or_create_waypoint_manager(env, num_waypoints=10):
+def get_or_create_waypoint_manager(env: "ManagerBasedRLEnv", num_waypoints: int = 10) -> "WaypointManager":
     if not hasattr(env, "waypoint_manager"):
         # 1. 매니저 생성
-        from .waypoint_manager import WaypointManager
         env.waypoint_manager = WaypointManager(env, num_waypoints)
         
         # 2. [핵심] 실제 시각화 마커 객체를 여기서 생성해서 scene에 수동 등록!

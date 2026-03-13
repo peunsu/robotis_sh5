@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 def reset_random_waypoints(
-    env, 
+    env: "ManagerBasedRLEnv", 
     env_ids: torch.Tensor, # Isaac Lab이 자동으로 넣어주는 인자
     num_waypoints: int, 
     distance_range: tuple[float, float]
@@ -77,7 +77,7 @@ def reset_root_at_origin(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, asset_
     default_joint_vel = asset.data.default_joint_vel[env_ids]
     asset.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
     
-def update_waypoint_status(env, env_ids, threshold: float):
+def update_waypoint_status(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, threshold: float):
     """
     Isaac Lab EventManager는 env와 env_ids를 기본으로 넘겨줘.
     그 뒤에 params에 적은 threshold가 키워드 인자로 들어와.

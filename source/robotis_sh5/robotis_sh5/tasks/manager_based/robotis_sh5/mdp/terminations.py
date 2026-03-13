@@ -12,7 +12,7 @@ import isaaclab.utils.math as math_utils
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def bad_orientation(env, threshold: float):
+def bad_orientation(env: "ManagerBasedRLEnv", threshold: float) -> torch.Tensor:
     """로봇이 일정 각도 이상 기울어지면 종료 (넘어짐 감지)."""
     # 로봇의 위쪽 방향 벡터 (Local Z-axis) 추출
     # Isaac Lab의 project_gravity 함수를 쓰면 세계 좌표계 기준의 중력 방향(내림) 벡터를 얻을 수 있어.
@@ -31,7 +31,7 @@ def bad_orientation(env, threshold: float):
     # 설정한 문턱값(threshold)보다 낮아지면(많이 기울면) True 반환
     return z_dot < threshold
 
-def all_waypoints_reached(env):
+def all_waypoints_reached(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """모든 웨이포인트를 순차적으로 통과했는지 확인."""
     wm = getattr(env, "waypoint_manager", None)
     if wm is None:

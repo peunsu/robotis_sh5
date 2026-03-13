@@ -12,7 +12,7 @@ import isaaclab.utils.math as math_utils
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def position_progress_reward(env):
+def position_progress_reward(env: "ManagerBasedRLEnv") -> torch.Tensor:
     wm = getattr(env, "waypoint_manager", None)
     if wm is None: return torch.zeros(env.num_envs, device=env.device)
     
@@ -26,7 +26,7 @@ def position_progress_reward(env):
     
     return progress
 
-def heading_alignment_reward(env, sigma: float = 0.25):
+def heading_alignment_reward(env: "ManagerBasedRLEnv", sigma: float = 0.25) -> torch.Tensor:
     wm = getattr(env, "waypoint_manager", None)
     if wm is None: return torch.zeros(env.num_envs, device=env.device)
     
@@ -46,7 +46,7 @@ def heading_alignment_reward(env, sigma: float = 0.25):
     
     return torch.exp(-heading_error / sigma)
 
-def goal_reached_reward(env, threshold: float):
+def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Tensor:
     wm = getattr(env, "waypoint_manager", None)
     if wm is None: return torch.zeros(env.num_envs, device=env.device)
     

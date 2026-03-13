@@ -27,7 +27,7 @@ class SwerveController(BaseController):
     def _normalize_angle(self, angle: torch.Tensor) -> torch.Tensor:
         return (angle + torch.pi) % (2 * torch.pi) - torch.pi
 
-    def forward(self, command: torch.Tensor, current_steer_angles: torch.Tensor, dt: float):
+    def forward(self, command: torch.Tensor, current_steer_angles: torch.Tensor, dt: float) -> tuple[torch.Tensor, torch.Tensor]:
         """
         command: (num_envs, 3) -> [vx, vy, w]
         current_steer_angles: (num_envs, 3)
