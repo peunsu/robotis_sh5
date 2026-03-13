@@ -13,11 +13,11 @@ from . import agents
 
 
 gym.register(
-    id="Robotis-SH5-Reach-v0",
+    id="Robotis-SH5-Navigation-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.robotis_sh5_env_cfg:RobotisSh5EnvCfg",
+        "env_cfg_entry_point": f"{__name__}.robotis_sh5_navigation_env_cfg:RobotisSh5NavigationEnvCfg",
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         "skrl_amp_cfg_entry_point": f"{agents.__name__}:skrl_amp_cfg.yaml",

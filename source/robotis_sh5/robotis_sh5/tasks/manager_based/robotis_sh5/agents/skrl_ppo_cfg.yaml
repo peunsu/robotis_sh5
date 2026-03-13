@@ -66,8 +66,8 @@ agent:
   time_limit_bootstrap: True
   # logging and checkpoint
   experiment:
-    directory: "robotis_sh5_reach"
-    experiment_name: "swerve_v1"
+    directory: "robotis_sh5_navigation"
+    experiment_name: "without_target_index"
     write_interval: 100
     checkpoint_interval: 1000
     wandb: False
@@ -77,5 +77,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 3200000
+  timesteps: 72000
   environment_info: log

@@ -27,7 +27,7 @@ from . import mdp
 
 
 @configclass
-class RobotisSh5SceneCfg(InteractiveSceneCfg):
+class RobotisSh5NavigationSceneCfg(InteractiveSceneCfg):
     """Configuration for a cart-pole scene."""
     
     # ground plane
@@ -116,7 +116,7 @@ class ObservationsCfg:
         
         # 현재 타겟 인덱스와 목표 오차 벡터
         rel_goal_pos = ObsTerm(func=mdp.get_rel_pos_to_current_waypoint) 
-        target_index = ObsTerm(func=mdp.get_target_waypoint_index) # 현재 몇 번째 목표인지
+        # target_index = ObsTerm(func=mdp.get_target_waypoint_index) # 현재 몇 번째 목표인지
         
         # 헤딩 오차 sin, cos (2차원)
         target_heading = ObsTerm(func=mdp.get_waypoint_heading_error_sin_cos)
@@ -192,9 +192,9 @@ class TerminationsCfg:
 
 
 @configclass
-class RobotisSh5EnvCfg(ManagerBasedRLEnvCfg):
+class RobotisSh5NavigationEnvCfg(ManagerBasedRLEnvCfg):
     # Scene settings
-    scene: RobotisSh5SceneCfg = RobotisSh5SceneCfg(num_envs=4096, env_spacing=4.0)
+    scene: RobotisSh5NavigationSceneCfg = RobotisSh5NavigationSceneCfg(num_envs=4096, env_spacing=4.0)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -225,7 +225,7 @@ class RobotisSh5EnvCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # general settings
         self.decimation = 4
-        self.episode_length_s = 10
+        self.episode_length_s = 30
         # Viewer settings
         self.viewer.eye = (10.0, 0.0, 8.0)
         self.viewer.lookat = (0.0, 0.0, 0.0)
