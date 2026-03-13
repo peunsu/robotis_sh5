@@ -4,85 +4,86 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
-
+import torch
 from typing import TYPE_CHECKING
 
-import math
-import torch
+from isaaclab.managers import SceneEntityCfg
+from .waypoint_manager import get_or_create_waypoint_manager
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-##
-# 이벤트 (Events/Resets) 구현
-##
-
-def reset_goal_position(env: ManagerBasedRLEnv, env_ids: torch.Tensor, pos_range: dict, asset_name: str = "goal_marker"):
-    """목표 지점 마커의 위치를 랜덤하게 리셋."""
-    
-    num_resets = len(env_ids)
-    if num_resets == 0: return
-    
-    view = env.scene[asset_name]
-    
-    if view.count < env.num_envs:
-        # 마커가 하나뿐인 경우: 0번 인덱스만 사용
-        indices = torch.tensor([0], device=env.device, dtype=torch.long)
-        num_to_calc = 1
-    else:
-        # 마커가 환경마다 있는 경우: 들어온 env_ids 그대로 사용
-        indices = env_ids
-        num_to_calc = num_resets
-
-    # --- 수정된 안전 로직 ---
-    # 실제 존재하는 마커 개수만큼만 인덱스를 준비함
-    if view.count < env.num_envs:
-        # 마커가 하나뿐인 경우: 0번 인덱스만 사용
-        indices = torch.tensor([0], device=env.device, dtype=torch.long)
-        num_to_calc = 1
-    else:
-        # 마커가 환경마다 있는 경우: 들어온 env_ids 그대로 사용
-        indices = env_ids
-        num_to_calc = num_resets
-
-    # 랜덤 위치 생성 (계산해야 할 개수만큼만)
-    random_pos = torch.zeros((num_to_calc, 3), device=env.device)
-    random_pos[:, 0] = torch.rand(num_to_calc, device=env.device) * (pos_range["x"][1] - pos_range["x"][0]) + pos_range["x"][0]
-    random_pos[:, 1] = torch.rand(num_to_calc, device=env.device) * (pos_range["y"][1] - pos_range["y"][0]) + pos_range["y"][0]
-    random_pos[:, 2] = 0.1 
-
-    # 위치 적용 (indices가 위치 개수와 맞아야 함)
-    view.set_world_poses(positions=random_pos, indices=indices)
-
-def reset_root_around_goal_2d(
-    env: ManagerBasedRLEnv, 
-    env_ids: torch.Tensor, 
-    min_dist: float = 1.0, 
-    max_dist: float = 4.0, 
-    yaw_range: tuple = (-math.pi, math.pi)
+def reset_random_waypoints(
+    env, 
+    env_ids: torch.Tensor, # Isaac Lab이 자동으로 넣어주는 인자
+    num_waypoints: int, 
+    distance_range: tuple[float, float]
 ):
-    num_resets = len(env_ids)
-    if num_resets == 0: return
-
-    # 1. 로컬 좌표계에서의 랜덤 위치 계산 (원점 기준)
-    r = torch.sqrt(torch.rand(num_resets, device=env.device) * (max_dist**2 - min_dist**2) + min_dist**2)
-    theta = torch.rand(num_resets, device=env.device) * 2 * math.pi
+    # 1. 매니저 가져오기
+    wm = get_or_create_waypoint_manager(env, num_waypoints)
     
-    local_pos = torch.zeros((num_resets, 3), device=env.device)
-    local_pos[:, 0] = r * torch.cos(theta)
-    local_pos[:, 1] = r * torch.sin(theta)
-    local_pos[:, 2] = 0.1 
+    # 2. 인자로 받은 env_ids 사용 (더 이상 asset_cfg.env_ids라고 쓰지 않아!)
+    num_resets = len(env_ids)
+    
+    # 해당 환경들의 타겟 인덱스 초기화
+    wm.target_indices[env_ids] = 0
+    
+    # 웨이포인트 생성 로직
+    fps = torch.zeros((num_resets, num_waypoints, 3), device=env.device)
+    for i in range(num_waypoints):
+        # x축 방향 전진 (랜덤 범위 적용)
+        low, high = distance_range
+        fps[:, i, 0] = (i + 1) * torch.empty(num_resets, device=env.device).uniform_(low, high)
+        # y축 랜덤 (좌우)
+        fps[:, i, 1] = torch.randn(num_resets, device=env.device) * 1.5
+        fps[:, i, 2] = 0.2
+        
+    # 절대 좌표로 변환하여 저장
+    wm.waypoints[env_ids] = fps + env.scene.env_origins[env_ids].unsqueeze(1)
+    
+    # 초기 거리 업데이트 (Progress 보상용)
+    root_pos = env.scene["robot"].data.root_pos_w[env_ids]
+    current_target = wm.waypoints[env_ids, 0]
+    wm.prev_dist[env_ids] = torch.norm(current_target - root_pos, dim=-1)
+    
+    # 시각화 갱신
+    wm.update_visuals()
+    
+def reset_root_at_origin(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    """로봇을 각 환경의 원점(Origin)으로 리셋하고 속도를 0으로 초기화합니다."""
+    
+    # 1. 대상 에셋(로봇) 가져오기
+    asset = env.scene[asset_cfg.name]
+    
+    # 2. 로봇의 기본 상태(default state) 가져오기
+    # 보통 ArticulationCfg에서 설정한 init_state 값을 바탕으로 함
+    default_root_state = asset.data.default_root_state[env_ids].clone()
+    
+    # 3. 위치를 환경의 원점으로 설정
+    # default_root_state는 로봇 좌표계 기준이므로, 실제 세계 좌표(World)로 변환하기 위해 
+    # 해당 환경의 원점(env_origins)을 더해줌
+    default_root_state[:, :3] += env.scene.env_origins[env_ids]
+    
+    # [선택] 필요하다면 높이(z)나 방향(quat)을 여기서 살짝 랜덤하게 흔들 수도 있어
+    # 예: default_root_state[:, 0:2] += torch.empty(len(env_ids), 2, device=env.device).uniform_(-0.5, 0.5)
 
-    # --- 핵심 수정 사항: 각 환경의 월드 원점 더하기 ---
-    # env.scene.env_origins는 각 환경 인덱스에 해당하는 월드 좌표상의 원점을 가지고 있어.
-    env_origins = env.scene.env_origins[env_ids]
-    world_pos = local_pos + env_origins # 로컬 랜덤 위치를 월드 위치로 변환
-
-    # 2. 방향(Yaw) 계산
-    random_yaw = torch.rand(num_resets, device=env.device) * (yaw_range[1] - yaw_range[0]) + yaw_range[0]
-    random_quat = torch.zeros((num_resets, 4), device=env.device)
-    random_quat[:, 0] = torch.cos(random_yaw / 2)
-    random_quat[:, 3] = torch.sin(random_yaw / 2)
-
-    # 3. 월드 좌표계 기준으로 포즈 업데이트
-    env.scene["robot"].write_root_pose_to_sim(torch.cat([world_pos, random_quat], dim=-1), env_ids)
+    # 4. 시뮬레이션에 상태 쓰기
+    # 위치/방향(pose)과 선속도/각속도(velocity)를 모두 초기화
+    asset.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+    asset.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+    
+    # 5. 조인트 상태(Joint positions/velocities)도 기본값으로 리셋
+    default_joint_pos = asset.data.default_joint_pos[env_ids]
+    default_joint_vel = asset.data.default_joint_vel[env_ids]
+    asset.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
+    
+def update_waypoint_status(env, env_ids, threshold: float):
+    """
+    Isaac Lab EventManager는 env와 env_ids를 기본으로 넘겨줘.
+    그 뒤에 params에 적은 threshold가 키워드 인자로 들어와.
+    """
+    wm = getattr(env, "waypoint_manager", None)
+    if wm is not None:
+        # wm.update가 내부적으로 모든 환경을 체크한다면 env_ids는 무시해도 되지만, 
+        # 성능을 위해선 해당 env_ids만 업데이트하는 게 좋아.
+        wm.update(threshold=threshold)

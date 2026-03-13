@@ -7,37 +7,46 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
+import isaaclab.utils.math as math_utils
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def is_near_goal(env: ManagerBasedRLEnv, threshold: float = 0.2) -> torch.Tensor:
-    """로봇이 목표 지점의 임계치 안에 들어왔는지 확인 (성공 종료)"""
-    # 로봇 현재 위치 (XY)
-    robot_pos_w = env.scene["robot"].data.root_pos_w[:, :2]
+def bad_orientation(env, threshold: float):
+    """로봇이 일정 각도 이상 기울어지면 종료 (넘어짐 감지)."""
+    # 로봇의 위쪽 방향 벡터 (Local Z-axis) 추출
+    # Isaac Lab의 project_gravity 함수를 쓰면 세계 좌표계 기준의 중력 방향(내림) 벡터를 얻을 수 있어.
+    root_quat_w = env.scene["robot"].data.root_quat_w
     
-    # 목표 지점 위치 (XY)
-    goal_pos_w, _ = env.scene["goal_marker"].get_world_poses()
-    goal_pos_w = goal_pos_w[:, :2]
+    # 로봇의 로컬 Z축(0,0,1)이 세계 좌표계에서 어디를 향하는지 계산
+    up_vec_w = math_utils.quat_apply(
+        root_quat_w, 
+        torch.tensor([0.0, 0.0, 1.0], device=env.device).repeat(env.num_envs, 1)
+    )
     
-    # 거리 계산
-    distance = torch.norm(goal_pos_w - robot_pos_w, dim=-1)
+    # 세계 좌표계의 Z축(0,0,1)과의 내적을 통해 기울기 확인
+    # 1.0이면 똑바로 선 상태, 0.0이면 옆으로 누운 상태, -1.0이면 뒤집힌 상태
+    z_dot = up_vec_w[:, 2]
     
-    # 임계치 이내이면 True 반환
-    return distance < threshold
+    # 설정한 문턱값(threshold)보다 낮아지면(많이 기울면) True 반환
+    return z_dot < threshold
 
-def bad_orientation(env: ManagerBasedRLEnv, threshold: float = 0.5) -> torch.Tensor:
-    """
-    로봇이 일정 각도 이상 기울어지면 True 반환.
-    - 서 있을 때 projected_gravity_b[:, 2]는 -1.0에 가까움.
-    - threshold가 0.5라면, -0.5보다 커지는 순간(0.0에 가까워지는 순간) 리셋.
-    """
-    # 중력의 Z성분이 -0.5보다 크다 = 약 60도 이상 기울어졌다
-    return env.scene["robot"].data.projected_gravity_b[:, 2] > -threshold
+def all_waypoints_reached(env):
+    """모든 웨이포인트를 순차적으로 통과했는지 확인."""
+    wm = getattr(env, "waypoint_manager", None)
+    if wm is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
-def root_pos_distance_from_env_origin(env: ManagerBasedRLEnv, threshold: float = 4.5) -> torch.Tensor:
-    """로봇이 환경 원점으로부터 너무 멀리 벗어났는지 확인"""
-    # 환경 원점 대비 상대 위치 (Local Pos)
-    relative_pos = env.scene["robot"].data.root_pos_w - env.scene.env_origins
-    distance = torch.norm(relative_pos[:, :2], dim=-1)
+    # 1. 현재 인덱스가 마지막 인덱스인지 확인 (num_waypoints - 1)
+    is_last_waypoint = (wm.target_indices == wm.num_waypoints - 1)
     
-    return distance > threshold
+    # 2. 마지막 타겟과의 거리 측정
+    root_pos_w = env.scene["robot"].data.root_pos_w[:, :2]
+    final_target_w = wm.waypoints[torch.arange(env.num_envs), -1, :2]
+    dist_to_final = torch.norm(final_target_w - root_pos_w, dim=-1)
+    
+    # 마지막 인덱스이면서 거리도 충분히 가깝다면 '성공' 종료
+    # threshold는 보통 0.2 ~ 0.3 정도로 잡아주면 적당해
+    success = is_last_waypoint & (dist_to_final < 0.2)
+    
+    return success
