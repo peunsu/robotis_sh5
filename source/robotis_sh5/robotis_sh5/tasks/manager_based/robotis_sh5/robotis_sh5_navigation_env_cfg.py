@@ -129,7 +129,7 @@ class EventCfg:
     reset_waypoint_positions = EventTerm(
         func=mdp.reset_random_waypoints,
         mode="reset",
-        params={"num_waypoints": 10, "distance_range": (1.0, 2.0)}
+        params={"num_waypoints": 10, "distance_range": (1.0, 2.0, 1.5)}
     )
     
     # Reset robot position at the start of each episode

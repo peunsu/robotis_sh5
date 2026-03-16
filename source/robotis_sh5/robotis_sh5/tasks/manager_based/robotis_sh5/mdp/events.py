@@ -13,7 +13,7 @@ from .waypoint_manager import get_or_create_waypoint_manager
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_waypoints: int, distance_range: tuple[float, float]):
+def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_waypoints: int, distance_range: tuple[float, float, float]):
     """
     Reset the waypoints for the specified environments with random positions.
 
@@ -21,7 +21,7 @@ def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_
         env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
         env_ids (torch.Tensor): The indices of the environments to reset.
         num_waypoints (int): The number of waypoints to generate.
-        distance_range (tuple[float, float]): The range of distances for the waypoints.
+        distance_range (tuple[float, float, float]): The range of distances for the waypoints. (low_dist, high_dist, lateral_dist)
     """
     
     wm = get_or_create_waypoint_manager(env, num_waypoints)
@@ -34,7 +34,7 @@ def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_
     
     # Generate random waypoints in front of the robot within the specified distance range
     fps = torch.zeros((num_resets, num_waypoints, 3), device=env.device)
-    low, high = distance_range
+    low_dist, high_dist, lateral_dist = distance_range[0], distance_range[1], distance_range[2]
     
     # To create a path of waypoints that extends forward from the robot,
     # we can generate random distances along the x-axis (forward direction) for each waypoint,
@@ -45,14 +45,14 @@ def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_
     for i in range(num_waypoints):
         # Generate a random step distance along the x-axis for each waypoint,
         # ensuring that waypoints are spaced out in front of the robot
-        dist_step = torch.empty(num_resets, device=env.device).uniform_(low, high)
+        dist_step = torch.empty(num_resets, device=env.device).uniform_(low_dist, high_dist)
         cumulative_x += dist_step
         
         # Random distance along the x-axis (forward direction)
         fps[:, i, 0] = cumulative_x
         
         # Random lateral offset along the y-axis (sideways direction)
-        fps[:, i, 1] = torch.empty(num_resets, device=env.device).uniform_(-1.5, 1.5)
+        fps[:, i, 1] = torch.empty(num_resets, device=env.device).uniform_(-lateral_dist, lateral_dist)
         
         # Fixed height (z-axis)
         fps[:, i, 2] = 0.2
