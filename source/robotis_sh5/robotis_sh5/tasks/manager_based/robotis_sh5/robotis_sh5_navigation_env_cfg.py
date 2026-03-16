@@ -221,8 +221,8 @@ class RobotisSh5NavigationEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 4
         self.episode_length_s = 30
         
-        self.viewer.eye = (10.0, 0.0, 8.0)
-        self.viewer.lookat = (0.0, 0.0, 0.0)
+        self.viewer.eye = (25.0, 0.0, 8.0)
+        self.viewer.lookat = (10.0, 0.0, 0.0)
         
         self.sim.dt = 1 / 60
         self.sim.render_interval = self.decimation
