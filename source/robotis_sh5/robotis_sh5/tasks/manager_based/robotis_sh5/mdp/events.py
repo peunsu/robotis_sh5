@@ -28,24 +28,42 @@ def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_
     num_resets = len(env_ids) # Number of environments to reset
     wm.target_indices[env_ids] = 0 # Reset target index to the first waypoint for the specified environments
     
+    # Get the reference position for the specified environments (usually the environment origin)
+    reference_pos = env.scene.env_origins[env_ids]
+    
+    
     # Generate random waypoints in front of the robot within the specified distance range
     fps = torch.zeros((num_resets, num_waypoints, 3), device=env.device)
+    low, high = distance_range
+    
+    # To create a path of waypoints that extends forward from the robot,
+    # we can generate random distances along the x-axis (forward direction) for each waypoint,
+    # while adding some random lateral offset on the y-axis.
+    # The z-axis can be set to a fixed height for all waypoints.
+    # This will create a more natural and navigable path for the robot to follow.
+    cumulative_x = torch.zeros(num_resets, device=env.device)
     for i in range(num_waypoints):
-        # Random distance along the x-axis (forward direction)
-        low, high = distance_range
-        fps[:, i, 0] = (i + 1) * torch.empty(num_resets, device=env.device).uniform_(low, high)
+        # Generate a random step distance along the x-axis for each waypoint,
+        # ensuring that waypoints are spaced out in front of the robot
+        dist_step = torch.empty(num_resets, device=env.device).uniform_(low, high)
+        cumulative_x += dist_step
         
-        # Random lateral offset (y-axis)
-        fps[:, i, 1] = torch.randn(num_resets, device=env.device) * 1.5
+        # Random distance along the x-axis (forward direction)
+        fps[:, i, 0] = cumulative_x
+        
+        # Random lateral offset along the y-axis (sideways direction)
+        fps[:, i, 1] = torch.empty(num_resets, device=env.device).uniform_(-1.5, 1.5)
         
         # Fixed height (z-axis)
         fps[:, i, 2] = 0.2
         
-    # Transform the waypoints from the robot's local frame to the world frame by adding the robot's current position
-    wm.waypoints[env_ids] = fps + env.scene.env_origins[env_ids].unsqueeze(1)
+    # Set the waypoint positions in the WaypointManager by adding the reference position to the generated waypoints
+    wm.waypoints[env_ids] = fps + reference_pos.unsqueeze(1)
+    
+    # The current position of the robot's root
+    root_pos = env.scene["robot"].data.root_pos_w[env_ids]
     
     # Update the previous distance to the first waypoint for reward calculation
-    root_pos = env.scene["robot"].data.root_pos_w[env_ids]
     current_target = wm.waypoints[env_ids, 0]
     wm.prev_dist[env_ids] = torch.norm(current_target - root_pos, dim=-1)
     
