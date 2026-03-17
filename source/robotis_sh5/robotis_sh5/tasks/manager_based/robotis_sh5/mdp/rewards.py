@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
+from collections import deque
 import torch
 from typing import TYPE_CHECKING
 
@@ -91,6 +92,8 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     # Ensure the metrics dictionary exists in env.extras to store success rate
     if "metrics" not in env.extras:
         env.extras["metrics"] = {"success_rate": 0.0}
+    if "success_buffer" not in env.extras:
+        env.extras["success_buffer"] = deque(maxlen=1000) # Buffer to store recent success outcomes for calculating success rate
     
     # Calculate the current distance to the target
     root_pos = env.scene["robot"].data.root_pos_w[:, :2]
@@ -107,15 +110,18 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     if len(reset_ids) > 0:        
         # Consider it a success if the robot has reached the goal and it is the final waypoint
         is_last = (wm.target_indices == wm.num_waypoints - 1)
-        success_final = is_last & goal_reached
+        success_all_envs = (is_last & goal_reached)
         
-        # Calculate the success rate for the batch of environments that are resetting at this step
-        batch_success_rate = success_final[reset_ids].float().mean().item()
+        # Get the success outcomes for the environments that are resetting at this step
+        success_at_reset = success_all_envs[reset_ids]
         
-        # Update the overall success rate metric using an exponential moving average
-        alpha = 0.01
-        env.extras["metrics"]["success_rate"] = (
-            (1.0 - alpha) * env.extras["metrics"]["success_rate"] + alpha * batch_success_rate
-        )
+        # Update the success buffer     
+        env.extras["success_buffer"].extend(success_at_reset.tolist())
+        
+        # Update the success rate metric in env.extras
+        if len(env.extras["success_buffer"]) > 0:
+            env.extras["metrics"]["success_rate"] = (
+                sum(env.extras["success_buffer"]) / len(env.extras["success_buffer"])
+            )
     
     return goal_reached_float
