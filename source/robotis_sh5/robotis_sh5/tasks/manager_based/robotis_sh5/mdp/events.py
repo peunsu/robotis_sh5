@@ -6,12 +6,15 @@
 from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
+import logging
 
 from isaaclab.managers import SceneEntityCfg
 from .waypoint_manager import get_or_create_waypoint_manager
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+    
+logger = logging.getLogger(__name__)
 
 def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_waypoints: int, distance_range: tuple[float, float, float]):
     """
@@ -111,3 +114,64 @@ def update_waypoint_status(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, thre
     wm = getattr(env, "waypoint_manager", None)
     if wm is not None:
         wm.update(threshold=threshold)
+
+def linear_curriculum_distance(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, old_value: tuple, max_distance_range: tuple, max_steps: int) -> tuple:
+    """
+    Update the distance range for the curriculum learning based on the current step.
+
+    Args:
+        env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
+        env_ids (torch.Tensor): The indices of the environments for which to update the distance range.
+        old_value (tuple): The initial distance range values (low_dist, high_dist, lateral_dist).
+        max_distance_range (tuple): The maximum distance range values (low_dist, high_dist, lateral_dist).
+        max_steps (int): The maximum number of steps for the curriculum learning.
+
+    Returns:
+        tuple: The updated distance range values (low_dist, high_dist, lateral_dist).
+    """
+    
+    current_step = env.common_step_counter
+    
+    # Calculate the progress of the curriculum learning as a value between 0 and 1
+    progress = min(current_step / max_steps, 1.0)
+    
+    # Linearly interpolate the distance range values based on the progress of the curriculum learning
+    start_low, start_high, start_lateral = 1.0, 2.0, 1.5
+    target_low, target_high, target_lateral = max_distance_range
+    
+    new_low = start_low + (target_low - start_low) * progress
+    new_high = start_high + (target_high - start_high) * progress
+    new_lateral = start_lateral + (target_lateral - start_lateral) * progress
+    
+    logger.info(f"Curriculum update - Step: {current_step}, Progress: {progress:.2%}, Distance Range: ({new_low:.2f}, {new_high:.2f}, {new_lateral:.2f})")
+    
+    return (new_low, new_high, new_lateral)
+
+def adaptive_distance_curriculum(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, old_value: tuple, max_distance_range: tuple) -> tuple:
+    """
+    Update the distance range for the curriculum learning based on the recent success rate of the agent.
+
+    Args:
+        env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
+        env_ids (torch.Tensor): The indices of the environments for which to update the distance range.
+        old_value (tuple): The initial distance range values (low_dist, high_dist, lateral_dist).
+        max_distance_range (tuple): The maximum distance range values (low_dist, high_dist, lateral_dist).
+
+    Returns:
+        tuple: The updated distance range values (low_dist, high_dist, lateral_dist).
+    """
+    
+    # Get the recent success rate from the environment's metrics
+    success_rate = env.extras.get("metrics", {}).get("success_rate", 0.0)
+    
+    # Initial and target distance range values for the curriculum learning
+    start_low, start_high, start_lateral = 1.0, 2.0, 1.5
+    target_low, target_high, target_lateral = max_distance_range
+    
+    # Interpolate the distance range values based on the recent success rate,
+    # allowing the curriculum to adapt to the agent's performance
+    new_low = start_low + (target_low - start_low) * success_rate
+    new_high = start_high + (target_high - start_high) * success_rate
+    new_lateral = start_lateral + (target_lateral - start_lateral) * success_rate
+    
+    return (new_low, new_high, new_lateral)

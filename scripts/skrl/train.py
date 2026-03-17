@@ -229,6 +229,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
+    
+    #####################
+    # Custom callback to log success rate from environment's extras during training
+    #####################
+    
+    # get the agent for logging success rate during training
+    agent = runner.agent
+    
+    # log success rate from environment's extras during training
+    def log_success_rate(timestep, timesteps):
+        actual_env = env.unwrapped
+        
+        try:
+            success_rate = actual_env.extras.get("metrics", {}).get("success_rate", None)
+            if success_rate is not None:
+                agent.track_data("Metrics/success_rate", success_rate)
+        except Exception as e:
+            print(f"Error while logging success rate: {e}")
+        
+        agent._original_post_interaction(timestep, timesteps)
+    
+    # monkey-patch the agent's post_interaction function to log success rate at each step
+    agent._original_post_interaction = agent.post_interaction
+    agent.post_interaction = log_success_rate
+    
+    #####################
+    # End of custom callback for logging success rate
+    #####################
 
     # run training
     runner.run()

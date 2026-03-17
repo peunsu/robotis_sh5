@@ -94,5 +94,20 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     
     # Reward is 1.0 if the current distance is less than the threshold, otherwise 0.0
     goal_reached = current_dist < threshold
+    goal_reached_float = goal_reached.float()
+    
+    # Record success metric in env extras
+    if "metrics" not in env.extras:
+        env.extras["metrics"] = {}
+    
+    # Update the success rate metric using an exponential moving average
+    current_batch_success = torch.mean(goal_reached_float).item()
+    if "success_rate" not in env.extras["metrics"]:
+        env.extras["metrics"]["success_rate"] = current_batch_success
+    else:
+        alpha = 0.05  # smoothing factor for the moving average
+        env.extras["metrics"]["success_rate"] = (
+            (1.0 - alpha) * env.extras["metrics"]["success_rate"] + alpha * current_batch_success
+        )
         
-    return goal_reached.float()
+    return goal_reached_float

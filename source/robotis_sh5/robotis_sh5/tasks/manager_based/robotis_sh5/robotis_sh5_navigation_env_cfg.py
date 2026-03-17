@@ -9,12 +9,15 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.managers import (
+    SceneEntityCfg,
+    CurriculumTermCfg,
+    EventTermCfg,
+    ObservationGroupCfg,
+    ObservationTermCfg,
+    RewardTermCfg,
+    TerminationTermCfg
+)
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.utils import configclass
@@ -85,33 +88,33 @@ class ObservationsCfg:
     """Observation specifications."""
 
     @configclass
-    class PolicyCfg(ObsGroup):
+    class PolicyCfg(ObservationGroupCfg):
         """Observations for policy group."""
 
         # Wheel joint positions with respect to the robot base (6 joints: 3 drive + 3 steer)
-        joint_pos_rel = ObsTerm(
+        joint_pos_rel = ObservationTermCfg(
             func=mdp.joint_pos_rel, 
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*drive", ".*steer"])}
         )
         
         # Wheel joint velocities with respect to the robot base (6 joints: 3 drive + 3 steer)
-        joint_vel_rel = ObsTerm(
+        joint_vel_rel = ObservationTermCfg(
             func=mdp.joint_vel_rel, 
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*drive", ".*steer"])}
         )
         
         # Root linear and angular velocity in the robot's local frame (3 linear + 3 angular)
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        base_lin_vel = ObservationTermCfg(func=mdp.base_lin_vel)
+        base_ang_vel = ObservationTermCfg(func=mdp.base_ang_vel)
         
         # Relative position to the current target waypoint (x, y in the robot's local frame)
-        rel_goal_pos = ObsTerm(func=mdp.get_rel_pos_to_current_waypoint)
+        rel_goal_pos = ObservationTermCfg(func=mdp.get_rel_pos_to_current_waypoint)
         
         # The index of the current target waypoint (scalar)
-        # target_index = ObsTerm(func=mdp.get_target_waypoint_index)
+        # target_index = ObservationTermCfg(func=mdp.get_target_waypoint_index)
         
         # Relative heading to the current target waypoint, represented as sin and cos (2 values)
-        target_heading = ObsTerm(func=mdp.get_waypoint_heading_error_sin_cos)
+        target_heading = ObservationTermCfg(func=mdp.get_waypoint_heading_error_sin_cos)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -126,17 +129,17 @@ class EventCfg:
     """Event specifications."""
     
     # Reset waypoint positions at the start of each episode, with randomization
-    reset_waypoint_positions = EventTerm(
+    reset_waypoint_positions = EventTermCfg(
         func=mdp.reset_random_waypoints,
         mode="reset",
         params={"num_waypoints": 10, "distance_range": (1.0, 2.0, 1.5)}
     )
     
     # Reset robot position at the start of each episode
-    reset_robot_position = EventTerm(func=mdp.reset_root_at_origin, mode="reset")
+    reset_robot_position = EventTermCfg(func=mdp.reset_root_at_origin, mode="reset")
     
     # Update waypoint status every step (Interval)
-    update_waypoints = EventTerm(
+    update_waypoints = EventTermCfg(
         func=mdp.update_waypoint_status,
         mode="interval",
         is_global_time=False,
@@ -149,27 +152,27 @@ class RewardsCfg:
     """Reward specifications."""
     
     # The difference in distance to the target waypoint since the last step (progress reward)
-    progress = RewTerm(
+    progress = RewardTermCfg(
         func=mdp.position_progress_reward,
         weight=2.0
     )
     
     # Alignment of the robot's heading with the direction to the target waypoint (encourages facing the target)
-    heading = RewTerm(
+    heading = RewardTermCfg(
         func=mdp.heading_alignment_reward,
         weight=0.5,
         params={"sigma": 0.25}
     )
     
     # A reward for reaching the goal (current waypoint), given when the robot is within a certain threshold distance
-    goal = RewTerm(
+    goal = RewardTermCfg(
         func=mdp.goal_reached_reward,
         weight=15.0,
         params={"threshold": 0.2}
     )
     
     # A small penalty on action to encourage smoother control
-    action_rate = RewTerm(
+    action_rate = RewardTermCfg(
         func=mdp.action_rate_l2, 
         weight=-0.01
     )
@@ -179,13 +182,43 @@ class TerminationsCfg:
     """Termination specifications."""
     
     # Termination if the episode exceeds the maximum time limit
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
     
     # Termination if the robot's orientation is too tilted (e.g., fallen over)
-    robot_fell = DoneTerm(func=mdp.bad_orientation, params={"threshold": 0.5})
+    robot_fell = TerminationTermCfg(func=mdp.bad_orientation, params={"threshold": 0.5})
     
     # Termination if all waypoints have been reached (task completion)
-    task_completed = DoneTerm(func=mdp.all_waypoints_reached)
+    task_completed = TerminationTermCfg(func=mdp.all_waypoints_reached)
+    
+@configclass
+class CurriculumCfg:
+    """Curriculum specifications."""
+
+    # Dynamically increase the distance range for random waypoint generation as training progresses
+    # waypoint_distance_curriculum = CurriculumTermCfg(
+    #     func=mdp.modify_term_cfg,
+    #     params={
+    #         # Modify the distance_range parameter of the reset_random_waypoints event term
+    #         # to increase the range linearly from (1.0, 2.0, 1.5) to (3.0, 5.0, 4.0) over 72000 steps
+    #         "address": "events.reset_waypoint_positions.params.distance_range",
+    #         "modify_fn": mdp.linear_curriculum_distance,
+    #         "modify_params": {
+    #             "max_distance_range": (3.0, 5.0, 4.0), # Maximum distance range for waypoint randomization at the end of curriculum
+    #             "max_steps": 72000,                    # Steps at which the curriculum should reach the maximum distance range
+    #         },
+    #     },
+    # )
+    
+    waypoint_distance_curriculum = CurriculumTermCfg(
+        func=mdp.modify_term_cfg,
+        params={
+            "address": "events.reset_waypoint_positions.params.distance_range",
+            "modify_fn": mdp.adaptive_distance_curriculum,
+            "modify_params": {
+                "max_distance_range": (3.0, 5.0, 4.0), # Maximum distance range for waypoint randomization at the end of curriculum
+            },
+        },
+    )
 
 @configclass
 class RobotisSh5NavigationEnvCfg(ManagerBasedRLEnvCfg):
@@ -198,6 +231,7 @@ class RobotisSh5NavigationEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
     
     waypoint_marker_cfg = VisualizationMarkersCfg(
         prim_path="/World/Visuals/WaypointMarkers",
