@@ -242,7 +242,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         actual_env = env.unwrapped
         
         try:
-            success_rate = actual_env.extras.get("metrics", {}).get("success_rate", None)
+            success_rate = actual_env.extras.get("metrics", {}).get("success_rate", 0.0)
             if success_rate is not None:
                 agent.track_data("Metrics/success_rate", success_rate)
         except Exception as e:

@@ -216,6 +216,8 @@ class CurriculumCfg:
             "modify_fn": mdp.adaptive_distance_curriculum,
             "modify_params": {
                 "max_distance_range": (3.0, 5.0, 4.0), # Maximum distance range for waypoint randomization at the end of curriculum
+                "grace_period": 0,                    # Steps to wait before starting curriculum updates
+                "fade_in_steps": 0,                   # Steps over which to fade in the curriculum updates
             },
         },
     )

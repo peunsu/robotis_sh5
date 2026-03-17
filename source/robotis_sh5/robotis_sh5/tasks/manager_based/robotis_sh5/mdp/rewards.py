@@ -75,6 +75,7 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     """
     Calculate a reward for reaching the goal (current waypoint).
     The reward is given when the robot is within a certain threshold distance from the target waypoint.
+    Also updates the success rate metric in the environment's extras when an episode ends.
 
     Args:
         env (ManagerBasedRLEnv): The environment instance, which should have a waypoint manager with the current target and previous distance.
@@ -87,6 +88,10 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     wm = getattr(env, "waypoint_manager", None)
     if wm is None: return torch.zeros(env.num_envs, device=env.device)
     
+    # Ensure the metrics dictionary exists in env.extras to store success rate
+    if "metrics" not in env.extras:
+        env.extras["metrics"] = {"success_rate": 0.0}
+    
     # Calculate the current distance to the target
     root_pos = env.scene["robot"].data.root_pos_w[:, :2]
     current_target = wm.waypoints[torch.arange(env.num_envs), wm.target_indices, :2]
@@ -96,18 +101,21 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     goal_reached = current_dist < threshold
     goal_reached_float = goal_reached.float()
     
-    # Record success metric in env extras
-    if "metrics" not in env.extras:
-        env.extras["metrics"] = {}
+    # The ids of the environments that have reached the final goal (last waypoint) at this step
+    reset_ids = env.reset_buf.nonzero(as_tuple=False).flatten()
     
-    # Update the success rate metric using an exponential moving average
-    current_batch_success = torch.mean(goal_reached_float).item()
-    if "success_rate" not in env.extras["metrics"]:
-        env.extras["metrics"]["success_rate"] = current_batch_success
-    else:
-        alpha = 0.05  # smoothing factor for the moving average
-        env.extras["metrics"]["success_rate"] = (
-            (1.0 - alpha) * env.extras["metrics"]["success_rate"] + alpha * current_batch_success
-        )
+    if len(reset_ids) > 0:        
+        # Consider it a success if the robot has reached the goal and it is the final waypoint
+        is_last = (wm.target_indices == wm.num_waypoints - 1)
+        success_final = is_last & goal_reached
         
+        # Calculate the success rate for the batch of environments that are resetting at this step
+        batch_success_rate = success_final[reset_ids].float().mean().item()
+        
+        # Update the overall success rate metric using an exponential moving average
+        alpha = 0.01
+        env.extras["metrics"]["success_rate"] = (
+            (1.0 - alpha) * env.extras["metrics"]["success_rate"] + alpha * batch_success_rate
+        )
+    
     return goal_reached_float

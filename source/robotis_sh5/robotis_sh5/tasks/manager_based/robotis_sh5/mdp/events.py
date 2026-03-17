@@ -147,31 +147,55 @@ def linear_curriculum_distance(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, 
     
     return (new_low, new_high, new_lateral)
 
-def adaptive_distance_curriculum(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, old_value: tuple, max_distance_range: tuple) -> tuple:
+def adaptive_distance_curriculum(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor,
+    old_value: tuple,
+    max_distance_range: tuple,
+    grace_period: int = 12000,
+    fade_in_steps: int = 24000
+) -> tuple:
     """
-    Update the distance range for the curriculum learning based on the recent success rate of the agent.
+    Update the distance range for the curriculum learning based on the agent's success rate in reaching the goal.
+    The curriculum will adapt to the agent's performance, allowing for a more personalized learning experience.
 
     Args:
         env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
         env_ids (torch.Tensor): The indices of the environments for which to update the distance range.
         old_value (tuple): The initial distance range values (low_dist, high_dist, lateral_dist).
         max_distance_range (tuple): The maximum distance range values (low_dist, high_dist, lateral_dist).
+        grace_period (int): The number of steps to wait before starting to update the curriculum based on success rate.
+        fade_in_steps (int): The number of steps over which to fade in the curriculum updates
 
     Returns:
         tuple: The updated distance range values (low_dist, high_dist, lateral_dist).
     """
     
-    # Get the recent success rate from the environment's metrics
+    # Get the current success rate and current step 
     success_rate = env.extras.get("metrics", {}).get("success_rate", 0.0)
+    current_step = env.common_step_counter
     
     # Initial and target distance range values for the curriculum learning
     start_low, start_high, start_lateral = 1.0, 2.0, 1.5
     target_low, target_high, target_lateral = max_distance_range
     
+    # During the grace period, return the initial distance range values without updating based on success rate
+    if current_step < grace_period:
+        return (start_low, start_high, start_lateral)
+    
+    # Calculate the time scale for fading in the curriculum updates based on the current step and fade-in duration
+    if fade_in_steps <= 0:
+        time_scale = 1.0
+    else:
+        time_scale = min(1.0, (current_step - grace_period) / fade_in_steps)
+    
+    # Calculate the final scale for the curriculum updates by combining the time scale and success rate
+    final_scale = time_scale * success_rate
+
     # Interpolate the distance range values based on the recent success rate,
     # allowing the curriculum to adapt to the agent's performance
-    new_low = start_low + (target_low - start_low) * success_rate
-    new_high = start_high + (target_high - start_high) * success_rate
-    new_lateral = start_lateral + (target_lateral - start_lateral) * success_rate
+    new_low = start_low + (target_low - start_low) * final_scale
+    new_high = start_high + (target_high - start_high) * final_scale
+    new_lateral = start_lateral + (target_lateral - start_lateral) * final_scale
     
     return (new_low, new_high, new_lateral)
