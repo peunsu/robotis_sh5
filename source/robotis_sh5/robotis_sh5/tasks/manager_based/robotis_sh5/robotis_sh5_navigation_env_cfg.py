@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import os
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -132,7 +133,7 @@ class EventCfg:
     reset_waypoint_positions = EventTermCfg(
         func=mdp.reset_random_waypoints,
         mode="reset",
-        params={"num_waypoints": 10, "distance_range": (1.0, 2.0, 1.5)}
+        params={"num_waypoints": 10, "waypoint_params": (1.0, 2.0, torch.pi / 2)}
     )
     
     # Reset robot position at the start of each episode
@@ -194,30 +195,15 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum specifications."""
 
-    # Dynamically increase the distance range for random waypoint generation as training progresses
-    # waypoint_distance_curriculum = CurriculumTermCfg(
-    #     func=mdp.modify_term_cfg,
-    #     params={
-    #         # Modify the distance_range parameter of the reset_random_waypoints event term
-    #         # to increase the range linearly from (1.0, 2.0, 1.5) to (3.0, 5.0, 4.0) over 72000 steps
-    #         "address": "events.reset_waypoint_positions.params.distance_range",
-    #         "modify_fn": mdp.linear_curriculum_distance,
-    #         "modify_params": {
-    #             "max_distance_range": (3.0, 5.0, 4.0), # Maximum distance range for waypoint randomization at the end of curriculum
-    #             "max_steps": 72000,                    # Steps at which the curriculum should reach the maximum distance range
-    #         },
-    #     },
-    # )
-    
     waypoint_distance_curriculum = CurriculumTermCfg(
         func=mdp.modify_term_cfg,
         params={
-            "address": "events.reset_waypoint_positions.params.distance_range",
+            "address": "events.reset_waypoint_positions.params.waypoint_params",
             "modify_fn": mdp.adaptive_distance_curriculum,
             "modify_params": {
-                "max_distance_range": (3.0, 5.0, 4.0), # Maximum distance range for waypoint randomization at the end of curriculum
-                "grace_period": 0,                    # Steps to wait before starting curriculum updates
-                "fade_in_steps": 0,                   # Steps over which to fade in the curriculum updates
+                "waypoint_params": (3.0, 5.0, torch.pi),
+                "grace_period": 0,
+                "fade_in_steps": 0,
             },
         },
     )

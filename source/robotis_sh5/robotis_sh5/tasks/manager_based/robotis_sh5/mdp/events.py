@@ -16,7 +16,12 @@ if TYPE_CHECKING:
     
 logger = logging.getLogger(__name__)
 
-def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_waypoints: int, distance_range: tuple[float, float, float]):
+def reset_random_waypoints(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor,
+    num_waypoints: int,
+    waypoint_params: tuple[float, float, float]
+):
     """
     Reset the waypoints for the specified environments with random positions.
 
@@ -24,7 +29,7 @@ def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_
         env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
         env_ids (torch.Tensor): The indices of the environments to reset.
         num_waypoints (int): The number of waypoints to generate.
-        distance_range (tuple[float, float, float]): The range of distances for the waypoints. (low_dist, high_dist, lateral_dist)
+        waypoint_params (tuple[float, float, float]): The parameters for waypoint generation. (min_dist, max_dist, angle_limit)
     """
     
     wm = get_or_create_waypoint_manager(env, num_waypoints)
@@ -34,30 +39,30 @@ def reset_random_waypoints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, num_
     # Get the reference position for the specified environments (usually the environment origin)
     reference_pos = env.scene.env_origins[env_ids]
     
-    
-    # Generate random waypoints in front of the robot within the specified distance range
+    # Initialize a tensor to store the generated waypoint positions for all resets and waypoints
     fps = torch.zeros((num_resets, num_waypoints, 3), device=env.device)
-    low_dist, high_dist, lateral_dist = distance_range[0], distance_range[1], distance_range[2]
     
-    # To create a path of waypoints that extends forward from the robot,
-    # we can generate random distances along the x-axis (forward direction) for each waypoint,
-    # while adding some random lateral offset on the y-axis.
-    # The z-axis can be set to a fixed height for all waypoints.
-    # This will create a more natural and navigable path for the robot to follow.
-    cumulative_x = torch.zeros(num_resets, device=env.device)
+    # Unpack the distance range into minimum and maximum distance values for waypoint generation
+    min_dist, max_dist, angle_limit = waypoint_params[0], waypoint_params[1], waypoint_params[2]
+    
+    # Initialize a tensor to keep track of the previous position for each environment,
+    # which will be used to generate waypoints
+    prev_pos = torch.zeros((num_resets, 2), device=env.device) 
+
     for i in range(num_waypoints):
-        # Generate a random step distance along the x-axis for each waypoint,
-        # ensuring that waypoints are spaced out in front of the robot
-        dist_step = torch.empty(num_resets, device=env.device).uniform_(low_dist, high_dist)
-        cumulative_x += dist_step
+        # Generate random distances for the waypoints within the specified distance range
+        r = torch.empty(num_resets, device=env.device).uniform_(min_dist, max_dist)
         
-        # Random distance along the x-axis (forward direction)
-        fps[:, i, 0] = cumulative_x
+        # Generate random angles for the waypoints within the specified angle limit
+        theta = torch.empty(num_resets, device=env.device).uniform_(-angle_limit, angle_limit)
         
-        # Random lateral offset along the y-axis (sideways direction)
-        fps[:, i, 1] = torch.empty(num_resets, device=env.device).uniform_(-lateral_dist, lateral_dist)
+        # Calculate the waypoint positions in front of the robot based on the random distances and angles
+        prev_pos[:, 0] += r * torch.cos(theta)
+        prev_pos[:, 1] += r * torch.sin(theta)
         
-        # Fixed height (z-axis)
+        # Store the generated waypoint positions in the fps tensor, with a fixed height of 0.2
+        fps[:, i, 0] = prev_pos[:, 0]
+        fps[:, i, 1] = prev_pos[:, 1]
         fps[:, i, 2] = 0.2
         
     # Set the waypoint positions in the WaypointManager by adding the reference position to the generated waypoints
@@ -115,60 +120,27 @@ def update_waypoint_status(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, thre
     if wm is not None:
         wm.update(threshold=threshold)
 
-def linear_curriculum_distance(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, old_value: tuple, max_distance_range: tuple, max_steps: int) -> tuple:
-    """
-    Update the distance range for the curriculum learning based on the current step.
-
-    Args:
-        env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
-        env_ids (torch.Tensor): The indices of the environments for which to update the distance range.
-        old_value (tuple): The initial distance range values (low_dist, high_dist, lateral_dist).
-        max_distance_range (tuple): The maximum distance range values (low_dist, high_dist, lateral_dist).
-        max_steps (int): The maximum number of steps for the curriculum learning.
-
-    Returns:
-        tuple: The updated distance range values (low_dist, high_dist, lateral_dist).
-    """
-    
-    current_step = env.common_step_counter
-    
-    # Calculate the progress of the curriculum learning as a value between 0 and 1
-    progress = min(current_step / max_steps, 1.0)
-    
-    # Linearly interpolate the distance range values based on the progress of the curriculum learning
-    start_low, start_high, start_lateral = 1.0, 2.0, 1.5
-    target_low, target_high, target_lateral = max_distance_range
-    
-    new_low = start_low + (target_low - start_low) * progress
-    new_high = start_high + (target_high - start_high) * progress
-    new_lateral = start_lateral + (target_lateral - start_lateral) * progress
-    
-    logger.info(f"Curriculum update - Step: {current_step}, Progress: {progress:.2%}, Distance Range: ({new_low:.2f}, {new_high:.2f}, {new_lateral:.2f})")
-    
-    return (new_low, new_high, new_lateral)
-
 def adaptive_distance_curriculum(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
     old_value: tuple,
-    max_distance_range: tuple,
+    waypoint_params: tuple[float, float, float],
     grace_period: int = 12000,
     fade_in_steps: int = 24000
 ) -> tuple:
     """
-    Update the distance range for the curriculum learning based on the agent's success rate in reaching the goal.
-    The curriculum will adapt to the agent's performance, allowing for a more personalized learning experience.
+    Adaptively modify the waypoint generation parameters based on the agent's success rate to create a curriculum learning effect.
 
     Args:
         env (ManagerBasedRLEnv): The environment instance containing the robot state information and scene.
         env_ids (torch.Tensor): The indices of the environments for which to update the distance range.
-        old_value (tuple): The initial distance range values (low_dist, high_dist, lateral_dist).
-        max_distance_range (tuple): The maximum distance range values (low_dist, high_dist, lateral_dist).
+        old_value (tuple): The initial curriculum parameter values.
+        waypoint_params (tuple[float, float, float]): The parameters for waypoint generation. (min_dist, max_dist, angle_limit)
         grace_period (int): The number of steps to wait before starting to update the curriculum based on success rate.
         fade_in_steps (int): The number of steps over which to fade in the curriculum updates
 
     Returns:
-        tuple: The updated distance range values (low_dist, high_dist, lateral_dist).
+        tuple: The updated values ((min_dist, max_dist), angle_limit) for the curriculum learning.
     """
     
     # Get the current success rate and current step 
@@ -176,26 +148,22 @@ def adaptive_distance_curriculum(
     current_step = env.common_step_counter
     
     # Initial and target distance range values for the curriculum learning
-    start_low, start_high, start_lateral = 1.0, 2.0, 1.5
-    target_low, target_high, target_lateral = max_distance_range
+    start_min_dist, start_max_dist, start_angle_limit = 1.0, 2.0, (torch.pi / 2)
+    target_min_dist, target_max_dist, target_angle_limit = waypoint_params[0], waypoint_params[1], waypoint_params[2]
     
     # During the grace period, return the initial distance range values without updating based on success rate
     if current_step < grace_period:
-        return (start_low, start_high, start_lateral)
+        return (start_min_dist, start_max_dist, start_angle_limit)
     
     # Calculate the time scale for fading in the curriculum updates based on the current step and fade-in duration
-    if fade_in_steps <= 0:
-        time_scale = 1.0
-    else:
-        time_scale = min(1.0, (current_step - grace_period) / fade_in_steps)
+    time_scale = min(1.0, (current_step - grace_period) / fade_in_steps) if fade_in_steps > 0 else 1.0
     
     # Calculate the final scale for the curriculum updates by combining the time scale and success rate
     final_scale = time_scale * success_rate
 
-    # Interpolate the distance range values based on the recent success rate,
-    # allowing the curriculum to adapt to the agent's performance
-    new_low = start_low + (target_low - start_low) * final_scale
-    new_high = start_high + (target_high - start_high) * final_scale
-    new_lateral = start_lateral + (target_lateral - start_lateral) * final_scale
+    # Interpolate the distance range and angle limit based on the final scale
+    new_min_dist = start_min_dist + (target_min_dist - start_min_dist) * final_scale
+    new_max_dist = start_max_dist + (target_max_dist - start_max_dist) * final_scale
+    new_angle_limit = start_angle_limit + (target_angle_limit - start_angle_limit) * final_scale
     
-    return (new_low, new_high, new_lateral)
+    return (new_min_dist, new_max_dist, new_angle_limit)
