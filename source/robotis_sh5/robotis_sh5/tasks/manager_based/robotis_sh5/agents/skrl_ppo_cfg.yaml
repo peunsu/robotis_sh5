@@ -67,7 +67,7 @@ agent:
   # logging and checkpoint
   experiment:
     directory: "robotis_sh5_navigation"
-    experiment_name: "curriculum_distance"
+    experiment_name: "curriculum_distance_without_heading"
     write_interval: 100
     checkpoint_interval: 1000
     wandb: False

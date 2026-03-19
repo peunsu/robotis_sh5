@@ -93,7 +93,7 @@ def goal_reached_reward(env: "ManagerBasedRLEnv", threshold: float) -> torch.Ten
     if "metrics" not in env.extras:
         env.extras["metrics"] = {"success_rate": 0.0}
     if "success_buffer" not in env.extras:
-        env.extras["success_buffer"] = deque(maxlen=1000) # Buffer to store recent success outcomes for calculating success rate
+        env.extras["success_buffer"] = deque(maxlen=5000) # Buffer to store recent success outcomes for calculating success rate
     
     # Calculate the current distance to the target
     root_pos = env.scene["robot"].data.root_pos_w[:, :2]
