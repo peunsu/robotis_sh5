@@ -21,7 +21,7 @@ from isaaclab.managers import (
 )
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.markers import VisualizationMarkersCfg
-from isaaclab.utils import configclass
+from isaaclab.utils import configclass, AdditiveUniformNoiseCfg
 
 from . import mdp
 
@@ -183,18 +183,27 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
     # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
+        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=2500.0),
     )
 
 @configclass
 class ActionsCfg:
     """Action specifications."""
-
-    # SwerveDriveAction outputs [linear_vel_x, linear_vel_y, angular_vel_z]
-    base_velocity = mdp.SwerveDriveActionCfg(
+    
+    lift_action = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=[".*_steer", ".*_drive"],
-        scale=(1.0, 1.0, 2.0)  # vx, vy 스케일은 1.0, 회전(w) 스케일은 2.0
+        joint_names=["lift_joint"],
+        scale=0.5,
+    )
+    arm_l_action = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["arm_l_joint[1-7]"],
+        scale=0.5,
+    )
+    arm_r_action = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["arm_r_joint[1-7]"],
+        scale=0.5,
     )
 
 
@@ -206,33 +215,32 @@ class ObservationsCfg:
     class PolicyCfg(ObservationGroupCfg):
         """Observations for policy group."""
 
-        # Wheel joint positions with respect to the robot base (6 joints: 3 drive + 3 steer)
-        joint_pos_rel = ObservationTermCfg(
-            func=mdp.joint_pos_rel, 
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*drive", ".*steer"])}
+        joint_pos = ObservationTermCfg(
+            func=mdp.joint_pos_rel,
+            noise=AdditiveUniformNoiseCfg(n_min=-0.01, n_max=0.01),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["arm_l_joint[1-7]", "arm_r_joint[1-7]", "lift_joint"])}
         )
         
-        # Wheel joint velocities with respect to the robot base (6 joints: 3 drive + 3 steer)
-        joint_vel_rel = ObservationTermCfg(
-            func=mdp.joint_vel_rel, 
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*drive", ".*steer"])}
+        joint_vel = ObservationTermCfg(
+            func=mdp.joint_vel_rel,
+            noise=AdditiveUniformNoiseCfg(n_min=-0.01, n_max=0.01),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["arm_l_joint[1-7]", "arm_r_joint[1-7]", "lift_joint"])}
         )
         
-        # Root linear and angular velocity in the robot's local frame (3 linear + 3 angular)
-        base_lin_vel = ObservationTermCfg(func=mdp.base_lin_vel)
-        base_ang_vel = ObservationTermCfg(func=mdp.base_ang_vel)
+        pose_command_l = ObservationTermCfg(
+            func=mdp.generated_commands,
+            params={"command_name": "ee_pose_l"}
+        )
         
-        # Relative position to the current target waypoint (x, y in the robot's local frame)
-        rel_goal_pos = ObservationTermCfg(func=mdp.get_rel_pos_to_current_waypoint)
+        pose_command_r = ObservationTermCfg(
+            func=mdp.generated_commands,
+            params={"command_name": "ee_pose_r"}
+        )
         
-        # The index of the current target waypoint (scalar)
-        # target_index = ObservationTermCfg(func=mdp.get_target_waypoint_index)
-        
-        # Relative heading to the current target waypoint, represented as sin and cos (2 values)
-        target_heading = ObservationTermCfg(func=mdp.get_waypoint_heading_error_sin_cos)
+        actions = ObservationTermCfg(func=mdp.last_action)
 
         def __post_init__(self) -> None:
-            self.enable_corruption = False
+            self.enable_corruption = True
             self.concatenate_terms = True
 
     # observation groups
@@ -243,84 +251,25 @@ class ObservationsCfg:
 class EventCfg:
     """Event specifications."""
     
-    # Reset waypoint positions at the start of each episode, with randomization
-    reset_waypoint_positions = EventTermCfg(
-        func=mdp.reset_random_waypoints,
-        mode="reset",
-        params={"num_waypoints": 10, "waypoint_params": (1.0, 2.0, torch.pi / 2)}
-    )
-    
-    # Reset robot position at the start of each episode
-    reset_robot_position = EventTermCfg(func=mdp.reset_root_at_origin, mode="reset")
-    
-    # Update waypoint status every step (Interval)
-    update_waypoints = EventTermCfg(
-        func=mdp.update_waypoint_status,
-        mode="interval",
-        is_global_time=False,
-        interval_range_s=(0.001, 0.001), 
-        params={"threshold": 0.2}
-    )
+    pass
 
 @configclass
 class RewardsCfg:
     """Reward specifications."""
     
-    # The difference in distance to the target waypoint since the last step (progress reward)
-    progress = RewardTermCfg(
-        func=mdp.position_progress_reward,
-        weight=2.0
-    )
-    
-    # Alignment of the robot's heading with the direction to the target waypoint (encourages facing the target)
-    # heading = RewardTermCfg(
-    #     func=mdp.heading_alignment_reward,
-    #     weight=0.5,
-    #     params={"sigma": 0.25}
-    # )
-    
-    # A reward for reaching the goal (current waypoint), given when the robot is within a certain threshold distance
-    goal = RewardTermCfg(
-        func=mdp.goal_reached_reward,
-        weight=15.0,
-        params={"threshold": 0.2}
-    )
-    
-    # A small penalty on action to encourage smoother control
-    action_rate = RewardTermCfg(
-        func=mdp.action_rate_l2, 
-        weight=-0.01
-    )
+    pass
 
 @configclass
 class TerminationsCfg:
     """Termination specifications."""
     
-    # Termination if the episode exceeds the maximum time limit
-    time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
-    
-    # Termination if the robot's orientation is too tilted (e.g., fallen over)
-    robot_fell = TerminationTermCfg(func=mdp.bad_orientation, params={"threshold": 0.5})
-    
-    # Termination if all waypoints have been reached (task completion)
-    task_completed = TerminationTermCfg(func=mdp.all_waypoints_reached)
+    pass
     
 @configclass
 class CurriculumCfg:
     """Curriculum specifications."""
 
-    waypoint_distance_curriculum = CurriculumTermCfg(
-        func=mdp.modify_term_cfg,
-        params={
-            "address": "events.reset_waypoint_positions.params.waypoint_params",
-            "modify_fn": mdp.adaptive_distance_curriculum,
-            "modify_params": {
-                "waypoint_params": (3.0, 5.0, torch.pi),
-                "grace_period": 0,
-                "fade_in_steps": 0,
-            },
-        },
-    )
+    pass
 
 @configclass
 class RobotisSh5ReachEnvCfg(ManagerBasedRLEnvCfg):
