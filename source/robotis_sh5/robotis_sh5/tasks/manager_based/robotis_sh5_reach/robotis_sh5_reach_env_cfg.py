@@ -207,9 +207,9 @@ class CommandsCfg:
             pos_x=(0.5, 0.7),
             pos_y=(-0.3, -0.1),
             pos_z=(0.8, 1.6),
-            roll=(torch.pi / 2 - 0, torch.pi / 2 + 0),
-            pitch=( - 0,  + 0),
-            yaw=(torch.pi / 2 - 0, torch.pi / 2 + 0),
+            roll=(- torch.pi / 2 - torch.pi / 8, - torch.pi / 2 + torch.pi / 8),
+            pitch=(torch.pi - torch.pi / 8, torch.pi + torch.pi / 8),
+            yaw=(- torch.pi / 2 - torch.pi / 8, - torch.pi / 2 + torch.pi / 8),
         ),
     )
 
