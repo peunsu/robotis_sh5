@@ -43,18 +43,19 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                #disable_gravity=True,
+                disable_gravity=True,
                 max_depenetration_velocity=5.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
+                fix_root_link=True,
                 solver_position_iteration_count=32,
                 solver_velocity_iteration_count=1,
             ),
             activate_contact_sensors=False,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.1),
+            pos=(0.0, 0.0, 0.0),
             joint_pos={
                 # # Swerve base joints
                 "left_wheel_drive": 0.0, "left_wheel_steer": 0.0,
