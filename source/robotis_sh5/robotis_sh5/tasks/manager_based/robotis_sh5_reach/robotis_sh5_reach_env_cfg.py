@@ -113,7 +113,7 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
                     "arm_r_joint[1-2]",
                 ],
                 velocity_limit_sim=15.0,
-                effort_limit_sim=61.4,
+                effort_limit_sim=1000.0,  # 61.4
                 stiffness=600.0,
                 damping=30.0,
             ),
@@ -123,7 +123,7 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
                     "arm_r_joint[3-6]",
                 ],
                 velocity_limit_sim=15.0,
-                effort_limit_sim=31.7,
+                effort_limit_sim=1000.0,  # 31.7
                 stiffness=600.0,
                 damping=20.0,
             ),
@@ -133,7 +133,7 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
                     "arm_r_joint7",
                 ],
                 velocity_limit_sim=6.0,
-                effort_limit_sim=5.1,
+                effort_limit_sim=1000.0,  # 5.1
                 stiffness=200.0,
                 damping=3.0,
             ),
@@ -156,7 +156,8 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
             # Actuators for hands
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=["finger_l_joint[1-20]", "finger_r_joint[1-20]"],
-                effort_limit_sim=20.0,
+                velocity_limit_sim=2.2,
+                effort_limit_sim=1000.0,  # 20.0
                 stiffness=2.0,
                 damping=0.5,
             ),
@@ -165,7 +166,7 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
             "head": ImplicitActuatorCfg(
                 joint_names_expr=["head_joint1", "head_joint2"],
                 velocity_limit_sim=2.0,
-                effort_limit_sim=30.0,
+                effort_limit_sim=1000.0,  # 30.0
                 stiffness=150.0,
                 damping=3.0,
             ),
@@ -295,7 +296,7 @@ class RewardsCfg:
     # Reward left end-effector tracking
     end_effector_position_tracking_left = RewardTermCfg(
         func=mdp.position_command_error,
-        weight=-0.25,
+        weight=-0.35,  # default: -0.25
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "command_name": "ee_pose_l"
@@ -303,7 +304,7 @@ class RewardsCfg:
     )
     end_effector_position_tracking_fine_grained_left = RewardTermCfg(
         func=mdp.position_command_error_tanh,
-        weight=0.12,
+        weight=0.25,  # default: 0.12
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "std": 0.1,
@@ -322,7 +323,7 @@ class RewardsCfg:
     # Reward right end-effector tracking
     end_effector_position_tracking_right = RewardTermCfg(
         func=mdp.position_command_error,
-        weight=-0.25,
+        weight=-0.35,  # default: -0.25  
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "command_name": "ee_pose_r"
@@ -330,7 +331,7 @@ class RewardsCfg:
     )
     end_effector_position_tracking_fine_grained_right = RewardTermCfg(
         func=mdp.position_command_error_tanh,
-        weight=0.12,
+        weight=0.25,  # default: 0.12
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "std": 0.1,
@@ -356,6 +357,18 @@ class RewardsCfg:
         weight=0.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
+    
+    # Experimental: a penalty on the difference between the left and right end-effector errors to encourage more balanced bimanual coordination
+    # bimanual_diff_penalty = RewardTermCfg(
+    #     func=mdp.bimanual_error_difference_penalty,
+    #     weight=-0.1,
+    #     params={
+    #         "asset_cfg_l": SceneEntityCfg("robot", body_names=["hx5_d20_left_base"]),
+    #         "asset_cfg_r": SceneEntityCfg("robot", body_names=["hx5_d20_right_base"]),
+    #         "command_name_l": "ee_pose_l",
+    #         "command_name_r": "ee_pose_r",
+    #     },
+    # )
 
 @configclass
 class TerminationsCfg:
@@ -386,7 +399,7 @@ class RobotisSh5ReachEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    # curriculum: CurriculumCfg = CurriculumCfg()
 
     # Post initialization
     def __post_init__(self) -> None:
