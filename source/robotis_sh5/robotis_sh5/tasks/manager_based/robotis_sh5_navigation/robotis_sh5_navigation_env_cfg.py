@@ -159,11 +159,11 @@ class RewardsCfg:
     )
     
     # Alignment of the robot's heading with the direction to the target waypoint (encourages facing the target)
-    # heading = RewardTermCfg(
-    #     func=mdp.heading_alignment_reward,
-    #     weight=0.5,
-    #     params={"sigma": 0.25}
-    # )
+    heading = RewardTermCfg(
+        func=mdp.heading_alignment_reward,
+        weight=0.5,
+        params={"sigma": 0.25}
+    )
     
     # A reward for reaching the goal (current waypoint), given when the robot is within a certain threshold distance
     goal = RewardTermCfg(

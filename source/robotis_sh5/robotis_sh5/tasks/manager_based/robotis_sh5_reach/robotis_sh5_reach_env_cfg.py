@@ -41,7 +41,7 @@ class RobotisSh5ReachSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5.usd",
+            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_depenetration_velocity=5.0,
@@ -204,7 +204,7 @@ class CommandsCfg:
         resampling_time_range=(2.0, 4.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.5, 0.7),
+            pos_x=(0.45, 0.65),
             pos_y=(-0.3, -0.1),
             pos_z=(0.8, 1.6),
             roll=(- torch.pi / 2 - torch.pi / 8, - torch.pi / 2 + torch.pi / 8),
@@ -349,11 +349,11 @@ class RewardsCfg:
     # Penalty on action rate and joint velocity to encourage smoother motions
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
-        weight=-0.0001
+        weight=0.0
     )
     joint_vel = RewardTermCfg(
         func=mdp.joint_vel_l2,
-        weight=-0.0001,
+        weight=0.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
@@ -365,9 +365,14 @@ class TerminationsCfg:
     
 @configclass
 class CurriculumCfg:
-    """Curriculum specifications."""
+    """Curriculum learning configuration."""
 
-    pass
+    action_rate = CurriculumTermCfg(
+        func=mdp.modify_reward_weight, params={"term_name": "action_rate", "weight": -0.0001, "num_steps": 4500}
+    )
+    joint_vel = CurriculumTermCfg(
+        func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -0.0001, "num_steps": 4500}
+    )
 
 @configclass
 class RobotisSh5ReachEnvCfg(ManagerBasedRLEnvCfg):
@@ -381,7 +386,7 @@ class RobotisSh5ReachEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
-    # curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     # Post initialization
     def __post_init__(self) -> None:
