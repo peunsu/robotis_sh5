@@ -296,7 +296,7 @@ class RewardsCfg:
     # Reward left end-effector tracking
     end_effector_position_tracking_left = RewardTermCfg(
         func=mdp.position_command_error,
-        weight=-0.35,  # default: -0.25
+        weight=-0.30,  # default: -0.25
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "command_name": "ee_pose_l"
@@ -304,7 +304,7 @@ class RewardsCfg:
     )
     end_effector_position_tracking_fine_grained_left = RewardTermCfg(
         func=mdp.position_command_error_tanh,
-        weight=0.25,  # default: 0.12
+        weight=0.18,  # default: 0.12
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "std": 0.1,
@@ -323,7 +323,7 @@ class RewardsCfg:
     # Reward right end-effector tracking
     end_effector_position_tracking_right = RewardTermCfg(
         func=mdp.position_command_error,
-        weight=-0.35,  # default: -0.25  
+        weight=-0.30,  # default: -0.25  
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "command_name": "ee_pose_r"
@@ -331,7 +331,7 @@ class RewardsCfg:
     )
     end_effector_position_tracking_fine_grained_right = RewardTermCfg(
         func=mdp.position_command_error_tanh,
-        weight=0.25,  # default: 0.12
+        weight=0.18,  # default: 0.12
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "std": 0.1,
@@ -350,11 +350,11 @@ class RewardsCfg:
     # Penalty on action rate and joint velocity to encourage smoother motions
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
-        weight=0.0
+        weight=0.0,  # default: -0.0001
     )
     joint_vel = RewardTermCfg(
         func=mdp.joint_vel_l2,
-        weight=0.0,
+        weight=0.0,  # default: -0.0001
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
     
@@ -380,11 +380,37 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum learning configuration."""
 
-    action_rate = CurriculumTermCfg(
-        func=mdp.modify_reward_weight, params={"term_name": "action_rate", "weight": -0.0001, "num_steps": 4500}
+    # action_rate = CurriculumTermCfg(
+    #     func=mdp.modify_reward_weight, params={"term_name": "action_rate", "weight": -0.0001, "num_steps": 10000}
+    # )
+    # joint_vel = CurriculumTermCfg(
+    #     func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -0.0001, "num_steps": 10000}
+    # )
+    
+    action_rate_curriculum = CurriculumTermCfg(
+        func=mdp.modify_env_param,
+        params={
+            "address": "reward_manager.cfg.action_rate.weight", 
+            "modify_fn": mdp.fade_in_reward_weight,
+            "modify_params": {
+                "target_weight": -0.0001,
+                "grace_period": 10000,
+                "fade_in_steps": 20000,
+            }
+        }
     )
-    joint_vel = CurriculumTermCfg(
-        func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -0.0001, "num_steps": 4500}
+
+    joint_vel_curriculum = CurriculumTermCfg(
+        func=mdp.modify_env_param,
+        params={
+            "address": "reward_manager.cfg.joint_vel.weight",
+            "modify_fn": mdp.fade_in_reward_weight,
+            "modify_params": {
+                "target_weight": -0.0001,
+                "grace_period": 10000,
+                "fade_in_steps": 20000,
+            }
+        }
     )
 
 @configclass
@@ -399,7 +425,7 @@ class RobotisSh5ReachEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
-    # curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     # Post initialization
     def __post_init__(self) -> None:
