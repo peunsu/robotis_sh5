@@ -205,7 +205,7 @@ class CommandsCfg:
         resampling_time_range=(2.0, 4.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.45, 0.65),
+            pos_x=(0.50, 0.70),  # default: (0.45, 0.65)
             pos_y=(-0.3, -0.1),
             pos_z=(0.8, 1.6),
             roll=(- torch.pi / 2 - torch.pi / 8, - torch.pi / 2 + torch.pi / 8),
@@ -394,8 +394,8 @@ class CurriculumCfg:
             "modify_fn": mdp.fade_in_reward_weight,
             "modify_params": {
                 "target_weight": -0.0001,
-                "grace_period": 10000,
-                "fade_in_steps": 20000,
+                "grace_period": 8000,
+                "fade_in_steps": 2000,
             }
         }
     )
@@ -407,8 +407,8 @@ class CurriculumCfg:
             "modify_fn": mdp.fade_in_reward_weight,
             "modify_params": {
                 "target_weight": -0.0001,
-                "grace_period": 10000,
-                "fade_in_steps": 20000,
+                "grace_period": 8000,
+                "fade_in_steps": 2000,
             }
         }
     )
