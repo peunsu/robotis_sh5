@@ -304,7 +304,7 @@ class RewardsCfg:
     )
     end_effector_position_tracking_fine_grained_left = RewardTermCfg(
         func=mdp.position_command_error_tanh,
-        weight=0.18,  # default: 0.12
+        weight=0.20,  # default: 0.12
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "std": 0.1,
@@ -331,7 +331,7 @@ class RewardsCfg:
     )
     end_effector_position_tracking_fine_grained_right = RewardTermCfg(
         func=mdp.position_command_error_tanh,
-        weight=0.18,  # default: 0.12
+        weight=0.20,  # default: 0.12
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
             "std": 0.1,
@@ -408,7 +408,7 @@ class CurriculumCfg:
             "modify_fn": mdp.fade_in_reward_weight,
             "modify_params": {
                 "initial_weight": 0.0,
-                "target_weight": -0.000001,
+                "target_weight": -0.00001,
                 "grace_period": 8000,
                 "fade_in_steps": 2000,
             }
