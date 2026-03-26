@@ -350,7 +350,7 @@ class RewardsCfg:
     # Penalty on action rate and joint velocity to encourage smoother motions
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
-        weight=0.0,  # default: -0.0001
+        weight=-0.0001,  # default: -0.0001
     )
     joint_vel = RewardTermCfg(
         func=mdp.joint_vel_l2,
@@ -393,7 +393,8 @@ class CurriculumCfg:
             "address": "reward_manager.cfg.action_rate.weight", 
             "modify_fn": mdp.fade_in_reward_weight,
             "modify_params": {
-                "target_weight": -0.0001,
+                "initial_weight": -0.0001,
+                "target_weight": -0.005,
                 "grace_period": 8000,
                 "fade_in_steps": 2000,
             }
@@ -406,7 +407,8 @@ class CurriculumCfg:
             "address": "reward_manager.cfg.joint_vel.weight",
             "modify_fn": mdp.fade_in_reward_weight,
             "modify_params": {
-                "target_weight": -0.0001,
+                "initial_weight": 0.0,
+                "target_weight": -0.000001,
                 "grace_period": 8000,
                 "fade_in_steps": 2000,
             }
