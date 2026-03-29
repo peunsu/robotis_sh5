@@ -1,6 +1,6 @@
 retargeting:
   type: position
-  urdf_path: hx5_d20/hx5_d20_right.urdf
+  urdf_path: hx5_d20_right.urdf
 
   target_joint_names: [ 'finger_r_joint1', 'finger_r_joint2', 'finger_r_joint3', 'finger_r_joint4',
                         'finger_r_joint5', 'finger_r_joint6', 'finger_r_joint7', 'finger_r_joint8',
