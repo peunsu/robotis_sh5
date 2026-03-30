@@ -2,11 +2,12 @@ retargeting:
   type: position
   urdf_path: hx5_d20_left.urdf
 
-  target_joint_names: [ 'finger_l_joint1', 'finger_l_joint2', 'finger_l_joint3', 'finger_l_joint4',
-                        'finger_l_joint5', 'finger_l_joint6', 'finger_l_joint7', 'finger_l_joint8',
-                        'finger_l_joint9', 'finger_l_joint10', 'finger_l_joint11', 'finger_l_joint12',
-                        'finger_l_joint13', 'finger_l_joint14', 'finger_l_joint15', 'finger_l_joint16',
-                        'finger_l_joint17', 'finger_l_joint18', 'finger_l_joint19', 'finger_l_joint20' ]
+  target_joint_names: null
+  # target_joint_names: [ 'finger_l_joint1', 'finger_l_joint2', 'finger_l_joint3', 'finger_l_joint4',
+  #                       'finger_l_joint5', 'finger_l_joint6', 'finger_l_joint7', 'finger_l_joint8',
+  #                       'finger_l_joint9', 'finger_l_joint10', 'finger_l_joint11', 'finger_l_joint12',
+  #                       'finger_l_joint13', 'finger_l_joint14', 'finger_l_joint15', 'finger_l_joint16',
+  #                       'finger_l_joint17', 'finger_l_joint18', 'finger_l_joint19', 'finger_l_joint20' ]
   target_link_names: [ "finger_end_l_link1", "finger_end_l_link2", "finger_end_l_link3", "finger_end_l_link4", "finger_end_l_link5",
                        "finger_l_link3", "finger_l_link7", "finger_l_link11", "finger_l_link15", "finger_l_link19" ]
 
