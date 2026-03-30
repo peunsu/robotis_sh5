@@ -1,5 +1,6 @@
 retargeting/DexYCB
 retargeting/manopth
+retargeting/trajectories
 
 # C++
 **/cmake-build*/

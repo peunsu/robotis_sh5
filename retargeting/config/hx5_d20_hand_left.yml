@@ -7,9 +7,10 @@ retargeting:
                         'finger_l_joint9', 'finger_l_joint10', 'finger_l_joint11', 'finger_l_joint12',
                         'finger_l_joint13', 'finger_l_joint14', 'finger_l_joint15', 'finger_l_joint16',
                         'finger_l_joint17', 'finger_l_joint18', 'finger_l_joint19', 'finger_l_joint20' ]
-  target_link_names: [ "finger_end_l_link1", "finger_end_l_link2", "finger_end_l_link3", "finger_end_l_link4", "finger_end_l_link5" ]
+  target_link_names: [ "finger_end_l_link1", "finger_end_l_link2", "finger_end_l_link3", "finger_end_l_link4", "finger_end_l_link5",
+                       "finger_l_link3", "finger_l_link7", "finger_l_link11", "finger_l_link15", "finger_l_link19" ]
 
-  target_link_human_indices: [ 4, 8, 12, 16, 20 ]
+  target_link_human_indices: [ 4, 8, 12, 16, 20, 2, 6, 10, 14, 18 ]
   add_dummy_free_joint: True
 
   # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency

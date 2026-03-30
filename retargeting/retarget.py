@@ -106,16 +106,17 @@ class TrajectoryGenerator:
 
         # MANO Wrist (index 0) 정보 추출
         wrist_R_cam = rotations.matrix_from_compact_axis_angle(first_hand[:3])
+        wrist_q_cam = rotations.quaternion_from_compact_axis_angle(first_hand[:3])
         wrist_t_cam = joints_init_cam[0]
         
         # World로 변환
         wrist_R_world, wrist_t_world = compose_pose(R_c2w, t_c2w, wrist_R_cam, wrist_t_cam)
-        wrist_q_world = mat_to_quat(wrist_R_world)
+        # wrist_q_world = mat_to_quat(wrist_R_world)
 
         # 리타겟터 초기화
         self.retargeter.warm_start(
             wrist_t_world,
-            wrist_q_world,
+            wrist_q_cam,
             hand_type=HandType.right if self.hand_type == "right" else HandType.left,
             is_mano_convention=True # MANO 파라미터에서 추출했으므로 True
         )
@@ -123,11 +124,8 @@ class TrajectoryGenerator:
         # -----------------------------
         # Main loop
         # -----------------------------
-        for i in tqdm(range(len(hand_poses)), desc=f"Retargeting {capture_name}"):
+        for i in tqdm(range(start_frame, len(hand_poses)), desc=f"Retargeting {capture_name}"):
             curr_hand_raw = hand_poses[i]
-            if np.abs(curr_hand_raw).sum() < 1e-5:
-                continue
-
             curr_hand = np.array(curr_hand_raw).squeeze()
             p = torch.from_numpy(curr_hand[:48].astype(np.float32)).to(self.device).reshape(1, 48)
             t = torch.from_numpy(curr_hand[48:51].astype(np.float32)).to(self.device).reshape(1, 3)
@@ -184,7 +182,7 @@ class TrajectoryGenerator:
 
 if __name__ == "__main__":
     generator = TrajectoryGenerator("hands", "config/hx5_d20_hand_right.yml", "DexYCB")
-    result = generator.process_sequence(seq_idx=0)
+    result = generator.process_sequence(seq_idx=8)
 
     os.makedirs("trajectories", exist_ok=True)
     save_path = f"trajectories/{result['capture_name']}_multi.npy"
