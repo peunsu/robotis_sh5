@@ -40,7 +40,7 @@ class FullBodySceneCfg(InteractiveSceneCfg):
         prim_path="/World/Table",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
-            scale=(0.85, 0.85, 0.85),
+            scale=(1.0, 1.0, 1.0),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False)
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.3, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
@@ -55,7 +55,7 @@ class FullBodySceneCfg(InteractiveSceneCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False)
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.6, 0.8, 0.0),
+            pos=(0.75, 1.0, 0.0),
             rot=(0.70711, 0.0, 0.0, -0.70711),
             joint_pos={
                 # # Swerve base joints
@@ -158,7 +158,7 @@ class FullBodySceneCfg(InteractiveSceneCfg):
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, data: dict):
     """시뮬레이션 메인 루프"""
     robot: Articulation = scene["robot"]
-    TABLE_HEIGHT = 0.85
+    TABLE_HEIGHT = 1.00
     
     # 1. SceneEntityCfg 정의 (튜토리얼 방식)
     # 팔(Arm) 엔티티: IK 계산에 필요한 Joint들과 End-effector Body 지정
@@ -185,7 +185,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, dat
     markers = VisualizationMarkers(marker_cfg)
 
     # 2. IK 컨트롤러 및 인덱스 설정
-    ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls")
+    ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls", ik_params={"lambda_val": 0.05})
     ik_controller = DifferentialIKController(ik_cfg, num_envs=scene.num_envs, device=sim.device)
 
     # Fixed base 로봇의 Jacobian 인덱스 보정 (튜토리얼 로직 반영)
@@ -204,6 +204,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, dat
     frame_idx = 0
     num_frames = len(data["qpos"])
     sim_dt = sim.get_physics_dt()
+    
+    t = 0.0
 
     while simulation_app.is_running():
         if frame_idx == 0:
@@ -214,6 +216,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, dat
         target_pos_w = torch.tensor(data["root_pos"][frame_idx], device=sim.device).unsqueeze(0)
         target_pos_w[:, 2] += TABLE_HEIGHT
         target_quat_w = torch.tensor(data["root_quat"][frame_idx], device=sim.device).unsqueeze(0)
+        
+        markers.visualize(translations=target_pos_w, orientations=target_quat_w)
 
         root_pos_w = robot.data.root_pos_w
         root_quat_w = robot.data.root_quat_w
@@ -224,14 +228,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, dat
         # 현재 EE Pose (arm_entity_cfg.body_ids[0] 사용)
         ee_pose_w = robot.data.body_pose_w[:, arm_entity_cfg.body_ids[0]]
         ee_pos_b, ee_quat_b = subtract_frame_transforms(root_pos_w, root_quat_w, ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
-        markers.visualize(translations=ee_pos_b, orientations=ee_quat_b)
 
         # [B] IK 계산
         jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, arm_entity_cfg.joint_ids]
         curr_arm_q = robot.data.joint_pos[:, arm_entity_cfg.joint_ids]
     
-        ik_controller.set_command(torch.cat([target_pos_b, target_quat_b], dim=-1))
-        arm_next_q = ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, curr_arm_q)
+        ik_controller.set_command(torch.cat([target_pos_w, target_quat_w], dim=-1))
+        arm_next_q = ik_controller.compute(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7], jacobian, curr_arm_q)
 
         # [C] 명령 적용 (SceneEntity의 joint_ids 활용)
         robot.set_joint_position_target(arm_next_q, joint_ids=arm_entity_cfg.joint_ids)
@@ -248,8 +251,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, dat
         scene.write_data_to_sim()
         sim.step(render=True)
         scene.update(sim_dt)
-
-        frame_idx = (frame_idx + 1) % num_frames
+        
+        t += 1
+        if t % 10 == 0:
+            frame_idx = (frame_idx + 1) % num_frames
+            
 
 # main 함수 내부, sim.reset() 이후에 추가해
 def debug_robot_info(scene: InteractiveScene):
