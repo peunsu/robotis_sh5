@@ -105,8 +105,8 @@ class TrajectoryGenerator:
         Returns:
             tuple[np.ndarray | None, np.ndarray | None]: The computed hand geometry (vertices and joints).
         """
-        # if np.abs(hand_pose_frame).sum() < 1e-5:
-        #     return None, None
+        if np.abs(hand_pose_frame).sum() < 1e-5:
+            return None, None
         
         # Extract pose parameters and convert to torch tensors
         p = torch.from_numpy(hand_pose_frame[:, :48].astype(np.float32)).to(self.device)
