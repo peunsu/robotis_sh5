@@ -17,6 +17,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.sim.converters.urdf_converter_cfg import UrdfConverterCfg
 from pxr import Gf, UsdGeom
 
@@ -43,6 +44,13 @@ def main():
     root_quat_raw = data["root_quat"]
     retargeting_joint_names = data["joint_names"]
 
+    TABLE_HEIGHT = 0.85
+    table_cfg = sim_utils.UsdFileCfg(
+        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
+        scale=(0.85, 0.85, 0.85),
+    )
+    sim_utils.spawn_from_usd("/World/Table", table_cfg, translation=(0.3, 0.3, 0), orientation=(0, 0, 0, 1.0))
+    
     # Spawn the objects in the simulation
     obj_prims = []
     for i, name in enumerate(object_names):
@@ -109,7 +117,7 @@ def main():
         if frame_idx == 0:
             sim.reset()
             robot.reset()
-
+        
         # Get the retargeted trajectory data for the current frame
         current_qpos = torch.tensor(
             qpos_raw[frame_idx][retargeting_to_isaac],
@@ -126,6 +134,8 @@ def main():
             device=sim.device,
             dtype=torch.float32,
         ).unsqueeze(0)
+        
+        curr_root_pos[:, 2] += TABLE_HEIGHT
 
         # Combine the root position and quaternion to form the full robot pose for the current frame
         robot_pose = torch.cat([curr_root_pos, curr_root_quat], dim=-1)
@@ -136,7 +146,7 @@ def main():
             q = obj_quats[i][frame_idx]
 
             xform.GetOrderedXformOps()[0].Set(
-                Gf.Vec3d(float(p[0]), float(p[1]), float(p[2]))
+                Gf.Vec3d(float(p[0]), float(p[1]), float(p[2] + TABLE_HEIGHT))
             )
             xform.GetOrderedXformOps()[1].Set(
                 Gf.Quatf(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
