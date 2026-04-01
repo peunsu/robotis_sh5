@@ -60,8 +60,7 @@ class DexYCBCommandTerm(CommandTerm):
 
         for i, env_id in enumerate(env_ids):
             # 1. 데이터셋에서 무작위 샘플링
-            #random_idx = np.random.randint(self.dataset_len)
-            random_idx = 0
+            random_idx = np.random.randint(self.dataset_len)
             data_path = os.path.join(self.cfg.dataset_dir, f"{self.dataset[random_idx]['capture_name']}.npy")
             data = np.load(data_path, allow_pickle=True).item()
             
@@ -84,11 +83,6 @@ class DexYCBCommandTerm(CommandTerm):
                 w_pos.unsqueeze(0), 
                 w_quat.unsqueeze(0)
             )
-            
-            target_quat_b = target_quat_b / torch.norm(target_quat_b, dim=-1, keepdim=True)
-            # w(0번 인덱스)가 음수인 경우 전체에 -1 곱하기
-            neg_mask = target_quat_b[:, 0] < 0
-            target_quat_b[neg_mask] *= -1.0
 
             # 버퍼 저장
             self.pose_command_w[env_id, :3] = w_pos

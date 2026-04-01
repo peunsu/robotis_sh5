@@ -44,6 +44,10 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
             scale=(1.0, 1.0, 1.0),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=False,
+                kinematic_enabled=False,
+            ),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False)
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.3, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
@@ -57,6 +61,9 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_depenetration_velocity=5.0,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=False  # 일단 로봇의 물리적 충돌을 비활성화 (필요시 특정 바디만 켤 수 있음)
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
@@ -388,7 +395,7 @@ class RewardsCfg:
     
     joint_pos_imitation = RewardTermCfg(
         func=mdp.joint_custom_command_error,
-        weight=-1.00,  # 손가락 모양이 중요하므로 높은 가중치
+        weight=-0.00,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"]), # 모든 손가락 관절
             "command_name": "hand_pose_r"
@@ -422,6 +429,14 @@ class CurriculumCfg:
     # joint_vel = CurriculumTermCfg(
     #     func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -0.0001, "num_steps": 10000}
     # )
+    joint_pos_curriculum = CurriculumTermCfg(
+        func=mdp.modify_reward_weight,
+        params={
+            "term_name": "joint_pos_imitation",
+            "weight": -0.12,
+            "num_steps": 16000
+        }
+    )
     
     action_rate_curriculum = CurriculumTermCfg(
         func=mdp.modify_env_param,
