@@ -175,10 +175,10 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             
             # Actuators for hands
             "hand": ImplicitActuatorCfg(
-                joint_names_expr=["finger_l_joint[1-20]", "finger_r_joint[1-20]"],
+                joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
                 velocity_limit_sim=2.2,
                 effort_limit_sim=1000.0,  # 20.0
-                stiffness=2.0,
+                stiffness=20.0,
                 damping=0.5,
             ),
 
@@ -263,7 +263,7 @@ class ActionsCfg:
     )
     hand_r_action = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=["finger_r_joint[1-20]"],
+        joint_names=["finger_r_joint.*"],
         scale=0.5,
     )
 
@@ -290,12 +290,14 @@ class ObservationsCfg:
         joint_pos = ObservationTermCfg(
             func=mdp.joint_pos_rel,
             noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint[1-20]", "arm_r_joint[1-7]", "lift_joint"])}
+            #params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*", "arm_r_joint[1-7]", "lift_joint"])}
         )
         joint_vel = ObservationTermCfg(
             func=mdp.joint_vel_rel,
             noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint[1-20]", "arm_r_joint[1-7]", "lift_joint"])}
+            #params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*", "arm_r_joint[1-7]", "lift_joint"])}
         )
         
         # End-effector pose command for both arms
@@ -434,7 +436,7 @@ class CurriculumCfg:
         params={
             "term_name": "joint_pos_imitation",
             "weight": -0.12,
-            "num_steps": 16000
+            "num_steps": 4500
         }
     )
     

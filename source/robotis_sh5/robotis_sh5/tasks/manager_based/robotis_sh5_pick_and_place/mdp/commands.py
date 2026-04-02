@@ -38,6 +38,18 @@ class DexYCBCommandTerm(CommandTerm):
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.body_idx = self.robot.find_bodies(cfg.body_name)[0][0]
         
+        # 1. 샘플 데이터를 하나 불러와서 데이터셋의 joint_names 확인
+        sample_path = os.path.join(self.cfg.dataset_dir, f"{self.dataset[0]['capture_name']}.npy")
+        sample_data = np.load(sample_path, allow_pickle=True).item()
+        dataset_joint_names = sample_data["joint_names"]
+
+        # 2. 로봇의 관절 순서에 맞춰 데이터셋 인덱스 맵 생성
+        # robot.joint_names는 Isaac Lab이 URDF/USD로부터 읽어들인 순서임
+        self.retargeting_to_isaac = [
+            dataset_joint_names.index(name) for name in self.robot.joint_names 
+            if name in dataset_joint_names
+        ]
+        
         # [Buffers]
         # pose_command_b: 로봇 베이스 기준 (pos_x, y, z, qw, qx, qy, qz) -> 7차원
         self.pose_command_b = torch.zeros(self.num_envs, 7, device=self.device)
@@ -61,13 +73,16 @@ class DexYCBCommandTerm(CommandTerm):
         for i, env_id in enumerate(env_ids):
             # 1. 데이터셋에서 무작위 샘플링
             random_idx = np.random.randint(self.dataset_len)
+            
             data_path = os.path.join(self.cfg.dataset_dir, f"{self.dataset[random_idx]['capture_name']}.npy")
             data = np.load(data_path, allow_pickle=True).item()
             
+            random_frame = np.random.randint(len(data["qpos"]))
+            
             # 데이터셋의 좌표 (해당 env 원점 기준)
-            raw_pos = torch.tensor(data["root_pos"][-1], device=self.device).float()
+            raw_pos = torch.tensor(data["root_pos"][random_frame], device=self.device).float()
             raw_pos[2] += 1.0 # 테이블 높이 보정
-            raw_quat = torch.tensor(data["root_quat"][-1], device=self.device).float()
+            raw_quat = torch.tensor(data["root_quat"][random_frame], device=self.device).float()
 
             # 1. 월드 좌표(w)로 먼저 변환 (env_origin + 데이터셋 좌표)
             # 회전은 env 자체가 회전되어 있지 않다면 raw_quat을 그대로 써도 되지만, 
@@ -91,7 +106,13 @@ class DexYCBCommandTerm(CommandTerm):
             self.pose_command_b[env_id, 3:] = target_quat_b.squeeze(0)
             
             # 5. 손가락 관절 목표값 저장 (이건 절대값이므로 그대로 유지)
-            self.target_qpos[env_id] = torch.tensor(data["qpos"][-1], device=self.device).float()
+            #self.target_qpos[env_id] = torch.tensor(data["qpos"][-1], device=self.device).float()
+            
+            qpos_all = data["qpos"][random_frame]
+            mapped_qpos = torch.tensor(qpos_all[self.retargeting_to_isaac], device=self.device).float()
+            
+            # 현재 로봇의 관절 순서에 맞게 버퍼에 저장
+            self.target_qpos[env_id] = mapped_qpos
 
     def _update_command(self):
         """매 스텝마다 Base 기준 커맨드 유지 (필요 시 여기서 동적 갱신 가능)"""
