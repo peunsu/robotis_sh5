@@ -8,117 +8,129 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import RigidObject
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul
+from isaaclab.utils.math import quat_apply
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def position_command_error(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    """
-    Penalize tracking of the position error using L2-norm.
+def get_virtual_link_poses(env: ManagerBasedRLEnv, fingertip_names: list, palm_name: str):
+    robot = env.scene["robot"]
+    num_envs = env.num_envs  # 현재 16개 환경
 
-    The function computes the position error between the desired position (from the command) and the
-    current position of the asset's body (in world frame). The position error is computed as the L2-norm
-    of the difference between the desired and current positions.
+    virtual_fingertip_pos = []
+    for name in fingertip_names:
+        body_indices = robot.find_bodies(name)[0]
+        p_pos = robot.data.body_pos_w[:, body_indices]
+        p_quat = robot.data.body_quat_w[:, body_indices]
+        
+        if p_pos.ndim == 3 and p_pos.shape[1] == 1:
+            p_pos = p_pos.squeeze(1)
+            p_quat = p_quat.squeeze(1)
+        
+        is_left = "_l_" in name
+        if "link4" in name or "link1" in name:
+            offset_y = -0.03975 if is_left else 0.03975
+            offset = [0.0, offset_y, 0.0]
+        else:
+            offset = [0.0, 0.0, 0.02425]
+            
+        # (1, 3) 텐서를 만든 후 현재 환경 개수만큼 확장
+        offset_tensor = torch.tensor(offset, device=env.device).view(1, 3).expand(num_envs, 3)
+        
+        # 회전 적용 후 더하기 -> 결과: (num_envs, 3)
+        v_pos = p_pos + quat_apply(p_quat, offset_tensor)
+        virtual_fingertip_pos.append(v_pos)
+    
+    # Palm 포지션 계산 -> 결과: (num_envs, 3)
+    palm_idx = robot.find_bodies(palm_name)[0]
+    p_pos_palm = robot.data.body_pos_w[:, palm_idx]
+    p_quat_palm = robot.data.body_quat_w[:, palm_idx]
+    
+    if p_pos_palm.ndim == 3 and p_pos_palm.shape[1] == 1:
+        p_pos_palm = p_pos_palm.squeeze(1)
+        p_quat_palm = p_quat_palm.squeeze(1)
+    
+    palm_offset = torch.tensor([0.01, 0.0, 0.06], device=env.device).view(1, 3).expand(num_envs, 3)
+    virtual_palm_pos = p_pos_palm + quat_apply(p_quat_palm, palm_offset)
+    
+    # print(f"Virtual fingertip positions shape: {virtual_fingertip_pos[0].shape}")
+    # print(f"Virtual palm position shape: {virtual_palm_pos.shape}")
+    
+    return virtual_fingertip_pos, virtual_palm_pos
 
-    Args:
-        env (ManagerBasedRLEnv): The environment instance.
-        command_name (str): The name of the command to use for the position error calculation.
-        asset_cfg (SceneEntityCfg): The configuration for the asset.
+def object_distance_reward(env: ManagerBasedRLEnv, fingertip_names: list, palm_name: str) -> torch.Tensor:
+    # 1. 물체 중심 위치
+    obj_pos = env.scene["object"].data.root_pos_w
+    
+    # 2. 가상 위치 계산
+    v_fingertip_pos, v_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
+    
+    # 3. 거리 계산
+    dist_fingertips = torch.stack([torch.norm(pos - obj_pos, dim=1) for pos in v_fingertip_pos], dim=1).mean(dim=1)
+    dist_palm = torch.norm(v_palm_pos - obj_pos, dim=1)
+    
+    # print(f"Object distance reward shape: {dist_fingertips.shape}")
+    # print(f"Object distance reward shape: {dist_palm.shape}")
+    
+    return -2.0 * dist_fingertips - dist_palm
 
-    Returns:
-        torch.Tensor: The position error between the desired and current positions.
-    """
-    # extract the asset (to enable type hinting)
-    asset: RigidObject = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    # obtain the desired and current positions
-    des_pos_b = command[:, :3]
-    des_pos_w, _ = combine_frame_transforms(asset.data.root_state_w[:, :3], asset.data.root_state_w[:, 3:7], des_pos_b)
-    curr_pos_w = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]  # type: ignore
-    return torch.norm(curr_pos_w - des_pos_w, dim=1)
-
-
-def position_command_error_tanh(
-    env: ManagerBasedRLEnv,
-    std: float,
-    command_name: str,
-    asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    """
-    Reward tracking of the position using the tanh kernel.
-
-    The function computes the position error between the desired position (from the command) and the
-    current position of the asset's body (in world frame) and maps it with a tanh kernel.
-
-    Args:
-        env (ManagerBasedRLEnv): The environment instance.
-        std (float): The standard deviation for the tanh kernel.
-        command_name (str): The name of the command to use for the position error calculation.
-        asset_cfg (SceneEntityCfg): The configuration for the asset.
-
-    Returns:
-        torch.Tensor: The reward for tracking the position.
-    """
-    # extract the asset (to enable type hinting)
-    asset: RigidObject = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    # obtain the desired and current positions
-    des_pos_b = command[:, :3]
-    des_pos_w, _ = combine_frame_transforms(asset.data.root_state_w[:, :3], asset.data.root_state_w[:, 3:7], des_pos_b)
-    curr_pos_w = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]  # type: ignore
-    distance = torch.norm(curr_pos_w - des_pos_w, dim=1)
-    return 1 - torch.tanh(distance / std)
-
-
-def orientation_command_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """
-    Penalize tracking orientation error using shortest path.
-
-    The function computes the orientation error between the desired orientation (from the command) and the
-    current orientation of the asset's body (in world frame). The orientation error is computed as the shortest
-    path between the desired and current orientations.
-
-    Args:
-        env (ManagerBasedRLEnv): The environment instance.
-        command_name (str): The name of the command to use for the orientation error calculation.
-        asset_cfg (SceneEntityCfg): The configuration for the asset.
-
-    Returns:
-        torch.Tensor: The orientation error between the desired and current orientations.
-    """
-    # extract the asset (to enable type hinting)
-    asset: RigidObject = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    # obtain the desired and current orientations
-    des_quat_b = command[:, 3:7]
-    des_quat_w = quat_mul(asset.data.root_state_w[:, 3:7], des_quat_b)
-    curr_quat_w = asset.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]  # type: ignore
-    return quat_error_magnitude(curr_quat_w, des_quat_w)
-
-def joint_custom_command_error(
+def object_height_reward(
     env: ManagerBasedRLEnv, 
-    command_name: str, 
-    asset_cfg: SceneEntityCfg
+    fingertip_names: list, 
+    palm_name: str,
+    table_height: float = 1.0,
+    target_lift_height: float = 0.6
 ) -> torch.Tensor:
-    """
-    현재 로봇 관절 위치와 Command에 저장된 목표 관절 위치(qpos) 사이의 오차를 계산해.
-    """
-    # 에셋 및 커맨드 데이터 추출
-    asset: RigidObject = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
+    obj_pos = env.scene["object"].data.root_pos_w
+    h = obj_pos[:, 2]
+    target_h = table_height + target_lift_height
+
+    v_fingertip_pos, v_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
     
-    # 목표 관절 위치 (DexYCB의 qpos 부분)
-    target_joint_pos = command[:, 7:27]
+    avg_dist_fingertips = torch.stack([torch.norm(pos - obj_pos, dim=1) for pos in v_fingertip_pos], dim=1).mean(dim=1)
+    dist_palm = torch.norm(v_palm_pos - obj_pos, dim=1)
+
+    # 논문 조건: 손이 너무 멀면 보상 0
+    out_of_reach = (avg_dist_fingertips >= 0.12) & (dist_palm >= 0.15)
+
+    diff = h - target_h
+    abs_diff = torch.abs(diff)
     
-    # 현재 로봇의 관절 위치 (지정된 joint_ids 기준)
-    current_joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    reward = 0.9 + (-2.0 * abs_diff) + diff + (1.0 / (abs_diff + 1.0))
     
-    # L2 Norm 오차 반환
-    return torch.norm(target_joint_pos - current_joint_pos, dim=1)
+    # print(f"Object height reward shape: {reward.shape}")
+
+    return torch.where(out_of_reach, torch.zeros_like(reward), reward)
+
+def object_horizontal_displacement_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    obj_pos = env.scene["object"].data.root_pos_w
+    obj_init_pos = env.scene["object"].data.default_root_state[:, :3]
+    displacement_xy = torch.norm(obj_pos[:, :2] - obj_init_pos[:, :2], dim=1)
+    # print(f"Object horizontal displacement reward shape: {displacement_xy.shape}")
+    return -0.3 * displacement_xy
+
+def success_reward(
+    env: ManagerBasedRLEnv, 
+    fingertip_names: list, 
+    palm_name: str,
+    table_height: float = 1.0,
+    target_lift_height: float = 0.6, 
+    threshold: float = 0.05
+) -> torch.Tensor:
+    obj_pos = env.scene["object"].data.root_pos_w
+    h = obj_pos[:, 2]
+    target_h = table_height + target_lift_height
+
+    height_condition = torch.abs(h - target_h) <= threshold
+
+    v_fingertip_pos, v_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
+    
+    avg_dist_fingertips = torch.stack([torch.norm(pos - obj_pos, dim=1) for pos in v_fingertip_pos], dim=1).mean(dim=1)
+    dist_palm = torch.norm(v_palm_pos - obj_pos, dim=1)
+
+    # 논문 성공 조건 반영
+    grasp_condition = (avg_dist_fingertips <= 0.12) | (dist_palm <= 0.15)
+    is_success = height_condition & grasp_condition
+
+    # print(f"Success reward shape: {is_success.shape}")
+    return torch.where(is_success, torch.tensor(200.0, device=env.device), torch.tensor(0.0, device=env.device))

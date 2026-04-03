@@ -8,7 +8,7 @@ import torch
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import (
@@ -27,7 +27,6 @@ from isaaclab.utils.noise import UniformNoiseCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from . import mdp
-from .retargeting.dataset import DexYCBVideoDataset
 
 @configclass
 class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):    
@@ -43,28 +42,31 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Table",
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
-            scale=(1.0, 1.0, 1.0),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                rigid_body_enabled=False,
-                kinematic_enabled=False,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False)
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.3, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
+    )
+    
+    object = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Object",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd",
+            scale=(0.75, 0.75, 0.75),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.3, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
     )
 
     # Robot
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified.usd",
+            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified_dex.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_depenetration_velocity=5.0,
             ),
-            collision_props=sim_utils.CollisionPropertiesCfg(
-                collision_enabled=False  # 일단 로봇의 물리적 충돌을 비활성화 (필요시 특정 바디만 켤 수 있음)
-            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
                 fix_root_link=True,
@@ -86,10 +88,6 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                 **{f"arm_l_joint{i + 1}": 0.0 for i in range(7)},
                 # Right arm joints
                 **{f"arm_r_joint{i + 1}": 0.0 for i in range(7)},
-
-                # Left and right gripper joints
-                # **{f"gripper_l_joint{i + 1}": 0.0 for i in range(4)},
-                # **{f"gripper_r_joint{i + 1}": 0.0 for i in range(4)},
                 
                 # Left and right finger joints
                 **{f"finger_l_joint{i + 1}": 0.0 for i in range(20)},
@@ -157,21 +155,6 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                 stiffness=200.0,
                 damping=3.0,
             ),
-
-            # Actuators for grippers
-            # "gripper_master": ImplicitActuatorCfg(
-            #     joint_names_expr=["gripper_l_joint1", "gripper_r_joint1"],
-            #     velocity_limit_sim=2.2,
-            #     effort_limit_sim=30.0,
-            #     stiffness=100.0,
-            #     damping=4.0,
-            # ),
-            # "gripper_slave": ImplicitActuatorCfg(
-            #     joint_names_expr=["gripper_l_joint[2-4]", "gripper_r_joint[2-4]"],
-            #     effort_limit_sim=20.0,
-            #     stiffness=2.0,
-            #     damping=0.5,
-            # ),
             
             # Actuators for hands
             "hand": ImplicitActuatorCfg(
@@ -203,43 +186,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications."""
     
-    # End-effector pose commands for both arms,
-    # which will be generated and updated at random intervals to create a dynamic reaching task.
-    # ee_pose_l = mdp.UniformPoseCommandCfg(
-    #     asset_name="robot",
-    #     body_name=MISSING,
-    #     resampling_time_range=(2.0, 4.0),
-    #     debug_vis=True,
-    #     ranges=mdp.UniformPoseCommandCfg.Ranges(
-    #         pos_x=(0.45, 0.65),
-    #         pos_y=(0.1, 0.3),
-    #         pos_z=(0.8, 1.6),
-    #         roll=(torch.pi / 2 - torch.pi / 8, torch.pi / 2 + torch.pi / 8),
-    #         pitch=(torch.pi - torch.pi / 8, torch.pi + torch.pi / 8),
-    #         yaw=(torch.pi / 2 - torch.pi / 8, torch.pi / 2 + torch.pi / 8),
-    #     ),
-    # )
-    # ee_pose_r = mdp.UniformPoseCommandCfg(
-    #     asset_name="robot",
-    #     body_name=MISSING,
-    #     resampling_time_range=(2.0, 4.0),
-    #     debug_vis=True,
-    #     ranges=mdp.UniformPoseCommandCfg.Ranges(
-    #         pos_x=(0.50, 0.70),  # default: (0.45, 0.65)
-    #         pos_y=(-0.3, -0.1),
-    #         pos_z=(0.8, 1.6),
-    #         roll=(- torch.pi / 2 - torch.pi / 8, - torch.pi / 2 + torch.pi / 8),
-    #         pitch=(torch.pi - torch.pi / 8, torch.pi + torch.pi / 8),
-    #         yaw=(- torch.pi / 2 - torch.pi / 8, - torch.pi / 2 + torch.pi / 8),
-    #     ),
-    # )
-    hand_pose_r = mdp.DexYCBCommandTermCfg(
-        asset_name="robot",
-        dataset_dir="retargeting/trajectories",
-        body_name=MISSING,
-        resampling_time_range=(2.0, 4.0),
-        debug_vis=True
-    )
+    pass
 
 @configclass
 class ActionsCfg:
@@ -251,11 +198,6 @@ class ActionsCfg:
         joint_names=["lift_joint"],
         scale=0.5,
     )
-    # arm_l_action = mdp.JointPositionActionCfg(
-    #     asset_name="robot",
-    #     joint_names=["arm_l_joint[1-7]"],
-    #     scale=0.5,
-    # )
     arm_r_action = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["arm_r_joint[1-7]"],
@@ -277,48 +219,50 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # Relative joint positions and velocities with respect to the default pose
-        # joint_pos = ObservationTermCfg(
-        #     func=mdp.joint_pos_rel,
-        #     noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
-        #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["arm_l_joint[1-7]", "arm_r_joint[1-7]", "lift_joint"])}
-        # )
-        # joint_vel = ObservationTermCfg(
-        #     func=mdp.joint_vel_rel,
-        #     noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
-        #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["arm_l_joint[1-7]", "arm_r_joint[1-7]", "lift_joint"])}
-        # )
         joint_pos = ObservationTermCfg(
             func=mdp.joint_pos_rel,
-            noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
-            #params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
+            #noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*", "arm_r_joint[1-7]", "lift_joint"])}
         )
         joint_vel = ObservationTermCfg(
             func=mdp.joint_vel_rel,
-            noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
-            #params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
+            #noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*", "arm_r_joint[1-7]", "lift_joint"])}
         )
         
-        # End-effector pose command for both arms
-        # pose_command_l = ObservationTermCfg(
-        #     func=mdp.generated_commands,
-        #     params={"command_name": "ee_pose_l"}
-        # )
-        # pose_command_r = ObservationTermCfg(
-        #     func=mdp.generated_commands,
-        #     params={"command_name": "ee_pose_r"}
-        # )
-        hand_pose_command_r = ObservationTermCfg(
-            func=mdp.generated_commands,
-            params={"command_name": "hand_pose_r"}
+        # The position and orientation of the end-effectors (in the world frame)
+        left_eef_pos = ObservationTermCfg(
+            func=mdp.get_eef_pos,
+            params={"link_name": "hx5_d20_left_base"}
+        )
+        left_eef_quat = ObservationTermCfg(
+            func=mdp.get_eef_quat,
+            params={"link_name": "hx5_d20_left_base"}
+        )
+        right_eef_pos = ObservationTermCfg(
+            func=mdp.get_eef_pos,
+            params={"link_name": "hx5_d20_right_base"}
+        )
+        right_eef_quat = ObservationTermCfg(
+            func=mdp.get_eef_quat,
+            params={"link_name": "hx5_d20_right_base"}
+        )
+        
+        # The position and orientation of the object, and the relative position of the end-effectors to the object (in the world frame)
+        object = ObservationTermCfg(
+            func=mdp.object_obs,
+            #noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
+            params={
+                "left_eef_link_name": "hx5_d20_left_base",
+                "right_eef_link_name": "hx5_d20_right_base",
+            }
         )
         
         # The last input action
         actions = ObservationTermCfg(func=mdp.last_action)
 
         def __post_init__(self) -> None:
-            self.enable_corruption = True
+            self.enable_corruption = False
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
@@ -341,77 +285,55 @@ class EventCfg:
 class RewardsCfg:
     """Reward specifications."""
     
-    # Reward left end-effector tracking
-    # end_effector_position_tracking_left = RewardTermCfg(
-    #     func=mdp.position_command_error,
-    #     weight=-0.30,  # default: -0.25
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-    #         "command_name": "ee_pose_l"
-    #     },
-    # )
-    # end_effector_position_tracking_fine_grained_left = RewardTermCfg(
-    #     func=mdp.position_command_error_tanh,
-    #     weight=0.20,  # default: 0.12
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-    #         "std": 0.1,
-    #         "command_name": "ee_pose_l"
-    #     },
-    # )
-    # end_effector_orientation_tracking_left = RewardTermCfg(
-    #     func=mdp.orientation_command_error,
-    #     weight=-0.12,
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-    #         "command_name": "ee_pose_l"
-    #     },
-    # )
-
-    # Reward right end-effector tracking
-    end_effector_position_tracking_right = RewardTermCfg(
-        func=mdp.position_command_error,
-        weight=-0.30,  # default: -0.25  
+    # 1. Distance Reward
+    dist_reward = RewardTermCfg(
+        func=mdp.object_distance_reward,
+        weight=1.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "command_name": "hand_pose_r"
-        },
-    )
-    end_effector_position_tracking_fine_grained_right = RewardTermCfg(
-        func=mdp.position_command_error_tanh,
-        weight=0.20,  # default: 0.12
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "std": 0.1,
-            "command_name": "hand_pose_r"
-        },
-    )
-    end_effector_orientation_tracking_right = RewardTermCfg(
-        func=mdp.orientation_command_error,
-        weight=-0.12,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "command_name": "hand_pose_r"
-        },
+            "fingertip_names": MISSING,
+            "palm_name": MISSING
+        }
     )
     
-    joint_pos_imitation = RewardTermCfg(
-        func=mdp.joint_custom_command_error,
-        weight=-0.00,
+    # 2. Height Reward (CrossDex 논문 수식 반영)
+    height_reward = RewardTermCfg(
+        func=mdp.object_height_reward,
+        weight=1.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"]), # 모든 손가락 관절
-            "command_name": "hand_pose_r"
-        },
+            "fingertip_names": MISSING,
+            "palm_name": MISSING,
+            "table_height": MISSING,
+            "target_lift_height": MISSING
+        }
     )
-
+    
+    # 3. XY Displacement Penalty
+    xy_penalty = RewardTermCfg(
+        func=mdp.object_horizontal_displacement_reward,
+        weight=1.0
+    )
+    
+    # 4. Success Reward (CrossDex 성공 조건: 높이 + 파지 여부)
+    success_bonus = RewardTermCfg(
+        func=mdp.success_reward,
+        weight=1.0,
+        params={
+            "fingertip_names": MISSING,
+            "palm_name": MISSING,
+            "table_height": MISSING,
+            "target_lift_height": MISSING,
+            "threshold": 0.05
+        }
+    )
+    
     # Penalty on action rate and joint velocity to encourage smoother motions
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
-        weight=-0.0001,  # default: -0.0001
+        weight=-0.0001,
     )
     joint_vel = RewardTermCfg(
         func=mdp.joint_vel_l2,
-        weight=0.0,  # default: -0.0001
+        weight=-0.00001,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
@@ -424,49 +346,36 @@ class TerminationsCfg:
 @configclass
 class CurriculumCfg:
     """Curriculum learning configuration."""
-
-    # action_rate = CurriculumTermCfg(
-    #     func=mdp.modify_reward_weight, params={"term_name": "action_rate", "weight": -0.0001, "num_steps": 10000}
-    # )
-    # joint_vel = CurriculumTermCfg(
-    #     func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -0.0001, "num_steps": 10000}
-    # )
-    joint_pos_curriculum = CurriculumTermCfg(
-        func=mdp.modify_reward_weight,
-        params={
-            "term_name": "joint_pos_imitation",
-            "weight": -0.12,
-            "num_steps": 4500
-        }
-    )
     
-    action_rate_curriculum = CurriculumTermCfg(
-        func=mdp.modify_env_param,
-        params={
-            "address": "reward_manager.cfg.action_rate.weight", 
-            "modify_fn": mdp.fade_in_reward_weight,
-            "modify_params": {
-                "initial_weight": -0.0001,
-                "target_weight": -0.005,
-                "grace_period": 8000,
-                "fade_in_steps": 2000,
-            }
-        }
-    )
+    # action_rate_curriculum = CurriculumTermCfg(
+    #     func=mdp.modify_env_param,
+    #     params={
+    #         "address": "reward_manager.cfg.action_rate.weight", 
+    #         "modify_fn": mdp.fade_in_reward_weight,
+    #         "modify_params": {
+    #             "initial_weight": -0.0001,
+    #             "target_weight": -0.005,
+    #             "grace_period": 8000,
+    #             "fade_in_steps": 2000,
+    #         }
+    #     }
+    # )
 
-    joint_vel_curriculum = CurriculumTermCfg(
-        func=mdp.modify_env_param,
-        params={
-            "address": "reward_manager.cfg.joint_vel.weight",
-            "modify_fn": mdp.fade_in_reward_weight,
-            "modify_params": {
-                "initial_weight": 0.0,
-                "target_weight": -0.00001,
-                "grace_period": 8000,
-                "fade_in_steps": 2000,
-            }
-        }
-    )
+    # joint_vel_curriculum = CurriculumTermCfg(
+    #     func=mdp.modify_env_param,
+    #     params={
+    #         "address": "reward_manager.cfg.joint_vel.weight",
+    #         "modify_fn": mdp.fade_in_reward_weight,
+    #         "modify_params": {
+    #             "initial_weight": 0.0,
+    #             "target_weight": -0.00001,
+    #             "grace_period": 8000,
+    #             "fade_in_steps": 2000,
+    #         }
+    #     }
+    # )
+    
+    pass
 
 @configclass
 class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
@@ -474,13 +383,13 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
     
 
     scene: RobotisSh5PickAndPlaceSceneCfg = RobotisSh5PickAndPlaceSceneCfg(num_envs=4096, env_spacing=4.0)
-    commands: CommandsCfg = CommandsCfg()
+    #commands: CommandsCfg = CommandsCfg()
     actions: ActionsCfg = ActionsCfg()
     observations: ObservationsCfg = ObservationsCfg()
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    #curriculum: CurriculumCfg = CurriculumCfg()
 
     # Post initialization
     def __post_init__(self) -> None:
@@ -497,20 +406,42 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
         
+        table_height = 1.0
+        target_lift_height = 0.6
+        
         ee_link_l = "hx5_d20_left_base"
         ee_link_r = "hx5_d20_right_base"
         
-        # self.commands.ee_pose_l.body_name = ee_link_l
-        # self.commands.ee_pose_r.body_name = ee_link_r
-        self.commands.hand_pose_r.body_name = ee_link_r
+        fingertip_links_l = [
+            "finger_l_link4",
+            "finger_l_link8",
+            "finger_l_link12",
+            "finger_l_link16",
+            "finger_l_link20"
+        ]
+        fingertip_links_r = [
+            "finger_r_link4",
+            "finger_r_link8",
+            "finger_r_link12",
+            "finger_r_link16",
+            "finger_r_link20"
+        ]
         
-        # self.rewards.end_effector_position_tracking_left.params["asset_cfg"].body_names = [ee_link_l]
-        # self.rewards.end_effector_position_tracking_fine_grained_left.params["asset_cfg"].body_names = [ee_link_l]
-        # self.rewards.end_effector_orientation_tracking_left.params["asset_cfg"].body_names = [ee_link_l]
+        palm_link_l = "hx5_d20_left_base"
+        palm_link_r = "hx5_d20_right_base"
         
-        self.rewards.end_effector_position_tracking_right.params["asset_cfg"].body_names = [ee_link_r]
-        self.rewards.end_effector_position_tracking_fine_grained_right.params["asset_cfg"].body_names = [ee_link_r]
-        self.rewards.end_effector_orientation_tracking_right.params["asset_cfg"].body_names = [ee_link_r]
+        self.rewards.dist_reward.params["fingertip_names"] = fingertip_links_r
+        self.rewards.dist_reward.params["palm_name"] = palm_link_r
+        
+        self.rewards.height_reward.params["fingertip_names"] = fingertip_links_r
+        self.rewards.height_reward.params["palm_name"] = palm_link_r
+        self.rewards.height_reward.params["table_height"] = table_height
+        self.rewards.height_reward.params["target_lift_height"] = target_lift_height
+        
+        self.rewards.success_bonus.params["fingertip_names"] = fingertip_links_r
+        self.rewards.success_bonus.params["palm_name"] = palm_link_r
+        self.rewards.success_bonus.params["table_height"] = table_height
+        self.rewards.success_bonus.params["target_lift_height"] = target_lift_height
         
         
     
