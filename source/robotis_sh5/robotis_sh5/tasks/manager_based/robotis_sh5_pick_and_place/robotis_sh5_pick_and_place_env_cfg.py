@@ -54,7 +54,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             scale=(0.75, 0.75, 0.75),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.3, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.3, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
     )
 
     # Robot
@@ -87,7 +87,13 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                 # Left arm joints
                 **{f"arm_l_joint{i + 1}": 0.0 for i in range(7)},
                 # Right arm joints
-                **{f"arm_r_joint{i + 1}": 0.0 for i in range(7)},
+                #**{f"arm_r_joint{i + 1}": 0.0 for i in range(7)},
+                "arm_r_joint2": -1.13,
+                "arm_r_joint3": 0.03,
+                "arm_r_joint4": -2.1,
+                "arm_r_joint5": -1.44,
+                "arm_r_joint6": 0.43,
+                "arm_r_joint7": -0.65,
                 
                 # Left and right finger joints
                 **{f"finger_l_joint{i + 1}": 0.0 for i in range(20)},
@@ -272,12 +278,18 @@ class ObservationsCfg:
 class EventCfg:
     """Event specifications."""
     
-    reset_robot_joints = EventTermCfg(
-        func=mdp.reset_joints_by_scale,
+    reset_all = EventTermCfg(func=mdp.reset_scene_to_default, mode="reset")
+    
+    reset_object = EventTermCfg(
+        func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "position_range": (0.0, 0.0),
-            "velocity_range": (0.0, 0.0),
+            "pose_range": {
+                "x": [0.01, 0.01],
+                "y": [0.01, 0.01],
+            },
+            "velocity_range": {},
+            "asset_cfg": SceneEntityCfg("object"),
         },
     )
 
@@ -343,6 +355,18 @@ class TerminationsCfg:
     
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
     
+    object_dropping = TerminationTermCfg(
+        func=mdp.root_height_below_minimum, params={"minimum_height": 0.5, "asset_cfg": SceneEntityCfg("object")}
+    )
+
+    success = TerminationTermCfg(func=mdp.task_done_pick_place, params={
+        "fingertip_names": MISSING,
+        "palm_name": MISSING,
+        "table_height": MISSING,
+        "target_lift_height": MISSING,
+        "threshold": 0.05
+    })
+    
 @configclass
 class CurriculumCfg:
     """Curriculum learning configuration."""
@@ -382,7 +406,7 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
     """Environment configuration for the Robotis SH5 Pick and Place task."""
     
 
-    scene: RobotisSh5PickAndPlaceSceneCfg = RobotisSh5PickAndPlaceSceneCfg(num_envs=4096, env_spacing=4.0)
+    scene: RobotisSh5PickAndPlaceSceneCfg = RobotisSh5PickAndPlaceSceneCfg(num_envs=16, env_spacing=4.0, replicate_physics=True)
     #commands: CommandsCfg = CommandsCfg()
     actions: ActionsCfg = ActionsCfg()
     observations: ObservationsCfg = ObservationsCfg()
@@ -395,19 +419,23 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         """Post initialization."""
         
+        self.sim.physx.bounce_threshold_velocity = 0.01
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
+        self.sim.physx.friction_correlation_distance = 0.00625
         self.sim.physx.gpu_max_rigid_patch_count = 4096 * 4096
         
-        self.decimation = 2
-        self.episode_length_s = 12.0
+        self.decimation = 6
+        self.episode_length_s = 20.0
         
         self.viewer.eye = (3.5, 3.5, 3.5)
         #self.viewer.lookat = (0.0, 0.0, 0.0)
         
         self.sim.dt = 1.0 / 60.0
-        self.sim.render_interval = self.decimation
+        self.sim.render_interval = 2
         
         table_height = 1.0
-        target_lift_height = 0.6
+        target_lift_height = 0.3
         
         ee_link_l = "hx5_d20_left_base"
         ee_link_r = "hx5_d20_right_base"
@@ -443,6 +471,10 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.success_bonus.params["table_height"] = table_height
         self.rewards.success_bonus.params["target_lift_height"] = target_lift_height
         
+        self.terminations.success.params["fingertip_names"] = fingertip_links_r
+        self.terminations.success.params["palm_name"] = palm_link_r
+        self.terminations.success.params["table_height"] = table_height
+        self.terminations.success.params["target_lift_height"] = target_lift_height
         
     
 @configclass
