@@ -61,7 +61,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified_dex.usd",
+            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified_dex_2.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_depenetration_velocity=5.0,
@@ -237,14 +237,14 @@ class ObservationsCfg:
         )
         
         # The position and orientation of the end-effectors (in the world frame)
-        left_eef_pos = ObservationTermCfg(
-            func=mdp.get_eef_pos,
-            params={"link_name": "hx5_d20_left_base"}
-        )
-        left_eef_quat = ObservationTermCfg(
-            func=mdp.get_eef_quat,
-            params={"link_name": "hx5_d20_left_base"}
-        )
+        # left_eef_pos = ObservationTermCfg(
+        #     func=mdp.get_eef_pos,
+        #     params={"link_name": "hx5_d20_left_base"}
+        # )
+        # left_eef_quat = ObservationTermCfg(
+        #     func=mdp.get_eef_quat,
+        #     params={"link_name": "hx5_d20_left_base"}
+        # )
         right_eef_pos = ObservationTermCfg(
             func=mdp.get_eef_pos,
             params={"link_name": "hx5_d20_right_base"}
@@ -257,9 +257,9 @@ class ObservationsCfg:
         # The position and orientation of the object, and the relative position of the end-effectors to the object (in the world frame)
         object = ObservationTermCfg(
             func=mdp.object_obs,
-            #noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
+             #noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
             params={
-                "left_eef_link_name": "hx5_d20_left_base",
+                # "left_eef_link_name": "hx5_d20_left_base",
                 "right_eef_link_name": "hx5_d20_right_base",
             }
         )
@@ -285,8 +285,8 @@ class EventCfg:
         mode="reset",
         params={
             "pose_range": {
-                "x": [0.01, 0.01],
-                "y": [0.01, 0.01],
+                "x": [-0.01, 0.01],
+                "y": [-0.01, 0.01],
             },
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object"),
@@ -343,11 +343,11 @@ class RewardsCfg:
         func=mdp.action_rate_l2,
         weight=-0.0001,
     )
-    joint_vel = RewardTermCfg(
-        func=mdp.joint_vel_l2,
-        weight=-0.00001,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
+    # joint_vel = RewardTermCfg(
+    #     func=mdp.joint_vel_l2,
+    #     weight=-2.5e-6,
+    #     params={"asset_cfg": SceneEntityCfg("robot")},
+    # )
 
 @configclass
 class TerminationsCfg:
