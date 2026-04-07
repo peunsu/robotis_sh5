@@ -31,25 +31,24 @@ def root_height_below_minimum(
 
 def task_done_pick_place(
     env: ManagerBasedRLEnv, 
-    fingertip_names: list, 
-    palm_name: str,
-    table_height: float = 1.0,
-    target_lift_height: float = 0.6,
+    command_name: str,
     threshold: float = 0.05
 ) -> torch.Tensor:
-    obj_pos = env.scene["object"].data.root_pos_w
-    h = obj_pos[:, 2]
-    target_h = table_height + target_lift_height
-
-    height_condition = torch.abs(h - target_h) <= threshold
-
-    v_fingertip_pos, v_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
+    """
+    물체가 목표 위치(30cm 위)에 lambda_0 이내로 들어오면 즉시 성공으로 판단해.
+    """
+    # 1. 커맨드 매니저에서 목표 위치(World Frame) 가져오기
+    # DexYCBCommandTerm의 command 마지막 3차원이 target_pos_w임
+    command = env.command_manager.get_command(command_name)
+    target_pos_w = command[:, -3:]
     
-    avg_dist_fingertips = torch.stack([torch.norm(pos - obj_pos, dim=1) for pos in v_fingertip_pos], dim=1).mean(dim=1)
-    dist_palm = torch.norm(v_palm_pos - obj_pos, dim=1)
+    # 2. 오브젝트의 현재 월드 좌표
+    obj_pos_w = env.scene["object"].data.root_pos_w
+    
+    # 3. 거리 계산 (L2 Norm)
+    d_obj = torch.norm(obj_pos_w - target_pos_w, p=2, dim=-1)
 
-    # 논문 성공 조건 반영
-    grasp_condition = (avg_dist_fingertips <= 0.12) | (dist_palm <= 0.15)
-    is_success = height_condition & grasp_condition
+    # 4. 성공 여부 판정 (0.05m 이내면 True)
+    is_success = d_obj < threshold
 
     return is_success

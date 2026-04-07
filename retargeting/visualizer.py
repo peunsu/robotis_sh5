@@ -34,6 +34,8 @@ def main():
     dataset = DexYCBVideoDataset("DexYCB", hand_type=args_cli.hand_type)
     capture_name = dataset[args_cli.seq_idx]["capture_name"]
     data = np.load(f"trajectories/{capture_name}.npy", allow_pickle=True).item()
+    
+    print(f"Loaded trajectory data for sequence '{capture_name}' with {len(data['qpos'])} frames.")
 
     # Extract relevant data from the loaded trajectory
     object_names = data.get("object_names", [])
@@ -44,10 +46,10 @@ def main():
     root_quat_raw = data["root_quat"]
     retargeting_joint_names = data["joint_names"]
 
-    TABLE_HEIGHT = 0.85
+    TABLE_HEIGHT = 1.00
     table_cfg = sim_utils.UsdFileCfg(
         usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
-        scale=(0.85, 0.85, 0.85),
+        scale=(1.0, 1.0, 1.0),
     )
     sim_utils.spawn_from_usd("/World/Table", table_cfg, translation=(0.3, 0.3, 0), orientation=(0, 0, 0, 1.0))
     
@@ -117,6 +119,8 @@ def main():
         if frame_idx == 0:
             sim.reset()
             robot.reset()
+        
+        print(f"Visualizing frame {frame_idx + 1}/{num_frames} of sequence '{capture_name}'")
         
         # Get the retargeted trajectory data for the current frame
         current_qpos = torch.tensor(

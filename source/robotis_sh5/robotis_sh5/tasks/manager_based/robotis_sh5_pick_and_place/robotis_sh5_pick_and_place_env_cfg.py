@@ -44,14 +44,15 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.3, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.35, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
     )
     
     object = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics/003_cracker_box.usd",
-            scale=(0.75, 0.75, 0.75),
+            #usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics/006_mustard_bottle.usd",
+            usd_path="/home/peunsu/workspace/robotis_sh5/retargeting/DexYCB/models/006_mustard_bottle/textured.usd",
+            scale=(1.00, 1.00, 1.00),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.3, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
@@ -61,7 +62,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified_dex_2.usd",
+            usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../../../data/robots/FFW/FFW_SH5_simplified_dex.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 max_depenetration_velocity=5.0,
@@ -76,7 +77,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             activate_contact_sensors=False,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.75, 1.0, 0.0),
+            pos=(1.00, 0.95, 0.0),
             rot=(0.70711, 0.0, 0.0, -0.70711),
             joint_pos={
                 # # Swerve base joints
@@ -137,7 +138,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                     "arm_r_joint[1-2]",
                 ],
                 velocity_limit_sim=15.0,
-                effort_limit_sim=1000.0,  # 61.4
+                effort_limit_sim=61.4,  # 61.4
                 stiffness=600.0,
                 damping=30.0,
             ),
@@ -147,7 +148,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                     "arm_r_joint[3-6]",
                 ],
                 velocity_limit_sim=15.0,
-                effort_limit_sim=1000.0,  # 31.7
+                effort_limit_sim=31.7,  # 31.7
                 stiffness=600.0,
                 damping=20.0,
             ),
@@ -157,7 +158,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                     "arm_r_joint7",
                 ],
                 velocity_limit_sim=6.0,
-                effort_limit_sim=1000.0,  # 5.1
+                effort_limit_sim=5.1,  # 5.1
                 stiffness=200.0,
                 damping=3.0,
             ),
@@ -166,7 +167,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
                 velocity_limit_sim=2.2,
-                effort_limit_sim=1000.0,  # 20.0
+                effort_limit_sim=3.0,  # 20.0
                 stiffness=20.0,
                 damping=0.5,
             ),
@@ -175,7 +176,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             "head": ImplicitActuatorCfg(
                 joint_names_expr=["head_joint1", "head_joint2"],
                 velocity_limit_sim=2.0,
-                effort_limit_sim=1000.0,  # 30.0
+                effort_limit_sim=30.0,  # 30.0
                 stiffness=150.0,
                 damping=3.0,
             ),
@@ -192,7 +193,16 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications."""
     
-    pass
+    hand_pose_r = mdp.DexYCBCommandTermCfg(
+        asset_name="robot",
+        file_path="/home/peunsu/workspace/robotis_sh5/retargeting/trajectories/20200709_143257.npy",
+        frame_idx=29,
+        table_height=MISSING,
+        body_name=MISSING,
+        object_name="object",
+        resampling_time_range=(20.0, 20.0), # same as episode length to sample only once at reset
+        debug_vis=True
+    )
 
 @configclass
 class ActionsCfg:
@@ -235,23 +245,18 @@ class ObservationsCfg:
             #noise=UniformNoiseCfg(n_min=-0.01, n_max=0.01),
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*", "arm_r_joint[1-7]", "lift_joint"])}
         )
-        
-        # The position and orientation of the end-effectors (in the world frame)
-        # left_eef_pos = ObservationTermCfg(
-        #     func=mdp.get_eef_pos,
-        #     params={"link_name": "hx5_d20_left_base"}
-        # )
-        # left_eef_quat = ObservationTermCfg(
-        #     func=mdp.get_eef_quat,
-        #     params={"link_name": "hx5_d20_left_base"}
-        # )
-        right_eef_pos = ObservationTermCfg(
-            func=mdp.get_eef_pos,
-            params={"link_name": "hx5_d20_right_base"}
+        joint_effort = ObservationTermCfg(
+            func=mdp.joint_effort,
+            params={"asset_cfg": SceneEntityCfg("robot")}
         )
-        right_eef_quat = ObservationTermCfg(
-            func=mdp.get_eef_quat,
-            params={"link_name": "hx5_d20_right_base"}
+        
+        right_hand_pose = ObservationTermCfg(
+            func=mdp.body_pose_w,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=["finger_r_link.*"])}
+        )
+        right_eef_pose = ObservationTermCfg(
+            func=mdp.body_pose_w,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=["hx5_d20_right_base"])}
         )
         
         # The position and orientation of the object, and the relative position of the end-effectors to the object (in the world frame)
@@ -264,6 +269,11 @@ class ObservationsCfg:
             }
         )
         
+        hand_pose_command_r = ObservationTermCfg(
+            func=mdp.generated_commands,
+            params={"command_name": "hand_pose_r"},
+        )
+
         # The last input action
         actions = ObservationTermCfg(func=mdp.last_action)
 
@@ -280,74 +290,120 @@ class EventCfg:
     
     reset_all = EventTermCfg(func=mdp.reset_scene_to_default, mode="reset")
     
-    reset_object = EventTermCfg(
-        func=mdp.reset_root_state_uniform,
+    reset_object_from_data = EventTermCfg(
+        func=mdp.reset_object_to_tray_pose,
         mode="reset",
         params={
-            "pose_range": {
-                "x": [-0.01, 0.01],
-                "y": [-0.01, 0.01],
-            },
-            "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object"),
+            "file_path": "/home/peunsu/workspace/robotis_sh5/retargeting/trajectories/20200709_143257.npy",
+            "frame_idx": 29, # 원하는 프레임 번호
+            "table_height": MISSING
         },
     )
+    
+    # reset_object = EventTermCfg(
+    #     func=mdp.reset_root_state_uniform,
+    #     mode="reset",
+    #     params={
+    #         "pose_range": {
+    #             "x": [-0.01, 0.01],
+    #             "y": [-0.01, 0.01],
+    #         },
+    #         "velocity_range": {},
+    #         "asset_cfg": SceneEntityCfg("object"),
+    #     },
+    # )
 
 @configclass
 class RewardsCfg:
-    """Reward specifications."""
+    """Reward specifications for the DexYCB Pick-and-Place task."""
+
+    # ---------------------------------------------------------
+    # 1. Imitation / Reaching Rewards (기본 자세 및 접근)
+    # ---------------------------------------------------------
     
-    # 1. Distance Reward
-    dist_reward = RewardTermCfg(
-        func=mdp.object_distance_reward,
-        weight=1.0,
+    joint_pos_imitation = RewardTermCfg(
+        func=mdp.joint_angle_error,
+        weight=-0.1,  # 페널티이므로 음수
         params={
-            "fingertip_names": MISSING,
-            "palm_name": MISSING
-        }
+            "command_name": "hand_pose_r",
+            "asset_cfg": SceneEntityCfg("robot")
+        },
     )
-    
-    # 2. Height Reward (CrossDex 논문 수식 반영)
-    height_reward = RewardTermCfg(
-        func=mdp.object_height_reward,
-        weight=1.0,
+
+    root_translation = RewardTermCfg(
+        func=mdp.root_translation_error,
+        weight=-0.6,
+        params={
+            "command_name": "hand_pose_r",
+            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING)
+        },
+    )
+
+    root_rotation = RewardTermCfg(
+        func=mdp.root_rotation_error,
+        weight=-0.1,
+        params={
+            "command_name": "hand_pose_r",
+            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING)
+        },
+    )
+
+    # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
+    fingertip_reaching = RewardTermCfg(
+        func=mdp.reaching_reward,
+        weight=-0.5, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "palm_name": MISSING,
-            "table_height": MISSING,
-            "target_lift_height": MISSING
-        }
+            "object_name": "object"
+        },
     )
-    
-    # 3. XY Displacement Penalty
-    xy_penalty = RewardTermCfg(
-        func=mdp.object_horizontal_displacement_reward,
-        weight=1.0
-    )
-    
-    # 4. Success Reward (CrossDex 성공 조건: 높이 + 파지 여부)
-    success_bonus = RewardTermCfg(
-        func=mdp.success_reward,
-        weight=1.0,
+
+    # ---------------------------------------------------------
+    # 2. Task Rewards (Lifting & Moving)
+    # ---------------------------------------------------------
+
+    # 수식 (8): 파지 성공 후 들어올리기 보상
+    object_lifting = RewardTermCfg(
+        func=mdp.lifting_reward_fullbody,
+        weight=0.1, # 성공 보상이므로 큰 양수 가중치
         params={
+            "command_name": "hand_pose_r",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "object_name": "object",
             "fingertip_names": MISSING,
             "palm_name": MISSING,
-            "table_height": MISSING,
-            "target_lift_height": MISSING,
-            "threshold": 0.05
-        }
+            "wrist_link_name": MISSING, # 실제 로봇의 손목 링크 이름
+            "thresholds": {
+                "lambda_f1": 0.12,  # 관절 오차 허용치
+                "lambda_f2": 0.6,   # 손가락-물체 거리 허용치
+                "lambda_0": 0.05    # 목표 도달 판단 기준 (5cm)
+            }
+        },
     )
+
+    # 수식 (9): 물체를 목표 지점으로 이동
+    object_moving = RewardTermCfg(
+        func=mdp.moving_reward,
+        weight=1.0,
+        params={
+            "command_name": "hand_pose_r",
+            "object_name": "object",
+            "weight_m": 2.0,   # 거리 페널티 wm
+            "weight_b": 10.0,  # 보너스 가중치 wb
+            "lambda_0": 0.05   # 보너스 구간 threshold
+        },
+    )
+
+    # ---------------------------------------------------------
+    # 3. Regularization (규제 항)
+    # ---------------------------------------------------------
     
-    # Penalty on action rate and joint velocity to encourage smoother motions
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
         weight=-0.0001,
     )
-    # joint_vel = RewardTermCfg(
-    #     func=mdp.joint_vel_l2,
-    #     weight=-2.5e-6,
-    #     params={"asset_cfg": SceneEntityCfg("robot")},
-    # )
 
 @configclass
 class TerminationsCfg:
@@ -360,10 +416,7 @@ class TerminationsCfg:
     )
 
     success = TerminationTermCfg(func=mdp.task_done_pick_place, params={
-        "fingertip_names": MISSING,
-        "palm_name": MISSING,
-        "table_height": MISSING,
-        "target_lift_height": MISSING,
+        "command_name": "hand_pose_r",
         "threshold": 0.05
     })
     
@@ -406,8 +459,8 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
     """Environment configuration for the Robotis SH5 Pick and Place task."""
     
 
-    scene: RobotisSh5PickAndPlaceSceneCfg = RobotisSh5PickAndPlaceSceneCfg(num_envs=16, env_spacing=4.0, replicate_physics=True)
-    #commands: CommandsCfg = CommandsCfg()
+    scene: RobotisSh5PickAndPlaceSceneCfg = RobotisSh5PickAndPlaceSceneCfg(num_envs=16, env_spacing=3.0, replicate_physics=True)
+    commands: CommandsCfg = CommandsCfg()
     actions: ActionsCfg = ActionsCfg()
     observations: ObservationsCfg = ObservationsCfg()
     events: EventCfg = EventCfg()
@@ -425,14 +478,14 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.friction_correlation_distance = 0.00625
         self.sim.physx.gpu_max_rigid_patch_count = 4096 * 4096
         
-        self.decimation = 6
-        self.episode_length_s = 20.0
+        self.decimation = 2
+        self.episode_length_s = 10.0
         
         self.viewer.eye = (3.5, 3.5, 3.5)
         #self.viewer.lookat = (0.0, 0.0, 0.0)
         
         self.sim.dt = 1.0 / 60.0
-        self.sim.render_interval = 2
+        self.sim.render_interval = self.decimation
         
         table_height = 1.0
         target_lift_height = 0.3
@@ -458,23 +511,33 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         palm_link_l = "hx5_d20_left_base"
         palm_link_r = "hx5_d20_right_base"
         
-        self.rewards.dist_reward.params["fingertip_names"] = fingertip_links_r
-        self.rewards.dist_reward.params["palm_name"] = palm_link_r
+        # self.rewards.dist_reward.params["fingertip_names"] = fingertip_links_r
+        # self.rewards.dist_reward.params["palm_name"] = palm_link_r
         
-        self.rewards.height_reward.params["fingertip_names"] = fingertip_links_r
-        self.rewards.height_reward.params["palm_name"] = palm_link_r
-        self.rewards.height_reward.params["table_height"] = table_height
-        self.rewards.height_reward.params["target_lift_height"] = target_lift_height
+        # self.rewards.height_reward.params["fingertip_names"] = fingertip_links_r
+        # self.rewards.height_reward.params["palm_name"] = palm_link_r
+        # self.rewards.height_reward.params["table_height"] = table_height
+        # self.rewards.height_reward.params["target_lift_height"] = target_lift_height
         
-        self.rewards.success_bonus.params["fingertip_names"] = fingertip_links_r
-        self.rewards.success_bonus.params["palm_name"] = palm_link_r
-        self.rewards.success_bonus.params["table_height"] = table_height
-        self.rewards.success_bonus.params["target_lift_height"] = target_lift_height
+        # self.rewards.success_bonus.params["fingertip_names"] = fingertip_links_r
+        # self.rewards.success_bonus.params["palm_name"] = palm_link_r
+        # self.rewards.success_bonus.params["table_height"] = table_height
+        # self.rewards.success_bonus.params["target_lift_height"] = target_lift_height
         
-        self.terminations.success.params["fingertip_names"] = fingertip_links_r
-        self.terminations.success.params["palm_name"] = palm_link_r
-        self.terminations.success.params["table_height"] = table_height
-        self.terminations.success.params["target_lift_height"] = target_lift_height
+        self.rewards.root_translation.params["asset_cfg"].body_names = [ee_link_r]
+        self.rewards.root_rotation.params["asset_cfg"].body_names = [ee_link_r]
+        
+        self.rewards.fingertip_reaching.params["fingertip_names"] = fingertip_links_r
+        self.rewards.fingertip_reaching.params["palm_name"] = palm_link_r
+        
+        self.rewards.object_lifting.params["fingertip_names"] = fingertip_links_r
+        self.rewards.object_lifting.params["palm_name"] = palm_link_r
+        self.rewards.object_lifting.params["wrist_link_name"] = palm_link_r
+        
+        self.events.reset_object_from_data.params["table_height"] = table_height
+        
+        self.commands.hand_pose_r.body_name = ee_link_r
+        self.commands.hand_pose_r.table_height = table_height
         
     
 @configclass

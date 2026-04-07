@@ -26,17 +26,17 @@ def object_obs(
         right_eef to object,
     """
 
-    body_pos_w = env.scene["robot"].data.body_pos_w
+    # body_pos_w = env.scene["robot"].data.body_pos_w
     # left_eef_idx = env.scene["robot"].data.body_names.index(left_eef_link_name)
-    right_eef_idx = env.scene["robot"].data.body_names.index(right_eef_link_name)
+    # right_eef_idx = env.scene["robot"].data.body_names.index(right_eef_link_name)
     # left_eef_pos = body_pos_w[:, left_eef_idx] - env.scene.env_origins
-    right_eef_pos = body_pos_w[:, right_eef_idx] - env.scene.env_origins
+    # right_eef_pos = body_pos_w[:, right_eef_idx] - env.scene.env_origins
 
     object_pos = env.scene["object"].data.root_pos_w - env.scene.env_origins
     object_quat = env.scene["object"].data.root_quat_w
 
     # left_eef_to_object = object_pos - left_eef_pos
-    right_eef_to_object = object_pos - right_eef_pos
+    # right_eef_to_object = object_pos - right_eef_pos
     
     # print(f"Object position: {object_pos}, Object quaternion: {object_quat}")
     # print(f"Right EEF position: {right_eef_pos}")
@@ -46,7 +46,7 @@ def object_obs(
             object_pos,
             object_quat,
             #left_eef_to_object,
-            right_eef_to_object,
+            #right_eef_to_object,
         ),
         dim=1,
     )
