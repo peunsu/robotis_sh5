@@ -67,11 +67,15 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                 disable_gravity=True,
                 max_depenetration_velocity=5.0,
             ),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True,
+                contact_offset=0.005,
+                rest_offset=0.0,
+            ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
                 fix_root_link=True,
-                solver_position_iteration_count=32,
+                solver_position_iteration_count=4,
                 solver_velocity_iteration_count=1,
             ),
             activate_contact_sensors=False,
@@ -200,6 +204,7 @@ class CommandsCfg:
         table_height=MISSING,
         body_name=MISSING,
         object_name="object",
+        fix_hand_command=True, # Whether to fix the hand pose in the command (for curriculum learning)
         resampling_time_range=(20.0, 20.0), # same as episode length to sample only once at reset
         debug_vis=True
     )
@@ -324,7 +329,7 @@ class RewardsCfg:
     
     joint_pos_imitation = RewardTermCfg(
         func=mdp.joint_angle_error,
-        weight=-0.1,  # 페널티이므로 음수
+        weight=-0.05,  # 페널티이므로 음수
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot")
@@ -352,7 +357,7 @@ class RewardsCfg:
     # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
     fingertip_reaching = RewardTermCfg(
         func=mdp.reaching_reward,
-        weight=-0.5, # wr 가중치
+        weight=0.0, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "palm_name": MISSING,
@@ -367,7 +372,7 @@ class RewardsCfg:
     # 수식 (8): 파지 성공 후 들어올리기 보상
     object_lifting = RewardTermCfg(
         func=mdp.lifting_reward_fullbody,
-        weight=0.1, # 성공 보상이므로 큰 양수 가중치
+        weight=0.0, # 성공 보상이므로 큰 양수 가중치
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot"),
@@ -386,7 +391,7 @@ class RewardsCfg:
     # 수식 (9): 물체를 목표 지점으로 이동
     object_moving = RewardTermCfg(
         func=mdp.moving_reward,
-        weight=1.0,
+        weight=0.0,
         params={
             "command_name": "hand_pose_r",
             "object_name": "object",
@@ -424,6 +429,54 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum learning configuration."""
     
+    hand_pose_command_curriculum = CurriculumTermCfg(
+        func=mdp.modify_env_param,
+        params={
+            "address": "command_manager.cfg.hand_pose_r.fix_hand_command",
+            "modify_fn": mdp.fix_hand_command_curriculum,  # 단순히 fix_hand_command를 True로 설정
+            "modify_params": {
+                "fix_hand_command": False,
+                "num_step": 5000
+            }
+        }
+    )
+    
+    # joint_pos_imitation_reward_schedule = CurriculumTermCfg(
+    #     func=mdp.modify_reward_weight,
+    #     params={
+    #         "term_name": "joint_pos_imitation",
+    #         "weight": -0.1,
+    #         "num_steps": 5000,
+    #     }
+    # )
+    
+    fingertip_reaching_reward_schedule = CurriculumTermCfg(
+        func=mdp.modify_reward_weight,
+        params={
+            "term_name": "fingertip_reaching",
+            "weight": -0.5,
+            "num_steps": 10000,
+        }
+    )
+        
+    object_lifting_reward_schedule = CurriculumTermCfg(
+        func=mdp.modify_reward_weight,
+        params={
+            "term_name": "object_lifting",
+            "weight": 0.1,
+            "num_steps": 10000,
+        }
+    )
+    
+    object_moving_reward_schedule = CurriculumTermCfg(
+        func=mdp.modify_reward_weight,
+        params={
+            "term_name": "object_moving",
+            "weight": 1.0,
+            "num_steps": 10000,
+        }
+    )
+
     # action_rate_curriculum = CurriculumTermCfg(
     #     func=mdp.modify_env_param,
     #     params={
@@ -466,7 +519,7 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
-    #curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     # Post initialization
     def __post_init__(self) -> None:
@@ -474,7 +527,7 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         
         self.sim.physx.bounce_threshold_velocity = 0.01
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 1024 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
         self.sim.physx.gpu_max_rigid_patch_count = 4096 * 4096
         

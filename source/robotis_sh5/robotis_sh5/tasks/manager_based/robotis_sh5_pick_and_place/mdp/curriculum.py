@@ -13,6 +13,16 @@ import isaaclab.envs.mdp as mdp
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+def fix_hand_command_curriculum(env: ManagerBasedRLEnv, env_ids, old_value, fix_hand_command, num_step):
+    """
+    커리큘럼 학습을 위해, fix_hand_command가 True인 경우 일정 단계까지 손가락 관절값을 고정된 값으로 설정하는 커리큘럼 함수.
+    """
+    
+    if env.common_step_counter > num_step:
+        return fix_hand_command
+    
+    return mdp.modify_env_param.NO_CHANGE
+
 def fade_in_reward_weight(env, env_ids, old_value, initial_weight, target_weight, grace_period, fade_in_steps):
     """
     grace_period 동안은 NO_CHANGE, 그 후 fade_in_steps 동안 target_weight까지 선형 증가.

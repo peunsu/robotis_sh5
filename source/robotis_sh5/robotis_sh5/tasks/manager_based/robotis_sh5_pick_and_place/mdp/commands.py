@@ -31,6 +31,9 @@ class DexYCBCommandTerm(CommandTerm):
         self.object = env.scene[cfg.object_name]
         self.ee_body_idx = self.robot.find_bodies(cfg.body_name)[0][0]
         
+        # Bool flag to determine if we should fix the hand pose in the command (for curriculum learning)
+        self.fix_hand_command = cfg.fix_hand_command
+        
         # [Buffers]
         self.rel_hand_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.rel_hand_quat = torch.zeros(self.num_envs, 4, device=self.device)
@@ -66,8 +69,13 @@ class DexYCBCommandTerm(CommandTerm):
         
         # 2. 관절값 매핑 적용
         raw_qpos = self.traj["qpos"]
+        target_qpos = raw_qpos[self.dataset_finger_indices]
         
-        self.target_qpos[env_ids] = raw_qpos[self.dataset_finger_indices]
+        if self.fix_hand_command:
+            # 손가락 관절값을 고정된 값으로 설정 (예: 0.0)
+            self.target_qpos[env_ids] = torch.zeros_like(self.target_qpos[env_ids])
+        else:
+            self.target_qpos[env_ids] = target_qpos
 
         # [핵심] Lifting Target Position 계산 (World 좌표 변환)
         # npy의 obj_pos + env_origin + table_height + offset(0.3m)
@@ -120,7 +128,8 @@ class DexYCBCommandTerm(CommandTerm):
     @property
     def command(self) -> torch.Tensor:
         # 7(Pose) + 손가락 개수 + 3(Target Pos)
-        return torch.cat([self.pose_command_b, self.target_qpos, self.target_pos_w], dim=-1)
+        command = torch.cat([self.pose_command_b, self.target_qpos, self.target_pos_w], dim=-1)
+        return command
 
     # --- Debug Visualizer ---
     def _set_debug_vis_impl(self, debug_vis: bool):
@@ -161,6 +170,7 @@ class DexYCBCommandTermCfg(CommandTermCfg):
     asset_name: str = "robot"
     object_name: str = "object"
     body_name: str = "hx5_d20_right_base"
+    fix_hand_command: bool = False # Whether to fix the hand pose in the command (for curriculum learning)
     
     # [Debug Visualizer Settings]
     # 1. 목표 포즈 마커 (목표 지점)
