@@ -42,7 +42,8 @@ class DexYCBCommandTerm(CommandTerm):
         self.target_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
 
         # 29번째 프레임 데이터를 한 번 로드해서 관절 순서 매핑 생성
-        self.traj = get_trajectory_data(self._env, self.cfg.file_path, frame_idx=self.cfg.frame_idx)
+        #self.traj = get_trajectory_data(self._env, self.cfg.file_path, frame_idx=self.cfg.frame_idx)
+        self.traj = get_trajectory_data(self._env, self.cfg.file_path)
         dataset_joints = self.traj["joint_names"] # 여기서 가져온 이름 리스트 사용
         
         robot_finger_indices = []

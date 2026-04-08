@@ -20,7 +20,7 @@ def reset_object_to_tray_pose(
     env_ids, 
     asset_cfg: SceneEntityCfg, 
     file_path: str, 
-    frame_idx: int, 
+    frame_idx: int = 0, 
     table_height: float = 1.0,
     pos_range_xy: tuple[float, float] = (-0.1, 0.1), # 랜덤 범위 추가
     rot_range_z: tuple[float, float] = (-0.2, 0.2)   # 랜덤 범위 추가

@@ -139,4 +139,4 @@ def contact_forces_norm(env, sensor_name: str):
     force_magnitudes = torch.norm(net_forces, p=2, dim=-1)
     
     # 에이전트가 학습하기 좋게 적절한 스케일로 조정 (보통 0.01 ~ 0.1 사이)
-    return force_magnitudes * 0.05
+    return force_magnitudes * 0.01

@@ -16,7 +16,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.math import subtract_frame_transforms, quat_error_magnitude, quat_mul
 from .utils import (
-    get_scaled_wrist_force, get_grasping_flags,
+    get_wrist_acc, get_grasping_flags,
     compute_finger_qpos_error, compute_hand_pos_error, compute_hand_rot_error
 )
 
@@ -137,15 +137,14 @@ def lifting_reward_fullbody(
     object_name: str,
     fingertip_names: list,
     wrist_link_name: str,
+    wrist_joint_name: str,
     thresholds: dict = {"lambda_fingertip": 0.60, "lambda_palm": 0.12, "lambda_d_obj": 0.05}
 ) -> torch.Tensor:
     # 1. 플래그 유틸리티 호출
     flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
     
-    # 2. 손목 힘(a_z) 계산
-    robot: Articulation = env.scene[asset_cfg.name]
-    wrist_idx = robot.find_bodies(wrist_link_name)[0][0]
-    a_z = get_scaled_wrist_force(robot, wrist_idx)
+    # 2. 손목 가속도(a_z) 계산
+    a_z = get_wrist_acc(env, wrist_joint_name)
 
     # 3. f == 3 (모든 조건 만족)일 때만 보상 지급
     reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.1 * (1.0 + a_z), torch.zeros_like(a_z))

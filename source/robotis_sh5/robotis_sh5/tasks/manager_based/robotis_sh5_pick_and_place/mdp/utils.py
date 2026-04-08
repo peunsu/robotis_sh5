@@ -72,10 +72,13 @@ def get_trajectory_data(env: ManagerBasedRLEnv, file_path: str, frame_idx: int =
     
     # 1. 데이터 로드
     data = np.load(file_path, allow_pickle=True).item()
+    frame_idx = data["motion_start_frame"] if frame_idx == 0 else frame_idx # 기본값 0이면 motion_start_frame 사용
     
     # --- World Frame 데이터 추출 ---
-    obj_pos_w = torch.tensor(data["obj_poses"][obj_idx][frame_idx], device=env.device, dtype=torch.float32)
-    obj_quat_w = torch.tensor(data["obj_quats"][obj_idx][frame_idx], device=env.device, dtype=torch.float32)
+    # obj_pos_w = torch.tensor(data["obj_poses"][obj_idx][frame_idx], device=env.device, dtype=torch.float32)
+    # obj_quat_w = torch.tensor(data["obj_quats"][obj_idx][frame_idx], device=env.device, dtype=torch.float32)
+    obj_pos_w = torch.tensor(data["obj_pos"][frame_idx], device=env.device, dtype=torch.float32)
+    obj_quat_w = torch.tensor(data["obj_quat"][frame_idx], device=env.device, dtype=torch.float32)
     
     hand_pos_w = torch.tensor(data["root_pos"][frame_idx], device=env.device, dtype=torch.float32)
     hand_quat_w = torch.tensor(data["root_quat"][frame_idx], device=env.device, dtype=torch.float32)
@@ -118,6 +121,21 @@ def get_scaled_wrist_force(robot: Articulation, wrist_link_idx: int) -> torch.Te
 
     # 3. 수치 안정성을 위한 스케일링
     return wrist_force_z # * 0.001
+
+def get_wrist_acc(env: ManagerBasedRLEnv, wrist_joint_name: str) -> torch.Tensor:
+    """
+    손목 관절의 가속도를 계산하여 반환하는 함수
+    """
+    # 1. 로봇 에셋 가져오기 (joint_acc_l2 방식 참고)
+    robot: Articulation = env.scene["robot"]
+    
+    # 2. 손목 관절(wrist_joint)의 가속도 추출
+    # asset_cfg.joint_ids에는 손목 관절의 인덱스가 들어있어야 해!
+    # joint_acc shape: (num_envs, num_joints)
+    wrist_joint_idx = robot.find_joints(wrist_joint_name)[0][0]
+    wrist_accel = robot.data.joint_acc[:, wrist_joint_idx]
+
+    return wrist_accel
 
 def get_grasping_flags(
     env: ManagerBasedRLEnv, 

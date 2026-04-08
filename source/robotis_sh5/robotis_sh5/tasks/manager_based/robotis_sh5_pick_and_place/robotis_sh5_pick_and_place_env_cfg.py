@@ -81,10 +81,10 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                 solver_velocity_iteration_count=2,
                 # solver_velocity_iteration_count=1,
             ),
-            activate_contact_sensors=False,
+            activate_contact_sensors=True,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(1.00, 0.7, 0.0),
+            pos=(0.9, 0.8, 0.0),
             rot=(0.70711, 0.0, 0.0, -0.70711),
             joint_pos={
                 # # Swerve base joints
@@ -96,12 +96,18 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
                 **{f"arm_l_joint{i + 1}": 0.0 for i in range(7)},
                 # Right arm joints
                 #**{f"arm_r_joint{i + 1}": 0.0 for i in range(7)},
-                "arm_r_joint2": -1.13,
-                "arm_r_joint3": 0.03,
-                "arm_r_joint4": -2.1,
-                "arm_r_joint5": -1.44,
-                "arm_r_joint6": 0.43,
-                "arm_r_joint7": -0.65,
+                # "arm_r_joint2": -1.13,
+                # "arm_r_joint3": 0.03,
+                # "arm_r_joint4": -2.1,
+                # "arm_r_joint5": -1.44,
+                # "arm_r_joint6": 0.43,
+                # "arm_r_joint7": -0.65,
+                "arm_r_joint2": -1.162,
+                "arm_r_joint3": 0.291,
+                "arm_r_joint4": -1.876,
+                "arm_r_joint5": -0.609,
+                "arm_r_joint6": 0.335,
+                "arm_r_joint7": -0.368,
                 
                 # Left and right finger joints
                 **{f"finger_l_joint{i + 1}": 0.0 for i in range(20)},
@@ -190,12 +196,12 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         },
     )
     
-    # contact_forces_RH = ContactSensorCfg(
-    #     prim_path="{ENV_REGEX_NS}/Robot/finger_r_link.*",
-    #     update_period=0.0,
-    #     history_length=1,
-    #     debug_vis=True,
-    # )
+    contact_forces_RH = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link.*",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=True,
+    )
     
     # Light
     dome_light = AssetBaseCfg(
@@ -209,8 +215,8 @@ class CommandsCfg:
     
     hand_pose_r = mdp.DexYCBCommandTermCfg(
         asset_name="robot",
-        file_path="/home/peunsu/workspace/robotis_sh5/retargeting/trajectories/20200709_143257.npy",
-        frame_idx=29,
+        file_path=MISSING,
+        #frame_idx=29,
         table_height=MISSING,
         body_name=MISSING,
         object_name="object",
@@ -309,6 +315,11 @@ class ObservationsCfg:
             func=mdp.generated_commands,
             params={"command_name": "hand_pose_r"},
         )
+        
+        hand_contact_forces = ObservationTermCfg(
+            func=mdp.contact_forces_norm,
+            params={"sensor_name": "contact_forces_RH"}
+        )
 
         # The last input action
         actions = ObservationTermCfg(func=mdp.last_action)
@@ -345,8 +356,8 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("object"),
-            "file_path": "/home/peunsu/workspace/robotis_sh5/retargeting/trajectories/20200709_143257.npy",
-            "frame_idx": 29, # 원하는 프레임 번호
+            "file_path": MISSING,
+            #"frame_idx": 29, # 원하는 프레임 번호
             "table_height": MISSING,
             "pos_range_xy": (-0.1, 0.1), # Range for randomizing the object's x and y position offset (in meters)
             "rot_range_z": (-0.2, 0.2)   # Range for randomizing the object's rotation around z-axis (in radians)
@@ -404,7 +415,7 @@ class RewardsCfg:
     # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
     fingertip_reaching = RewardTermCfg(
         func=mdp.reaching_reward,
-        weight=-0.1, # wr 가중치
+        weight=-0.15, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
@@ -426,6 +437,7 @@ class RewardsCfg:
             "object_name": "object",
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
+            "wrist_joint_name": MISSING,
             "thresholds": MISSING
         },
     )
@@ -509,14 +521,14 @@ class CurriculumCfg:
     #     }
     # )
     
-    fingertip_reaching_reward_schedule = CurriculumTermCfg(
-        func=mdp.modify_reward_weight,
-        params={
-            "term_name": "fingertip_reaching",
-            "weight": -0.5,
-            "num_steps": 5000,
-        }
-    )
+    # fingertip_reaching_reward_schedule = CurriculumTermCfg(
+    #     func=mdp.modify_reward_weight,
+    #     params={
+    #         "term_name": "fingertip_reaching",
+    #         "weight": -0.5,
+    #         "num_steps": 5000,
+    #     }
+    # )
         
     # object_lifting_reward_schedule = CurriculumTermCfg(
     #     func=mdp.modify_reward_weight,
@@ -625,6 +637,11 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
             "finger_r_link20"
         ]
         
+        file_path = "/home/peunsu/workspace/robotis_sh5/retargeting/trajectories/006_mustard_bottle/20200709_143257.npy"
+        
+        self.commands.hand_pose_r.file_path = file_path
+        self.events.reset_object_from_data.params["file_path"] = file_path
+        
         # self.rewards.dist_reward.params["fingertip_names"] = fingertip_links_r
         # self.rewards.dist_reward.params["wrist_link_name"] = wrist_link_r
         
@@ -646,6 +663,7 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         
         self.rewards.object_lifting.params["fingertip_names"] = fingertip_links_r
         self.rewards.object_lifting.params["wrist_link_name"] = ee_link_r
+        self.rewards.object_lifting.params["wrist_joint_name"] = "arm_r_joint7"
         self.rewards.object_lifting.params["thresholds"] = thresholds
         
         self.rewards.object_moving.params["fingertip_names"] = fingertip_links_r
