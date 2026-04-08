@@ -15,7 +15,10 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.math import subtract_frame_transforms, quat_error_magnitude, quat_mul
-from .utils import get_scaled_wrist_force
+from .utils import (
+    get_scaled_wrist_force, get_grasping_flags,
+    compute_finger_qpos_error, compute_hand_pos_error, compute_hand_rot_error
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -24,6 +27,9 @@ def joint_angle_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: Scen
     robot: Articulation = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
     command_term = env.command_manager.get_term(command_name)
+    
+    finger_qpos_error = compute_finger_qpos_error(env, command, command_term)
+    return finger_qpos_error
     
     # 1. command에서 손가락 부분만 추출 (중간에 딱 손가락 개수만큼 있음)
     # 7번 인덱스부터 (7 + 손가락 개수)까지
@@ -44,6 +50,9 @@ def root_translation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg:
     """수식 두 번째 항: ||th_obj - th_g||2"""
     robot: Articulation = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
+    
+    hand_pos_error = compute_hand_pos_error(env, command, asset_cfg, asset_cfg.body_names[0])
+    return hand_pos_error
     
     # 1. 커맨드에 저장된 목표 위치 (Base 기준 상대 좌표)
     # DexYCBCommandTerm의 pose_command_b 부분이 0:3에 해당함
@@ -70,6 +79,9 @@ def root_rotation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: Sc
     robot: Articulation = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
     
+    hand_rot_error = compute_hand_rot_error(env, command, asset_cfg, asset_cfg.body_names[0])
+    return hand_rot_error
+    
     # 1. 목표 회전 (쿼터니언, 인덱스 3:7)
     target_quat_b = command[:, 3:7]
     
@@ -89,7 +101,7 @@ def root_rotation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: Sc
 def reaching_reward(
     env: ManagerBasedRLEnv, 
     fingertip_names: list, 
-    palm_name: str, 
+    wrist_link_name: str, 
     object_name: str
 ) -> torch.Tensor:
     """
@@ -99,7 +111,7 @@ def reaching_reward(
     # 1. 가상 링크 포즈 가져오기 (이미 구현한 함수 호출)
     # virtual_fingertip_pos: list of (num_envs, 3)
     # virtual_palm_pos: (num_envs, 3)
-    virtual_fingertip_pos, virtual_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
+    virtual_fingertip_pos, virtual_palm_pos = get_virtual_link_poses(env, fingertip_names, wrist_link_name)
     
     # 2. 오브젝트 현재 위치 (World Frame)
     obj = env.scene[object_name]
@@ -113,7 +125,7 @@ def reaching_reward(
         total_dist += torch.norm(finger_pos - obj_pos_w, p=2, dim=-1)
         
     # 손바닥(Palm)과의 거리도 포함할지 선택 가능 (수식에 따라 포함)
-    # total_dist += torch.norm(virtual_palm_pos - obj_pos_w, p=2, dim=-1)
+    total_dist += 2 * torch.norm(virtual_palm_pos - obj_pos_w, p=2, dim=-1)
     
     # 가중치 제외하고 거리 합산값 반환 (RewTerm에서 weight로 -wr 적용)
     return total_dist
@@ -124,83 +136,54 @@ def lifting_reward_fullbody(
     asset_cfg: SceneEntityCfg,
     object_name: str,
     fingertip_names: list,
-    palm_name: str,
-    wrist_link_name: str, # 손목 링크 이름 추가
-    thresholds: dict = {
-        "lambda_f1": 0.12,
-        "lambda_f2": 0.6,
-        "lambda_0": 0.05
-    }
+    wrist_link_name: str,
+    thresholds: dict = {"lambda_fingertip": 0.60, "lambda_palm": 0.12, "lambda_d_obj": 0.05}
 ) -> torch.Tensor:
-    robot: Articulation = env.scene[asset_cfg.name]
-    command = env.command_manager.get_command(command_name)
-    command_term = env.command_manager.get_term(command_name)
-    obj = env.scene[object_name]
+    # 1. 플래그 유틸리티 호출
+    flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
     
-    # --- 1. f 계산 (Distance Terms) ---
-    # f1: 손가락 관절만 비교 (target_qpos에서 손가락 부분만 슬라이싱)
-    num_fingers = len(command_term.robot_finger_indices)
-    target_qpos = command[:, 7:7+num_fingers]
-    # 전체 관절 중 데이터셋과 매핑된(손가락) 부분만 오차 계산
-    # (command_term에서 만든 finger_mask를 활용하면 더 좋아)
-    f1_dist = torch.sum(torch.abs(robot.data.joint_pos[:, command_term.robot_finger_indices] - target_qpos), dim=-1)
-
-    # f2: 가상 손가락 끝 - 물체 거리 (구현한 함수 활용)
-    virtual_fingertip_pos, virtual_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
-    obj_pos_w = obj.data.root_pos_w
-    f2_dist = torch.zeros(env.num_envs, device=env.device)
-    for finger_pos in virtual_fingertip_pos:
-        f2_dist += torch.norm(finger_pos - obj_pos_w, p=2, dim=-1)
-    f2_dist += torch.norm(virtual_palm_pos - obj_pos_w, p=2, dim=-1)
-
-    # d_obj: 물체 - 타겟(30cm 위) 거리
-    target_pos_w = command[:, -3:]
-    d_obj = torch.norm(obj_pos_w - target_pos_w, p=2, dim=-1)
-
-    # --- 2. 조건 판단 (f = 3) ---
-    is_f1 = (f1_dist < thresholds["lambda_f1"]).float()
-    is_f2 = (f2_dist < thresholds["lambda_f2"]).float()
-    is_f3 = (d_obj > thresholds["lambda_0"]).float()
-    f = is_f1 + is_f2 + is_f3
-
-    # --- 3. az 계산 (Measured Joint Force 사용) ---
+    # 2. 손목 힘(a_z) 계산
+    robot: Articulation = env.scene[asset_cfg.name]
     wrist_idx = robot.find_bodies(wrist_link_name)[0][0]
     a_z = get_scaled_wrist_force(robot, wrist_idx)
 
-    # --- 4. 최종 리워드 ---
-    reward = torch.where(f >= 3.0, 1.0 * (1.0 + a_z), torch.zeros_like(f))
+    # 3. f == 3 (모든 조건 만족)일 때만 보상 지급
+    # 1.0 * (1.0 + a_z) 형태
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.1 * (1.0 + a_z), torch.zeros_like(a_z))
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, 0.2, reward)
     
     return reward
 
 def moving_reward(
     env: ManagerBasedRLEnv, 
     command_name: str, 
+    asset_cfg: SceneEntityCfg, # 추가
     object_name: str,
+    fingertip_names: list,     # 추가
+    wrist_link_name: str,
     weight_m: float = 2.0,
     weight_b: float = 10.0,
-    lambda_0: float = 0.05
+    thresholds: dict = {"lambda_fingertip": 0.60, "lambda_palm": 0.12, "lambda_d_obj": 0.05}
 ) -> torch.Tensor:
-    """
-    수식 (9): r_move 계산
-    물체가 목표 지점(target_pos_w)에 가까워질수록 보상을 주며, 
-    lambda_0 이내일 때 보너스 항을 추가함.
-    """
     command = env.command_manager.get_command(command_name)
-    obj = env.scene[object_name]
-
-    # 1. d_obj 계산: 현재 오브젝트 위치와 목표 위치(command의 마지막 3차원) 사이의 거리
-    target_pos_w = command[:, -3:]
-    curr_obj_pos_w = obj.data.root_pos_w
-    d_obj = torch.norm(curr_obj_pos_w - target_pos_w, p=2, dim=-1)
-
-    # 2. 기본 페널티 항: -wm * d_obj
-    reward = -weight_m * d_obj
-
-    # 3. 보너스 조건 판단: d_obj < lambda_0
-    # lambda_0 이내일 때 보너스 term인 1 / (1 + wb * d_obj) 를 더해줌
-    bonus = 1.0 / (1.0 + weight_b * d_obj)
+    command_term = env.command_manager.get_term(command_name)
     
-    # torch.where를 사용하여 조건부 리워드 적용
-    reward = torch.where(d_obj < lambda_0, reward + bonus, reward)
+    # 1. 플래그 유틸리티 호출 (d_obj만 가져와서 사용)
+    flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
+    d_obj = flags["d_obj"]
+    
+    target_flag = sum([
+        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
+        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
+        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
+    ])
+
+    # 2. 기본 거리 페널티
+    # reward = -weight_m * d_obj
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, 0.6 - weight_m * d_obj, torch.zeros_like(d_obj))
+
+    # 3. 보너스 조건 (d_obj < lambda_d_obj)
+    bonus = 1.0 / (1.0 + weight_b * d_obj)
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, reward + bonus, reward)
 
     return reward

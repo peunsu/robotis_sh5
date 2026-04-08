@@ -4,7 +4,7 @@ seed: 42
 # Models are instantiated using skrl's model instantiator utility
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
-  separate: False
+  separate: True # Default: False
   policy:  # see gaussian_model parameters
     class: GaussianMixin
     clip_actions: False # Default: False
@@ -77,5 +77,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 40000
+  timesteps: 80000
   environment_info: log

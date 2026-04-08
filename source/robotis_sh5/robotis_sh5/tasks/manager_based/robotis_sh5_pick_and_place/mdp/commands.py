@@ -81,7 +81,7 @@ class DexYCBCommandTerm(CommandTerm):
         # npy의 obj_pos + env_origin + table_height + offset(0.3m)
         env_origins = self._env.scene.env_origins[env_ids]
         table_offset = torch.tensor([0.0, 0.0, self.cfg.table_height], device=self.device)
-        lift_offset = torch.tensor([0.0, 0.0, 0.3], device=self.device)
+        lift_offset = torch.tensor([0.0, 0.0, self.cfg.target_lift_height], device=self.device)
 
         # 데이터셋의 오브젝트 위치를 현재 환경 위치로 오프셋 처리
         # traj["obj_pos"]는 (3,) 이므로 환경 개수만큼 expand해서 계산
@@ -167,11 +167,12 @@ class DexYCBCommandTermCfg(CommandTermCfg):
     file_path: str = MISSING
     frame_idx: int = 0
     table_height: float = 1.0
+    target_lift_height: float = 0.3
     asset_name: str = "robot"
     object_name: str = "object"
     body_name: str = "hx5_d20_right_base"
     fix_hand_command: bool = False # Whether to fix the hand pose in the command (for curriculum learning)
-    
+
     # [Debug Visualizer Settings]
     # 1. 목표 포즈 마커 (목표 지점)
     goal_pose_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(

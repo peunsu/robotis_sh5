@@ -11,7 +11,8 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
-from isaaclab.utils.math import quat_inv, quat_apply, quat_mul
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_inv, quat_apply, quat_mul, subtract_frame_transforms
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -117,3 +118,103 @@ def get_scaled_wrist_force(robot: Articulation, wrist_link_idx: int) -> torch.Te
 
     # 3. 수치 안정성을 위한 스케일링
     return wrist_force_z * 0.001
+
+def get_grasping_flags(
+    env: ManagerBasedRLEnv, 
+    command_name: str, 
+    asset_cfg: SceneEntityCfg, 
+    object_name: str, 
+    fingertip_names: list, 
+    palm_name: str,
+    thresholds: dict = {"lambda_fingertip": 0.60, "lambda_palm": 0.12, "lambda_d_obj": 0.05}
+) -> dict:
+    """
+    현재 에피소드의 파지 상태 플래그(f1, f2, f3)를 계산하여 딕셔너리로 반환합니다.
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    command_term = env.command_manager.get_term(command_name)
+    obj = env.scene[object_name]
+    
+    virtual_fingertip_pos, virtual_palm_pos = get_virtual_link_poses(env, fingertip_names, palm_name)
+    obj_pos_w = obj.data.root_pos_w
+    
+    # --- 1. f1: Joint Angle Error (손가락 관절 일치도) ---
+    # num_fingers = len(command_term.robot_finger_indices)
+    # target_qpos = command[:, 7:7+num_fingers]
+    # current_qpos = robot.data.joint_pos[:, command_term.robot_finger_indices]
+    # f1_dist = torch.sum(torch.abs(current_qpos - target_qpos), dim=-1)
+    # is_f1 = (f1_dist < thresholds["lambda_fingertip"]).float()
+    
+    # --- 1. f1: Fingertip Distance (손가락 끝 - 물체 거리) ---
+    f1_dist = torch.zeros(env.num_envs, device=env.device)
+    for finger_pos in virtual_fingertip_pos:
+        f1_dist += torch.norm(finger_pos - obj_pos_w, p=2, dim=-1)
+    f1_dist += torch.norm(virtual_palm_pos - obj_pos_w, p=2, dim=-1)
+    is_f1 = (f1_dist < thresholds["lambda_fingertip"]).int()
+    
+    # --- 2. f2: Palm Distance (손바닥과 물체의 거리) ---
+    f2_dist = torch.norm(virtual_palm_pos - obj_pos_w, p=2, dim=-1)
+    is_f2 = (f2_dist < thresholds["lambda_palm"]).int()
+
+    # --- 3. f3: Lifting Distance (물체 - 타겟 높이 거리) ---
+    target_pos_w = command[:, -3:]
+    d_obj = torch.norm(obj_pos_w - target_pos_w, p=2, dim=-1)
+    is_f3 = (d_obj < thresholds["lambda_d_obj"]).int() # 0.05m 이내로 들어오면 성공으로 간주
+
+    return {
+        "is_f1": is_f1, # 관절 각도 조건 만족
+        "is_f2": is_f2, # 손가락 위치 조건 만족
+        "is_f3": is_f3, # 들어올리기 성공
+        "d_obj": d_obj, # 물체-목표 거리 (moving_reward용)
+        "f_total": is_f1 + is_f2 + is_f3 # 총합 (3일 때 완전 성공)
+    }
+
+# [1] 손의 위치 오차 (L2 Norm)
+def compute_hand_pos_error(env, command, asset_cfg, ee_link_name):
+    robot = env.scene[asset_cfg.name]
+    ee_link_id = robot.find_bodies(ee_link_name)[0][0]
+    ee_pos_w = robot.data.body_state_w[:, ee_link_id, :3]
+    ee_quat_w = robot.data.body_state_w[:, ee_link_id, 3:7]
+    
+    # Base 기준 상대 좌표 변환
+    curr_pos_b, _ = subtract_frame_transforms(
+        robot.data.root_pos_w, robot.data.root_quat_w, ee_pos_w, ee_quat_w
+    )
+    
+    target_pos_b = command[:, :3]
+    delta_pos = target_pos_b - curr_pos_b
+    return torch.norm(delta_pos, p=2, dim=-1)
+
+# [2] 손의 회전 오차 (Geodesic Distance)
+def compute_hand_rot_error(env, command, asset_cfg, ee_link_name):    
+    robot = env.scene[asset_cfg.name]
+    ee_link_id = robot.find_bodies(ee_link_name)[0][0]
+    ee_quat_w = robot.data.body_state_w[:, ee_link_id, 3:7]
+    
+    # Base 기준 현재 회전 추출
+    _, curr_quat_b = subtract_frame_transforms(
+        robot.data.root_pos_w, robot.data.root_quat_w, 
+        robot.data.body_state_w[:, ee_link_id, :3], ee_quat_w
+    )
+    
+    target_quat_b = command[:, 3:7]
+    # q_delta = q_target * q_curr_inv
+    delta_quat = quat_mul(target_quat_b, quat_inv(curr_quat_b))
+    
+    # 2 * asin(||vec||) 계산
+    return 2.0 * torch.asin(torch.clamp(torch.norm(delta_quat[:, 0:3], p=2, dim=-1), max=1.0))
+
+# [3] 손가락 관절 오차 (L1 Norm)
+def compute_finger_qpos_error(env, command, command_term):
+    robot = env.scene[command_term.cfg.asset_name]
+    
+    # command에서 손가락 부분 추출
+    num_fingers = len(command_term.robot_finger_indices)
+    target_qpos = command[:, 7:7+num_fingers]
+    
+    # 현재 로봇의 손가락 관절 값
+    current_qpos = robot.data.joint_pos[:, command_term.robot_finger_indices]
+    
+    delta_qpos = target_qpos - current_qpos
+    return torch.norm(delta_qpos, p=1, dim=-1)
