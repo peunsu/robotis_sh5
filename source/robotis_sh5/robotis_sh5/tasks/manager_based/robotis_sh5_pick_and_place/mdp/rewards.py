@@ -148,7 +148,6 @@ def lifting_reward_fullbody(
     a_z = get_scaled_wrist_force(robot, wrist_idx)
 
     # 3. f == 3 (모든 조건 만족)일 때만 보상 지급
-    # 1.0 * (1.0 + a_z) 형태
     reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.1 * (1.0 + a_z), torch.zeros_like(a_z))
     reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, 0.2, reward)
     

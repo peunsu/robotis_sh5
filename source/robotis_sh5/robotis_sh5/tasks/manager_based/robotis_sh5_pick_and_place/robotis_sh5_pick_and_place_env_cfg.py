@@ -45,7 +45,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.3, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.3, 0.1, 0.0), rot=(0.0, 0.0, 0.0, 1.0))
     )
     
     object = RigidObjectCfg(
@@ -56,7 +56,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             scale=(1.00, 1.00, 1.00),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.3, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.1, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
     )
 
     # Robot
@@ -84,7 +84,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             activate_contact_sensors=False,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(1.00, 0.95, 0.0),
+            pos=(1.00, 0.7, 0.0),
             rot=(0.70711, 0.0, 0.0, -0.70711),
             joint_pos={
                 # # Swerve base joints
@@ -283,15 +283,15 @@ class ObservationsCfg:
         )
         joint_effort = ObservationTermCfg(
             func=mdp.joint_effort,
-            params={"asset_cfg": SceneEntityCfg("robot")}
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*", "arm_r_joint[1-7]", "lift_joint"])}
         )
         
         right_hand_pose = ObservationTermCfg(
-            func=mdp.body_pose_w,
+            func=mdp.body_pose_relative_to_env,
             params={"asset_cfg": SceneEntityCfg("robot", body_names=["finger_r_link.*"])}
         )
         right_eef_pose = ObservationTermCfg(
-            func=mdp.body_pose_w,
+            func=mdp.body_pose_relative_to_env,
             params={"asset_cfg": SceneEntityCfg("robot", body_names=["hx5_d20_right_base"])}
         )
         
@@ -348,8 +348,8 @@ class EventCfg:
             "file_path": "/home/peunsu/workspace/robotis_sh5/retargeting/trajectories/20200709_143257.npy",
             "frame_idx": 29, # 원하는 프레임 번호
             "table_height": MISSING,
-            "pos_range_xy": (-0.1, 0.1), # XY 평면상의 위치 랜덤 범위 [min, max] (단위: m)
-            "rot_range_z": (-0.2, 0.2)   # Z축(Yaw) 회전 랜덤 범위 [min, max] (단위: rad)
+            "pos_range_xy": (-0.1, 0.1), # Range for randomizing the object's x and y position offset (in meters)
+            "rot_range_z": (-0.2, 0.2)   # Range for randomizing the object's rotation around z-axis (in radians)
         },
     )
     
@@ -385,7 +385,7 @@ class RewardsCfg:
 
     root_translation = RewardTermCfg(
         func=mdp.root_translation_error,
-        weight=-0.3,
+        weight=-0.6,
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING)
@@ -394,7 +394,7 @@ class RewardsCfg:
 
     root_rotation = RewardTermCfg(
         func=mdp.root_rotation_error,
-        weight=-0.02,
+        weight=-0.1,
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot", body_names=MISSING)
@@ -404,7 +404,7 @@ class RewardsCfg:
     # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
     fingertip_reaching = RewardTermCfg(
         func=mdp.reaching_reward,
-        weight=-0.5, # wr 가중치
+        weight=-0.2, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
@@ -665,5 +665,5 @@ class RobotisSh5PickAndPlaceEnv_PLAY(RobotisSh5PickAndPlaceEnvCfg):
         super().__post_init__()
 
         self.scene.num_envs = 50
-        self.scene.env_spacing = 4.0
+        self.scene.env_spacing = 3.0
         self.observations.policy.enable_corruption = False  # Disable observation corruption for evaluation

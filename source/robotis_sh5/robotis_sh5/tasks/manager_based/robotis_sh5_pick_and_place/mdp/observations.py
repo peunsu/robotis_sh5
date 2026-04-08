@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import isaaclab.sim as sim_utils
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -63,7 +64,6 @@ def object_obs(
         left_eef to object,
         right_eef to object,
     """
-
     # body_pos_w = env.scene["robot"].data.body_pos_w
     # left_eef_idx = env.scene["robot"].data.body_names.index(left_eef_link_name)
     # right_eef_idx = env.scene["robot"].data.body_names.index(right_eef_link_name)
@@ -90,20 +90,40 @@ def object_obs(
     )
 
 
-def get_eef_pos(env: ManagerBasedRLEnv, link_name: str) -> torch.Tensor:
-    body_pos_w = env.scene["robot"].data.body_pos_w
-    left_eef_idx = env.scene["robot"].data.body_names.index(link_name)
-    left_eef_pos = body_pos_w[:, left_eef_idx] - env.scene.env_origins
-
-    return left_eef_pos
-
-
-def get_eef_quat(env: ManagerBasedRLEnv, link_name: str) -> torch.Tensor:
-    body_quat_w = env.scene["robot"].data.body_quat_w
-    left_eef_idx = env.scene["robot"].data.body_names.index(link_name)
-    left_eef_quat = body_quat_w[:, left_eef_idx]
-
-    return left_eef_quat
+def body_pose_relative_to_env(
+    env: ManagerBasedRLEnv, 
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """각 환경의 origin을 기준으로 한 body의 [pos, quat]를 반환해."""
+    
+    # 1. 자산(robot 등) 추출
+    asset = env.scene[asset_cfg.name]
+    
+    # 2. 월드 기준 포즈 데이터 가져오기 (num_envs, num_bodies, 3/4)
+    # body_ids가 지정되어 있으면 해당되는 바디들만 가져옴
+    body_pos_w = asset.data.body_state_w[:, asset_cfg.body_ids, :3]
+    body_quat_w = asset.data.body_state_w[:, asset_cfg.body_ids, 3:7]
+    
+    # 3. 각 환경의 Origin 가져오기 (num_envs, 3)
+    env_origins = env.scene.env_origins # 각 환경의 (x, y, z) 원점
+    
+    # 4. 좌표 변환 (World -> Env Relative)
+    # 위치(pos)는 단순히 환경 원점을 빼주면 되고, 
+    # 회전(quat)은 환경 자체가 회전되어 있지 않다면 월드와 동일해.
+    # 만약 환경 자체가 회전되어 있다면 subtract_frame_transforms를 쓰는 게 안전해.
+    
+    # 각 환경 원점을 body 개수만큼 확장 (num_envs, 1, 3) -> (num_envs, num_bodies, 3)
+    num_bodies = body_pos_w.shape[1]
+    env_origins_expanded = env_origins.unsqueeze(1).expand(-1, num_bodies, -1)
+    
+    # 상대 위치 계산
+    relative_pos = body_pos_w - env_origins_expanded
+    
+    # 5. 데이터 합치기 및 Flatten (num_envs, num_bodies * 7)
+    # 각 body당 [x, y, z, qw, qx, qy, qz] 순서로 맞춤
+    relative_poses = torch.cat([relative_pos, body_quat_w], dim=-1)
+    
+    return relative_poses.view(env.num_envs, -1)
 
 def contact_forces_norm(env, sensor_name: str):
     """오른손가락들의 접촉력 크기(Norm)를 observation으로 반환해."""
