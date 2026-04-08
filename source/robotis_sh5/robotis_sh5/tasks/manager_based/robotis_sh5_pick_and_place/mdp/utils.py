@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_inv, quat_apply, quat_mul, subtract_frame_transforms
+from isaaclab.utils.math import quat_inv, quat_apply, quat_mul, subtract_frame_transforms, quat_error_magnitude
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -117,7 +117,7 @@ def get_scaled_wrist_force(robot: Articulation, wrist_link_idx: int) -> torch.Te
     wrist_force_z = forces[:, wrist_link_idx, 2]
 
     # 3. 수치 안정성을 위한 스케일링
-    return wrist_force_z * 0.001
+    return wrist_force_z # * 0.001
 
 def get_grasping_flags(
     env: ManagerBasedRLEnv, 
@@ -190,20 +190,21 @@ def compute_hand_pos_error(env, command, asset_cfg, ee_link_name):
 def compute_hand_rot_error(env, command, asset_cfg, ee_link_name):    
     robot = env.scene[asset_cfg.name]
     ee_link_id = robot.find_bodies(ee_link_name)[0][0]
-    ee_quat_w = robot.data.body_state_w[:, ee_link_id, 3:7]
     
-    # Base 기준 현재 회전 추출
+    target_quat_b = command[:, 3:7]
+    
+    # 2. 현재 End-effector의 Base 기준 상대 회전 계산
+    ee_quat_w = robot.data.body_state_w[:, ee_link_id, 3:7]
+    root_quat_w = robot.data.root_quat_w
+    
+    # 베이스 기준 현재 EE 회전 (q_rel = q_root_inv * q_ee)
     _, curr_quat_b = subtract_frame_transforms(
-        robot.data.root_pos_w, robot.data.root_quat_w, 
+        robot.data.root_pos_w, root_quat_w, 
         robot.data.body_state_w[:, ee_link_id, :3], ee_quat_w
     )
     
-    target_quat_b = command[:, 3:7]
-    # q_delta = q_target * q_curr_inv
-    delta_quat = quat_mul(target_quat_b, quat_inv(curr_quat_b))
-    
-    # 2 * asin(||vec||) 계산
-    return 2.0 * torch.asin(torch.clamp(torch.norm(delta_quat[:, 0:3], p=2, dim=-1), max=1.0))
+    # 3. 두 쿼터니언 사이의 각도 차이 (라디안) 계산
+    return quat_error_magnitude(curr_quat_b, target_quat_b)
 
 # [3] 손가락 관절 오차 (L1 Norm)
 def compute_finger_qpos_error(env, command, command_term):

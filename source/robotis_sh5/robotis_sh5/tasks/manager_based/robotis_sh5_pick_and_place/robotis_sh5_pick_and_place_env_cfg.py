@@ -21,6 +21,7 @@ from isaaclab.managers import (
     TerminationTermCfg
 )
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import UniformNoiseCfg
@@ -189,6 +190,13 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         },
     )
     
+    # contact_forces_RH = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/finger_r_link.*",
+    #     update_period=0.0,
+    #     history_length=1,
+    #     debug_vis=True,
+    # )
+    
     # Light
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
@@ -304,6 +312,20 @@ class ObservationsCfg:
 
         # The last input action
         actions = ObservationTermCfg(func=mdp.last_action)
+        
+        marker_debugger = ObservationTermCfg(
+            func=mdp.visual_marker_obs,
+            params={
+                "fingertip_names": [
+                    "finger_r_link4",
+                    "finger_r_link8",
+                    "finger_r_link12",
+                    "finger_r_link16",
+                    "finger_r_link20"
+                ],
+                "palm_name": "hx5_d20_right_base"
+            }
+        )
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
