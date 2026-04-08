@@ -404,7 +404,7 @@ class RewardsCfg:
     # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
     fingertip_reaching = RewardTermCfg(
         func=mdp.reaching_reward,
-        weight=-0.2, # wr 가중치
+        weight=-0.1, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
@@ -484,17 +484,21 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum learning configuration."""
     
-    # hand_pose_command_curriculum = CurriculumTermCfg(
-    #     func=mdp.modify_env_param,
-    #     params={
-    #         "address": "command_manager.cfg.hand_pose_r.fix_hand_command",
-    #         "modify_fn": mdp.fix_hand_command_curriculum,  # 단순히 fix_hand_command를 True로 설정
-    #         "modify_params": {
-    #             "fix_hand_command": False,
-    #             "num_step": 5000
-    #         }
-    #     }
-    # )
+    hand_pose_command_curriculum = CurriculumTermCfg(
+        func=mdp.modify_env_param,
+        params={
+            "address": "command_manager.cfg.hand_pose_r.fix_hand_command",
+            "modify_fn": mdp.dynamic_hand_command_curriculum,  # 단순히 fix_hand_command를 True로 설정
+            "modify_params": {
+                "command_name": "hand_pose_r",
+                "asset_cfg": SceneEntityCfg("robot"),
+                "object_name": "object",
+                "fingertip_names": MISSING,
+                "wrist_link_name": MISSING,
+                "thresholds": MISSING
+            }
+        }
+    )
     
     # joint_pos_imitation_reward_schedule = CurriculumTermCfg(
     #     func=mdp.modify_reward_weight,
@@ -505,14 +509,14 @@ class CurriculumCfg:
     #     }
     # )
     
-    # fingertip_reaching_reward_schedule = CurriculumTermCfg(
-    #     func=mdp.modify_reward_weight,
-    #     params={
-    #         "term_name": "fingertip_reaching",
-    #         "weight": -0.5,
-    #         "num_steps": 10000,
-    #     }
-    # )
+    fingertip_reaching_reward_schedule = CurriculumTermCfg(
+        func=mdp.modify_reward_weight,
+        params={
+            "term_name": "fingertip_reaching",
+            "weight": -0.5,
+            "num_steps": 5000,
+        }
+    )
         
     # object_lifting_reward_schedule = CurriculumTermCfg(
     #     func=mdp.modify_reward_weight,
@@ -653,6 +657,10 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.commands.hand_pose_r.body_name = ee_link_r
         self.commands.hand_pose_r.table_height = table_height
         self.commands.hand_pose_r.target_lift_height = target_lift_height
+        
+        self.curriculum.hand_pose_command_curriculum.params["modify_params"]["fingertip_names"] = fingertip_links_r
+        self.curriculum.hand_pose_command_curriculum.params["modify_params"]["wrist_link_name"] = ee_link_r
+        self.curriculum.hand_pose_command_curriculum.params["modify_params"]["thresholds"] = thresholds
     
 @configclass
 class RobotisSh5PickAndPlaceEnv_PLAY(RobotisSh5PickAndPlaceEnvCfg):

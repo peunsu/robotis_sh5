@@ -8,12 +8,17 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
+from isaaclab.managers import SceneEntityCfg
 import isaaclab.envs.mdp as mdp
+from .utils import get_grasping_flags
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def fix_hand_command_curriculum(env: ManagerBasedRLEnv, env_ids, old_value, fix_hand_command, num_step):
+def fix_hand_command_curriculum(
+    env: ManagerBasedRLEnv, env_ids, old_value,
+    fix_hand_command, num_step
+):
     """
     커리큘럼 학습을 위해, fix_hand_command가 True인 경우 일정 단계까지 손가락 관절값을 고정된 값으로 설정하는 커리큘럼 함수.
     """
@@ -22,6 +27,26 @@ def fix_hand_command_curriculum(env: ManagerBasedRLEnv, env_ids, old_value, fix_
         return fix_hand_command
     
     return mdp.modify_env_param.NO_CHANGE
+
+def dynamic_hand_command_curriculum(
+    env: ManagerBasedRLEnv, env_ids, old_value,
+    command_name: str, 
+    asset_cfg: SceneEntityCfg,
+    object_name: str,
+    fingertip_names: list,
+    wrist_link_name: str,
+    thresholds: dict = {"lambda_fingertip": 0.60, "lambda_palm": 0.12, "lambda_d_obj": 0.05}
+):
+    """
+    커리큘럼 학습을 위해, fix_hand_command가 True인 경우 일정 단계까지 손가락 관절값을 고정된 값으로 설정하는 커리큘럼 함수.
+    """
+    
+    flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
+    
+    cond = (flags["is_f1"] + flags["is_f2"] == 2)  # 두 손가락이 모두 물체에 가까워졌는지 여부
+    
+    # 손가락이 물체에 충분히 가까워지기 전까지는 로봇 손의 초기 상태를 커맨드로, 그 이후에는 실제 손가락 관절값을 커맨드로 사용하도록 함.
+    return ~cond[env_ids]
 
 def fade_in_reward_weight(env, env_ids, old_value, initial_weight, target_weight, grace_period, fade_in_steps):
     """

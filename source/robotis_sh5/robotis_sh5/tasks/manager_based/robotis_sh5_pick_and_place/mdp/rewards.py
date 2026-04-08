@@ -179,7 +179,7 @@ def moving_reward(
 
     # 2. 기본 거리 페널티
     # reward = -weight_m * d_obj
-    reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, 0.6 - weight_m * d_obj, torch.zeros_like(d_obj))
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, 0.9 - weight_m * d_obj, torch.zeros_like(d_obj))
 
     # 3. 보너스 조건 (d_obj < lambda_d_obj)
     bonus = 1.0 / (1.0 + weight_b * d_obj)
