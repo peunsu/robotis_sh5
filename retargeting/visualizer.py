@@ -33,7 +33,8 @@ def main():
     # Load the trajectory data for the specified sequence index from the DexYCB dataset
     dataset = DexYCBVideoDataset("DexYCB", hand_type=args_cli.hand_type)
     capture_name = dataset[args_cli.seq_idx]["capture_name"]
-    data = np.load(f"trajectories/{capture_name}.npy", allow_pickle=True).item()
+    #data = np.load(f"trajectories/{capture_name}.npy", allow_pickle=True).item()
+    data = np.load(f"trajectories/20200709_143211.npy", allow_pickle=True).item()
     
     print(f"Loaded trajectory data for sequence '{capture_name}' with {len(data['qpos'])} frames.")
 

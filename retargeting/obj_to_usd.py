@@ -6,7 +6,7 @@ simulation_app = SimulationApp({"headless": True})
 
 import asyncio
 import omni.kit.asset_converter as converter
-from pxr import UsdPhysics, UsdGeom, Usd
+from pxr import UsdPhysics, UsdGeom, Usd, UsdShade
 import omni.usd
 import os
 
@@ -37,7 +37,27 @@ async def convert_obj_to_usd_with_physics(input_obj_path, output_usd_path):
         UsdPhysics.RigidBodyAPI.Apply(root_prim)
         mass_api = UsdPhysics.MassAPI.Apply(root_prim)
         mass_api.CreateMassAttr(0.5)
+        
+        # 1. Physics Material 생성 및 설정
+        material_path = "/World/PhysicsMaterial"
+        if not stage.GetPrimAtPath(material_path):
+            # Material Prim 생성
+            material_prim = stage.DefinePrim(material_path, "Material")
+            # Material에 PhysicsMaterialAPI 적용
+            physics_material = UsdPhysics.MaterialAPI.Apply(material_prim)
+            
+            physics_material.CreateStaticFrictionAttr(1.0)
+            physics_material.CreateDynamicFrictionAttr(0.6)
+            physics_material.CreateRestitutionAttr(0.0)
 
+        # 2. 물체(root_prim)에 Material 바인딩 (이 부분이 수정됐어!)
+        # UsdShade의 MaterialBindingAPI를 사용해
+        binding_api = UsdShade.MaterialBindingAPI.Apply(root_prim)
+        # 'physics' 목적(Purpose)으로 재질을 바인딩해줘
+        binding_api.Bind(UsdShade.Material(stage.GetPrimAtPath(material_path)), 
+                        bindingStrength=UsdShade.Tokens.strongerThanDescendants, 
+                        materialPurpose="physics")
+        
         # Collider 설정
         for prim in stage.Traverse():
             if prim.IsA(UsdGeom.Mesh):
