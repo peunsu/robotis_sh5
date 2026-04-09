@@ -147,7 +147,7 @@ def lifting_reward_fullbody(
     a_z = get_wrist_acc(env, wrist_joint_name)
 
     # 3. f == 3 (모든 조건 만족)일 때만 보상 지급
-    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.1 * (1.0 + a_z), torch.zeros_like(a_z))
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.01 * (1.0 + a_z), torch.zeros_like(a_z))
     reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, 0.2, reward)
     
     return reward
@@ -170,15 +170,16 @@ def moving_reward(
     flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
     d_obj = flags["d_obj"]
     
-    target_flag = sum([
-        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
-        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
-        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
-    ])
+    # target_flag = sum([
+    #     (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
+    #     (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
+    #     (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
+    # ])
 
     # 2. 기본 거리 페널티
     # reward = -weight_m * d_obj
-    reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, 0.9 - weight_m * d_obj, torch.zeros_like(d_obj))
+    # reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, 0.9 - weight_m * d_obj, torch.zeros_like(d_obj))
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.8 - weight_m * d_obj, torch.zeros_like(d_obj))
 
     # 3. 보너스 조건 (d_obj < lambda_d_obj)
     bonus = 1.0 / (1.0 + weight_b * d_obj)

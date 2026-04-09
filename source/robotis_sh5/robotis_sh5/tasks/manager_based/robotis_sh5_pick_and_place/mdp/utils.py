@@ -62,16 +62,25 @@ def get_virtual_link_poses(env: ManagerBasedRLEnv, fingertip_names: list, palm_n
     
     return virtual_fingertip_pos, virtual_palm_pos
 
+_TRAJECTORY_CACHE = {}
+
 def get_trajectory_data(env: ManagerBasedRLEnv, file_path: str, frame_idx: int = 0, obj_idx: int = 0):
     """
     npy 파일에서 특정 프레임의 데이터를 추출하여 
     오브젝트 포즈, 오브젝트 기준 핸드 포즈, 관절 각도, 관절 이름을 반환합니다.
     """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Trajectory file not found: {file_path}")
+    global _TRAJECTORY_CACHE
+    
+    if file_path not in _TRAJECTORY_CACHE:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Trajectory file not found: {file_path}")
+        
+        # 데이터를 로드해서 캐시에 저장 (메모리에 유지)
+        _TRAJECTORY_CACHE[file_path] = np.load(file_path, allow_pickle=True).item()
+        # print(f"[Cache] Loaded and cached: {file_path}") # 디버깅용
     
     # 1. 데이터 로드
-    data = np.load(file_path, allow_pickle=True).item()
+    data = _TRAJECTORY_CACHE[file_path]
     frame_idx = data["motion_start_frame"] if frame_idx == 0 else frame_idx # 기본값 0이면 motion_start_frame 사용
     
     # --- World Frame 데이터 추출 ---
@@ -106,21 +115,6 @@ def get_trajectory_data(env: ManagerBasedRLEnv, file_path: str, frame_idx: int =
         "qpos": qpos,                       # 로봇 손가락 관절 각도
         "joint_names": joint_names          # 관절 이름 리스트
     }
-    
-def get_scaled_wrist_force(robot: Articulation, wrist_link_idx: int) -> torch.Tensor:
-    """
-    robot: Articulation 객체
-    wrist_link_idx: 힘을 측정할 손목 링크(Link)의 인덱스
-    반환값: Z축 방향으로 작용하는 Force (scaled, torch.Tensor)
-    """
-    forces = robot.root_physx_view.get_link_incoming_joint_force()
-
-    # 2. 특정 손목 링크의 Z축 Force 추출 (index 2)
-    # forces shape: (num_envs, num_links, 6) -> (Fx, Fy, Fz, Tx, Ty, Tz)
-    wrist_force_z = forces[:, wrist_link_idx, 2]
-
-    # 3. 수치 안정성을 위한 스케일링
-    return wrist_force_z # * 0.001
 
 def get_wrist_acc(env: ManagerBasedRLEnv, wrist_joint_name: str) -> torch.Tensor:
     """

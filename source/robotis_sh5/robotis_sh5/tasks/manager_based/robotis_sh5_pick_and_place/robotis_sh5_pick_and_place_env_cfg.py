@@ -196,12 +196,61 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         },
     )
     
-    contact_forces_RH = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link.*",
+    # contact_forces_RH = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/finger_r_link.*",
+    #     update_period=0.0,
+    #     history_length=1,
+    #     debug_vis=True,
+    # )
+    
+    contact_forces_r_link_4 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link4",
         update_period=0.0,
         history_length=1,
         debug_vis=True,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
     )
+    
+    contact_forces_r_link_8 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link8",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=True,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+    )
+    
+    contact_forces_r_link_12 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link12",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=True,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+    )
+    
+    contact_forces_r_link_16 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link16",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=True,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+    )
+    
+    contact_forces_r_link_20 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/finger_r_link20",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=True,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+    )
+    
+    contact_forces_r_base = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/hx5_d20_right_base",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=True,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+    )
+    
     
     # Light
     dome_light = AssetBaseCfg(
@@ -318,25 +367,32 @@ class ObservationsCfg:
         
         hand_contact_forces = ObservationTermCfg(
             func=mdp.contact_forces_norm,
-            params={"sensor_name": "contact_forces_RH"}
+            params={"sensor_names": [
+                "contact_forces_r_link_4",
+                "contact_forces_r_link_8",
+                "contact_forces_r_link_12",
+                "contact_forces_r_link_16",
+                "contact_forces_r_link_20",
+                "contact_forces_r_base"
+            ]}
         )
 
         # The last input action
         actions = ObservationTermCfg(func=mdp.last_action)
         
-        marker_debugger = ObservationTermCfg(
-            func=mdp.visual_marker_obs,
-            params={
-                "fingertip_names": [
-                    "finger_r_link4",
-                    "finger_r_link8",
-                    "finger_r_link12",
-                    "finger_r_link16",
-                    "finger_r_link20"
-                ],
-                "palm_name": "hx5_d20_right_base"
-            }
-        )
+        # marker_debugger = ObservationTermCfg(
+        #     func=mdp.visual_marker_obs,
+        #     params={
+        #         "fingertip_names": [
+        #             "finger_r_link4",
+        #             "finger_r_link8",
+        #             "finger_r_link12",
+        #             "finger_r_link16",
+        #             "finger_r_link20"
+        #         ],
+        #         "palm_name": "hx5_d20_right_base"
+        #     }
+        # )
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -464,7 +520,7 @@ class RewardsCfg:
     
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
-        weight=-2.5e-4,
+        weight=-5.0e-4,
     )
     arm_joint_vel = RewardTermCfg(
         func=mdp.joint_vel_l2,

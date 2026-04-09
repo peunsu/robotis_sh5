@@ -125,18 +125,33 @@ def body_pose_relative_to_env(
     
     return relative_poses.view(env.num_envs, -1)
 
-def contact_forces_norm(env, sensor_name: str):
-    """오른손가락들의 접촉력 크기(Norm)를 observation으로 반환해."""
-    # 1. Scene에서 센서 객체 호출
-    sensor: ContactSensor = env.scene[sensor_name]
+def contact_forces_norm(env, sensor_names: list):
+    """필터링된 대상과의 접촉력 행렬(force_matrix_w)을 사용하여 크기를 계산해."""
     
-    # 2. 전체 접촉력 데이터 (env, body_id, 3) 가져오기
-    # net_forces_w_history를 쓰면 history_length에 따른 과거 데이터도 볼 수 있지만, 
-    # 여기서는 최신 값인 net_forces_w를 쓸게.
-    net_forces = sensor.data.net_forces_w
+    all_magnitudes = []
     
-    # 3. 각 링크별 힘의 크기 계산 (L2 Norm)
-    force_magnitudes = torch.norm(net_forces, p=2, dim=-1)
+    for name in sensor_names:
+        # 1. Scene에서 각 센서 객체 호출
+        sensor: ContactSensor = env.scene[name]
+        
+        # 2. 접촉력 행렬 데이터 가져오기 
+        # Shape: (num_envs, num_bodies, num_filters, 3)
+        force_matrix = sensor.data.force_matrix_w
+        
+        # 3. 필터링된 모든 대상으로부터 오는 힘을 합산 (num_filters 차원 합산)
+        # 결과 Shape: (num_envs, num_bodies, 3)
+        # 특정 물체들과의 접촉력만 남고, 바닥 등 필터링되지 않은 힘은 제외돼.
+        filtered_net_forces = torch.sum(force_matrix, dim=2)
+        
+        # 4. 각 바디별 힘의 크기 계산 (L2 Norm)
+        # 결과 Shape: (num_envs, num_bodies)
+        force_mag = torch.norm(filtered_net_forces, p=2, dim=-1)
+        
+        all_magnitudes.append(force_mag)
     
-    # 에이전트가 학습하기 좋게 적절한 스케일로 조정 (보통 0.01 ~ 0.1 사이)
-    return force_magnitudes * 0.01
+    # 5. 모든 센서 데이터를 하나의 텐서로 결합
+    # 결과 Shape: (num_envs, len(sensor_names))
+    combined_forces = torch.cat(all_magnitudes, dim=-1)
+    
+    # 6. 스케일 조정 (0.01) 후 반환
+    return combined_forces * 0.01
