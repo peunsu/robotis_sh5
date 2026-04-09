@@ -631,8 +631,6 @@ class CurriculumCfg:
     #         }
     #     }
     # )
-    
-    pass
 
 @configclass
 class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
