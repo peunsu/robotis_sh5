@@ -131,6 +131,16 @@ def get_wrist_acc(env: ManagerBasedRLEnv, wrist_joint_name: str) -> torch.Tensor
 
     return wrist_accel
 
+def get_object_acc(env: ManagerBasedRLEnv, object_name: str) -> torch.Tensor:
+    """
+    오브젝트의 가속도를 계산하여 반환하는 함수
+    """
+    obj = env.scene[object_name]
+    
+    obj_accel = obj.data.body_acc_w[:, 0, :3]  # (num_envs, 3)
+    
+    return obj_accel
+
 def get_grasping_flags(
     env: ManagerBasedRLEnv, 
     command_name: str, 

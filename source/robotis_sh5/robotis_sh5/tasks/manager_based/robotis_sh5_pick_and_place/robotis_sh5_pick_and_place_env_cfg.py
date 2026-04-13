@@ -180,7 +180,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
                 velocity_limit_sim=2.2,
-                effort_limit_sim=3.0,  # 20.0
+                effort_limit_sim=20.0,  # 20.0
                 stiffness=20.0,
                 damping=0.5,
             ),
@@ -366,7 +366,7 @@ class ObservationsCfg:
         )
         
         hand_contact_forces = ObservationTermCfg(
-            func=mdp.contact_forces_norm,
+            func=mdp.contact_forces,
             params={"sensor_names": [
                 "contact_forces_r_link_4",
                 "contact_forces_r_link_8",
@@ -443,7 +443,7 @@ class RewardsCfg:
     
     joint_pos_imitation = RewardTermCfg(
         func=mdp.joint_angle_error,
-        weight=-0.05,  # 페널티이므로 음수
+        weight=-0.1,  # 페널티이므로 음수
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot")
@@ -471,12 +471,28 @@ class RewardsCfg:
     # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
     fingertip_reaching = RewardTermCfg(
         func=mdp.reaching_reward,
-        weight=-0.15, # wr 가중치
+        weight=-0.50, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
             "object_name": "object"
         },
+    )
+    
+    contact_forces = RewardTermCfg(
+        func=mdp.grasp_contact_reward,
+        weight=-0.25,
+        params={
+            "sensor_names": [
+                "contact_forces_r_link_4",
+                "contact_forces_r_link_8",
+                "contact_forces_r_link_12",
+                "contact_forces_r_link_16",
+                "contact_forces_r_link_20",
+                "contact_forces_r_base"
+            ],
+            "threshold": 5.0,  # Contact force threshold for penalty (in Newtons)
+        }
     )
 
     # ---------------------------------------------------------
@@ -520,18 +536,18 @@ class RewardsCfg:
     
     action_rate = RewardTermCfg(
         func=mdp.action_rate_l2,
-        weight=-5.0e-4,
+        weight=-2.5e-4,
     )
-    arm_joint_vel = RewardTermCfg(
-        func=mdp.joint_vel_l2,
-        weight=-2.5e-5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["arm_r_joint[1-7]"])}
-    )
-    finger_joint_vel = RewardTermCfg(
-        func=mdp.joint_vel_l2,
-        weight=-2.5e-6,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
-    )
+    # arm_joint_vel = RewardTermCfg(
+    #     func=mdp.joint_vel_l2,
+    #     weight=-1.0e-5,
+    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["arm_r_joint[1-7]"])}
+    # )
+    # finger_joint_vel = RewardTermCfg(
+    #     func=mdp.joint_vel_l2,
+    #     weight=-2.5e-6,
+    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
+    # )
 
 @configclass
 class TerminationsCfg:
@@ -657,7 +673,7 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_max_rigid_patch_count = 4096 * 4096
         
         self.decimation = 2
-        self.episode_length_s = 8.0
+        self.episode_length_s = 4.0
         
         self.viewer.eye = (3.5, 3.5, 3.5)
         #self.viewer.lookat = (0.0, 0.0, 0.0)

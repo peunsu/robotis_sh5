@@ -125,10 +125,10 @@ def body_pose_relative_to_env(
     
     return relative_poses.view(env.num_envs, -1)
 
-def contact_forces_norm(env, sensor_names: list):
+def contact_forces(env, sensor_names: list):
     """필터링된 대상과의 접촉력 행렬(force_matrix_w)을 사용하여 크기를 계산해."""
     
-    all_magnitudes = []
+    all_forces = []
     
     for name in sensor_names:
         # 1. Scene에서 각 센서 객체 호출
@@ -143,15 +143,15 @@ def contact_forces_norm(env, sensor_names: list):
         # 특정 물체들과의 접촉력만 남고, 바닥 등 필터링되지 않은 힘은 제외돼.
         filtered_net_forces = torch.sum(force_matrix, dim=2)
         
-        # 4. 각 바디별 힘의 크기 계산 (L2 Norm)
-        # 결과 Shape: (num_envs, num_bodies)
-        force_mag = torch.norm(filtered_net_forces, p=2, dim=-1)
+        # 4. 차원을 조정하여 (num_envs, num_bodies * 3) 형태로 변환
+        # 결과 Shape: (num_envs, num_bodies * 3)
+        force_concat = filtered_net_forces.view(env.num_envs, -1)
         
-        all_magnitudes.append(force_mag)
+        all_forces.append(force_concat)
     
     # 5. 모든 센서 데이터를 하나의 텐서로 결합
-    # 결과 Shape: (num_envs, len(sensor_names))
-    combined_forces = torch.cat(all_magnitudes, dim=-1)
+    # 결과 Shape: (num_envs, total_bodies * 3 * num_sensors)
+    combined_forces = torch.cat(all_forces, dim=-1)
     
-    # 6. 스케일 조정 (0.01) 후 반환
-    return combined_forces * 0.01
+    # 6. 최종 접촉력 관측값 반환
+    return combined_forces
