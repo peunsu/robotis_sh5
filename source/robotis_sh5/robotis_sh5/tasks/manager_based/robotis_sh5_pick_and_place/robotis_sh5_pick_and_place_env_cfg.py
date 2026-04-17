@@ -53,7 +53,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             #usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/YCB/Axis_Aligned_Physics/006_mustard_bottle.usd",
             usd_path="/home/peunsu/workspace/robotis_sh5/retargeting/DexYCB/models/006_mustard_bottle/textured.usd",
-            scale=(1.00, 1.00, 1.00),
+            scale=(1.0, 1.0, 1.0),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.1, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
@@ -180,9 +180,9 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
                 velocity_limit_sim=2.2,
-                effort_limit_sim=20.0,  # 20.0
-                stiffness=20.0,
-                damping=0.5,
+                effort_limit_sim=15.0,  # 20.0
+                stiffness=1.0,  # 20.0
+                damping=0.2,  # 0.5
             ),
 
             # Actuators for head joints
@@ -208,7 +208,8 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        track_pose=True
     )
     
     contact_forces_r_link_8 = ContactSensorCfg(
@@ -216,7 +217,8 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        track_pose=True
     )
     
     contact_forces_r_link_12 = ContactSensorCfg(
@@ -224,7 +226,8 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        track_pose=True
     )
     
     contact_forces_r_link_16 = ContactSensorCfg(
@@ -232,7 +235,8 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        track_pose=True
     )
     
     contact_forces_r_link_20 = ContactSensorCfg(
@@ -240,7 +244,8 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        track_pose=True
     )
     
     contact_forces_r_base = ContactSensorCfg(
@@ -248,7 +253,8 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         debug_vis=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"]
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        track_pose=True
     )
     
     
@@ -279,42 +285,42 @@ class ActionsCfg:
     """Action specifications."""
     
     # Actions for controlling the joints of the robot
-    lift_action = mdp.JointPositionActionCfg(
-        asset_name="robot",
-        joint_names=["lift_joint"],
-        scale=0.5,
-    )
-    arm_r_action = mdp.JointPositionActionCfg(
-        asset_name="robot",
-        joint_names=["arm_r_joint[1-7]"],
-        scale=0.5,
-    )
-    hand_r_action = mdp.JointPositionActionCfg(
-        asset_name="robot",
-        joint_names=["finger_r_joint.*"],
-        scale=0.5,
-    )
-    # lift_action = mdp.JointPositionLowPassActionCfg(
+    # lift_action = mdp.JointPositionActionCfg(
     #     asset_name="robot",
     #     joint_names=["lift_joint"],
     #     scale=0.5,
-    #     f_c=5.0,  # Cut-off frequency for low-pass filter (Hz)
-    #     f_s=120.0  # Sampling frequency (Hz)
     # )
-    # arm_r_action = mdp.JointPositionLowPassActionCfg(
+    # arm_r_action = mdp.JointPositionActionCfg(
     #     asset_name="robot",
     #     joint_names=["arm_r_joint[1-7]"],
     #     scale=0.5,
-    #     f_c=5.0,  # Cut-off frequency for low-pass filter (Hz)
-    #     f_s=120.0, # Sampling frequency (Hz)
     # )
-    # hand_r_action = mdp.JointPositionLowPassActionCfg(
+    # hand_r_action = mdp.JointPositionActionCfg(
     #     asset_name="robot",
     #     joint_names=["finger_r_joint.*"],
     #     scale=0.5,
-    #     f_c=5.0,  # Cut-off frequency for low-pass filter (Hz)
-    #     f_s=120.0, # Sampling frequency (Hz)
     # )
+    lift_action = mdp.JointPositionLowPassActionCfg(
+        asset_name="robot",
+        joint_names=["lift_joint"],
+        scale=0.5,
+        f_c=10.0,  # Cut-off frequency for low-pass filter (Hz)
+        f_s=60.0  # Sampling frequency (Hz)
+    )
+    arm_r_action = mdp.JointPositionLowPassActionCfg(
+        asset_name="robot",
+        joint_names=["arm_r_joint[1-7]"],
+        scale=0.5,
+        f_c=10.0,  # Cut-off frequency for low-pass filter (Hz)
+        f_s=60.0, # Sampling frequency (Hz)
+    )
+    hand_r_action = mdp.JointPositionLowPassActionCfg(
+        asset_name="robot",
+        joint_names=["finger_r_joint.*"],
+        scale=0.5,
+        f_c=15.0,  # Cut-off frequency for low-pass filter (Hz)
+        f_s=60.0, # Sampling frequency (Hz)
+    )
 
 
 @configclass
@@ -420,6 +426,15 @@ class EventCfg:
         },
     )
     
+    # variable_gravity = EventTermCfg(
+    #     func=mdp.randomize_physics_scene_gravity,
+    #     mode="reset",
+    #     params={
+    #         "gravity_distribution_params": ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+    #         "operation": "abs",
+    #     },
+    # )
+    
     # reset_object = EventTermCfg(
     #     func=mdp.reset_root_state_uniform,
     #     mode="reset",
@@ -480,8 +495,8 @@ class RewardsCfg:
     )
     
     contact_forces = RewardTermCfg(
-        func=mdp.grasp_contact_reward,
-        weight=-0.25,
+        func=mdp.contact_forces_reward,
+        weight=0.5,
         params={
             "sensor_names": [
                 "contact_forces_r_link_4",
@@ -489,9 +504,9 @@ class RewardsCfg:
                 "contact_forces_r_link_12",
                 "contact_forces_r_link_16",
                 "contact_forces_r_link_20",
-                "contact_forces_r_base"
+                # "contact_forces_r_base"
             ],
-            "threshold": 5.0,  # Contact force threshold for penalty (in Newtons)
+            "threshold": 1.0,  # Contact force threshold for penalty (in Newtons)
         }
     )
 
@@ -524,7 +539,7 @@ class RewardsCfg:
             "object_name": "object",
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
-            "weight_m": 2.0,   # 거리 페널티 wm
+            "weight_m": 3.0,   # 거리 페널티 wm
             "weight_b": 10.0,  # 보너스 가중치 wb
             "thresholds": MISSING
         },
@@ -548,6 +563,8 @@ class RewardsCfg:
     #     weight=-2.5e-6,
     #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
     # )
+    
+    # early_termination = RewardTermCfg(func=mdp.is_terminated_term, weight=-1, params={"term_keys": "abnormal_robot"})
 
 @configclass
 class TerminationsCfg:
@@ -555,14 +572,24 @@ class TerminationsCfg:
     
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
     
-    object_dropping = TerminationTermCfg(
-        func=mdp.root_height_below_minimum, params={"minimum_height": 0.95, "asset_cfg": SceneEntityCfg("object")}
+    # object_dropping = TerminationTermCfg(
+    #     func=mdp.root_height_below_minimum, params={"minimum_height": 0.95, "asset_cfg": SceneEntityCfg("object")}
+    # )
+    
+    object_out_of_bound = TerminationTermCfg(
+        func=mdp.out_of_bound,
+        params={
+            "in_bound_range": {"x": 1.0, "y": 0.5, "z": 1.0},
+            "asset_cfg": SceneEntityCfg("object"),
+        },
     )
 
     success = TerminationTermCfg(func=mdp.task_done_pick_place, params={
         "command_name": "hand_pose_r",
         "threshold": 0.05
     })
+    
+    # abnormal_robot = TerminationTermCfg(func=mdp.abnormal_robot_state)
     
 @configclass
 class CurriculumCfg:

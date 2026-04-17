@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.assets import RigidObject
+from isaaclab.assets import RigidObject, Articulation
 from isaaclab.managers import SceneEntityCfg
 
 from .utils import get_virtual_link_poses
@@ -28,6 +28,35 @@ def root_height_below_minimum(
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     return asset.data.root_pos_w[:, 2] < minimum_height
+
+def out_of_bound(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    in_bound_range: dict[str, float] = {"x": 0.2, "y": 0.2, "z": 0.5}, # 예: 초기 위치서 20cm 이상 벗어나면 탈락
+) -> torch.Tensor:
+    # 객체 가져오기
+    object: RigidObject = env.scene[asset_cfg.name]
+    
+    # 1. 현재 로컬 위치 계산
+    object_pos_local = object.data.root_pos_w - env.scene.env_origins
+    
+    # 2. 저장해둔 초기 위치 가져오기 (없을 경우를 대비해 예외 처리)
+    if hasattr(env, "object_initial_pos_b"):
+        initial_pos = env.object_initial_pos_b
+    else:
+        # 아직 리셋이 한 번도 안 일어났다면 현재 위치를 기준으로 함
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    # 3. 초기 위치와의 차이 계산
+    diff = torch.abs(object_pos_local - initial_pos)
+    
+    # 4. 설정된 범위를 벗어났는지 확인
+    # 각 축별로 설정된 threshold를 넘어가면 True
+    out_x = diff[:, 0] > in_bound_range.get("x", 1.0)
+    out_y = diff[:, 1] > in_bound_range.get("y", 1.0)
+    out_z = diff[:, 2] > in_bound_range.get("z", 1.0)
+
+    return out_x | out_y | out_z
 
 def task_done_pick_place(
     env: ManagerBasedRLEnv, 
@@ -52,3 +81,9 @@ def task_done_pick_place(
     is_success = d_obj < threshold
 
     return is_success
+
+def abnormal_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Terminating environment when violation of velocity limits detects, this usually indicates unstable physics caused
+    by very bad, or aggressive action"""
+    robot: Articulation = env.scene[asset_cfg.name]
+    return (robot.data.joint_vel.abs() > (robot.data.joint_vel_limits * 2)).any(dim=1)

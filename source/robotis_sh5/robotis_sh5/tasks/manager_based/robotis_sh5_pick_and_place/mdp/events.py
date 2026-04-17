@@ -62,6 +62,11 @@ def reset_object_to_tray_pose(
     # 4. Root State 구성 (정지 상태 vel=0)
     vel = torch.zeros((num_resets, 6), device=env.device)
     root_state = torch.cat([target_pos_w, target_quat_w, vel], dim=-1)
+    
+    if not hasattr(env, "object_initial_pos_b"):
+        # env에 변수가 없으면 초기화 (전체 환경 개수만큼)
+        env.object_initial_pos_b = torch.zeros((env.num_envs, 3), device=env.device)
+    env.object_initial_pos_b[env_ids] = target_pos_w - env_origins
 
     # 5. 시뮬레이션에 적용
     asset = env.scene[asset_cfg.name]
