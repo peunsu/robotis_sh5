@@ -333,7 +333,7 @@ class ActionsCfg:
         asset_name="robot",
         joint_names=["finger_r_joint.*"],
         scale=0.5,
-        f_c=15.0,  # Cut-off frequency for low-pass filter (Hz)
+        f_c=10.0,  # Cut-off frequency for low-pass filter (Hz)
         f_s=20.0, # Sampling frequency (Hz)
     )
 
@@ -501,7 +501,7 @@ class RewardsCfg:
     # 수식 (7): 각 손가락이 물체에 가까워지도록 유도
     fingertip_reaching = RewardTermCfg(
         func=mdp.reaching_reward,
-        weight=-0.50, # wr 가중치
+        weight=-0.5, # wr 가중치
         params={
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
@@ -580,6 +580,7 @@ class RewardsCfg:
     #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["finger_r_joint.*"])}
     # )
     
+    alive = RewardTermCfg(func=mdp.is_alive, weight=1.00)
     # early_termination = RewardTermCfg(func=mdp.is_terminated_term, weight=-1, params={"term_keys": "abnormal_robot"})
 
 @configclass
