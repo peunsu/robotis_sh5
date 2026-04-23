@@ -718,8 +718,8 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 6
         self.episode_length_s = 4.0
         
-        self.viewer.eye = (3.5, -3.5, 3.5)
-        #self.viewer.lookat = (0.0, 0.0, 0.0)
+        self.viewer.eye = (3.0, -2.5, 2.0)
+        self.viewer.lookat = (1.0, 0.0, 0.0)
         
         self.sim.dt = 1.0 / 120.0 # 1.0 / 60.0
         self.sim.render_interval = 2 #self.decimation

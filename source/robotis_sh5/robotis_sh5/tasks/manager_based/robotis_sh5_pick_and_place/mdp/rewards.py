@@ -151,7 +151,7 @@ def lifting_reward_fullbody(
     # 2. 손목 가속도(a_z) 계산
     # a_z = get_wrist_acc(env, wrist_joint_name)
     a_z = get_object_acc(env, object_name)[:, 2]  # 오브젝트의 수직 가속도 사용 (lifting 성공 여부에 더 직접적일 수 있음)
-    a_z = torch.clip(a_z, min=0.0)  # 음수는 보상으로 계산하지 않음 (올라가는 가속도만 보상)
+    a_z = torch.clip(a_z, min=-1.0)  # 음수 가속도는 패널티로 계산 (떨어지는 경우), 양수 가속도는 보상으로 계산 (들어올리는 경우)
     
     # 3. f == 3 (모든 조건 만족)일 때만 보상 지급
     reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, (1.0 + a_z), torch.zeros_like(a_z))
