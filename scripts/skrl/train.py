@@ -248,7 +248,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         except Exception as e:
             print(f"Error while logging success rate: {e}")
         
-        agent._original_post_interaction(timestep, timesteps)
+        agent._original_post_interaction(timestep=timestep, timesteps=timesteps)
     
     # monkey-patch the agent's post_interaction function to log success rate at each step
     agent._original_post_interaction = agent.post_interaction

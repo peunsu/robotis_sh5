@@ -125,6 +125,31 @@ def body_pose_relative_to_env(
     
     return relative_poses.view(env.num_envs, -1)
 
+def body_position_relative_to_env(
+    env: ManagerBasedRLEnv, 
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """각 환경의 origin을 기준으로 한 body의 pos를 반환해."""
+    
+    # 1. 자산(robot 등) 추출
+    asset = env.scene[asset_cfg.name]
+    
+    # 2. 월드 기준 포즈 데이터 가져오기 (num_envs, num_bodies, 3/4)
+    # body_ids가 지정되어 있으면 해당되는 바디들만 가져옴
+    body_pos_w = asset.data.body_state_w[:, asset_cfg.body_ids, :3]
+    
+    # 3. 각 환경의 Origin 가져오기 (num_envs, 3)
+    env_origins = env.scene.env_origins # 각 환경의 (x, y, z) 원점
+    
+    # 각 환경 원점을 body 개수만큼 확장 (num_envs, 1, 3) -> (num_envs, num_bodies, 3)
+    num_bodies = body_pos_w.shape[1]
+    env_origins_expanded = env_origins.unsqueeze(1).expand(-1, num_bodies, -1)
+    
+    # 상대 위치 계산
+    relative_pos = body_pos_w - env_origins_expanded
+    
+    return relative_pos.view(env.num_envs, -1)
+
 def contact_forces(env, sensor_names: list):
     """필터링된 대상과의 접촉력 행렬(force_matrix_w)을 사용하여 크기를 계산해."""
     

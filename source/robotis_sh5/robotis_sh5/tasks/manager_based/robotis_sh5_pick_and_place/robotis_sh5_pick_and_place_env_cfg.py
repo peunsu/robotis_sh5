@@ -55,6 +55,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             usd_path="/home/peunsu/workspace/robotis_sh5/retargeting/DexYCB/models/006_mustard_bottle/textured.usd",
             scale=(1.0, 1.0, 1.0),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.1, 1.1), rot=(0.0, 0.0, 0.0, 1.0))
     )
@@ -206,7 +207,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     contact_forces_r_link_4 = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/finger_r_link4",
         update_period=0.0,
-        history_length=1,
+        history_length=6,
         debug_vis=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
         track_pose=True
@@ -215,7 +216,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     contact_forces_r_link_8 = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/finger_r_link8",
         update_period=0.0,
-        history_length=1,
+        history_length=6,
         debug_vis=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
         track_pose=True
@@ -224,7 +225,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     contact_forces_r_link_12 = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/finger_r_link12",
         update_period=0.0,
-        history_length=1,
+        history_length=6,
         debug_vis=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
         track_pose=True
@@ -233,7 +234,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     contact_forces_r_link_16 = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/finger_r_link16",
         update_period=0.0,
-        history_length=1,
+        history_length=6,
         debug_vis=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
         track_pose=True
@@ -242,7 +243,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     contact_forces_r_link_20 = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/finger_r_link20",
         update_period=0.0,
-        history_length=1,
+        history_length=6,
         debug_vis=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
         track_pose=True
@@ -251,12 +252,26 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
     contact_forces_r_base = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/hx5_d20_right_base",
         update_period=0.0,
-        history_length=1,
+        history_length=6,
         debug_vis=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
         track_pose=True
     )
     
+    # contact_forces_object = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Object",
+    #     update_period=0.0,
+    #     history_length=6,
+    #     debug_vis=True,
+    #     filter_prim_paths_expr=[
+    #         "{ENV_REGEX_NS}/Robot/finger_r_link4",
+    #         "{ENV_REGEX_NS}/Robot/finger_r_link8",
+    #         "{ENV_REGEX_NS}/Robot/finger_r_link12",
+    #         "{ENV_REGEX_NS}/Robot/finger_r_link16",
+    #         "{ENV_REGEX_NS}/Robot/finger_r_link20",
+    #         "{ENV_REGEX_NS}/Robot/hx5_d20_right_base"
+    #     ],
+    # )
     
     # Light
     dome_light = AssetBaseCfg(
@@ -305,21 +320,21 @@ class ActionsCfg:
         joint_names=["lift_joint"],
         scale=0.5,
         f_c=10.0,  # Cut-off frequency for low-pass filter (Hz)
-        f_s=60.0  # Sampling frequency (Hz)
+        f_s=20.0  # Sampling frequency (Hz)
     )
     arm_r_action = mdp.JointPositionLowPassActionCfg(
         asset_name="robot",
         joint_names=["arm_r_joint[1-7]"],
         scale=0.5,
         f_c=10.0,  # Cut-off frequency for low-pass filter (Hz)
-        f_s=60.0, # Sampling frequency (Hz)
+        f_s=20.0, # Sampling frequency (Hz)
     )
     hand_r_action = mdp.JointPositionLowPassActionCfg(
         asset_name="robot",
         joint_names=["finger_r_joint.*"],
         scale=0.5,
         f_c=15.0,  # Cut-off frequency for low-pass filter (Hz)
-        f_s=60.0, # Sampling frequency (Hz)
+        f_s=20.0, # Sampling frequency (Hz)
     )
 
 
@@ -348,7 +363,7 @@ class ObservationsCfg:
         )
         
         right_hand_pose = ObservationTermCfg(
-            func=mdp.body_pose_relative_to_env,
+            func=mdp.body_position_relative_to_env,
             params={"asset_cfg": SceneEntityCfg("robot", body_names=["finger_r_link.*"])}
         )
         right_eef_pose = ObservationTermCfg(
@@ -496,7 +511,7 @@ class RewardsCfg:
     
     contact_forces = RewardTermCfg(
         func=mdp.contact_forces_reward,
-        weight=0.5,
+        weight=1.0,
         params={
             "sensor_names": [
                 "contact_forces_r_link_4",
@@ -506,7 +521,7 @@ class RewardsCfg:
                 "contact_forces_r_link_20",
                 # "contact_forces_r_base"
             ],
-            "threshold": 1.0,  # Contact force threshold for penalty (in Newtons)
+            "threshold": 1.0,
         }
     )
 
@@ -522,6 +537,7 @@ class RewardsCfg:
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot"),
             "object_name": "object",
+            "sensor_name": "contact_forces_object",
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
             "wrist_joint_name": MISSING,
@@ -699,14 +715,14 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.friction_correlation_distance = 0.00625
         self.sim.physx.gpu_max_rigid_patch_count = 4096 * 4096
         
-        self.decimation = 2
+        self.decimation = 6
         self.episode_length_s = 4.0
         
-        self.viewer.eye = (3.5, 3.5, 3.5)
+        self.viewer.eye = (3.5, -3.5, 3.5)
         #self.viewer.lookat = (0.0, 0.0, 0.0)
         
-        self.sim.dt = 1.0 / 60.0 # 1.0 / 60.0
-        self.sim.render_interval = self.decimation
+        self.sim.dt = 1.0 / 120.0 # 1.0 / 60.0
+        self.sim.render_interval = 2 #self.decimation
         
         table_height = 1.0
         target_lift_height = 0.3

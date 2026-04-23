@@ -242,7 +242,6 @@ class TrajectoryGenerator:
             "qpos": np.array(trajectory),
             "root_pos": np.array(root_positions),
             "root_quat": np.array(root_quaternions),
-            # 선택된 물체 데이터만 저장
             "obj_pos": np.array(multi_obj_pos[target_obj_idx]),
             "obj_quat": np.array(multi_obj_quat[target_obj_idx]),
             "target_object_name": selected_obj_name,

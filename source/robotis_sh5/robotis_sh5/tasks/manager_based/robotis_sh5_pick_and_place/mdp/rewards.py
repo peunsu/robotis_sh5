@@ -136,6 +136,7 @@ def lifting_reward_fullbody(
     command_name: str, 
     asset_cfg: SceneEntityCfg,
     object_name: str,
+    sensor_name: str,
     fingertip_names: list,
     wrist_link_name: str,
     wrist_joint_name: str,
@@ -144,12 +145,17 @@ def lifting_reward_fullbody(
     # 1. 플래그 유틸리티 호출
     flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
     
+    # f_z = -torch.sum(torch.mean(env.scene[sensor_name].data.force_matrix_w_history[:, :, 0, :, 2], dim=1), dim=-1)  # Z축 방향 힘
+    # f_z = torch.clip(f_z, min=0.0)  # 음수는 보상으로 계산하지 않음 (들어올리는 힘만 보상)
+    
     # 2. 손목 가속도(a_z) 계산
     # a_z = get_wrist_acc(env, wrist_joint_name)
     a_z = get_object_acc(env, object_name)[:, 2]  # 오브젝트의 수직 가속도 사용 (lifting 성공 여부에 더 직접적일 수 있음)
-
+    a_z = torch.clip(a_z, min=0.0)  # 음수는 보상으로 계산하지 않음 (올라가는 가속도만 보상)
+    
     # 3. f == 3 (모든 조건 만족)일 때만 보상 지급
-    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.1 * (1.0 + a_z), torch.zeros_like(a_z))
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, (1.0 + a_z), torch.zeros_like(a_z))
+    # reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, 0.1 * (1.0 + f_z), torch.zeros_like(f_z))
     # reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, 0.2, reward)
     
     return reward
@@ -200,76 +206,27 @@ def grasp_contact_reward(env, sensor_names: list, threshold: float = 1.0) -> tor
         
     return total_reward # 손가락마다 접촉이 안 된 경우 -1, 모두 접촉한 경우 0 보상
 
-def contact_forces_reward(env: ManagerBasedRLEnv, sensor_names: list, threshold: float = 1.0) -> torch.Tensor:
-    num_envs = env.num_envs
+def contact_forces_reward(env: ManagerBasedRLEnv, sensor_names: list, threshold: float = 1.0) -> torch.Tensor:      
     num_sensors = len(sensor_names)
+    forces = torch.zeros((env.num_envs, num_sensors), device=env.device)
+    contacted_flags = {}
     
-    # 물체 위치 가져오기 (num_envs, 3)
-    object_pos = env.scene["object"].data.root_pos_w
-    
-    total_normal_reward = torch.zeros(num_envs, device=env.device)
-    contact_count = torch.zeros(num_envs, device=env.device)
-
     for i, name in enumerate(sensor_names):
         sensor: ContactSensor = env.scene[name]
         
-        # 1. 접촉 힘 벡터 (num_envs, 3) - 필터링된 net force
-        # sensor.data.force_matrix_w: (num_envs, 1, num_filters, 3) -> sum(dim=2) -> (num_envs, 1, 3)
-        net_force_w = torch.sum(sensor.data.force_matrix_w, dim=2)[:, 0, :]
+        # 원래 텐서 (num_envs, time_history, num_bodies, num_filters, 3)
+        # 필터링된 힘 합산 (num_envs, num_bodies, 3)
+        filtered_net_forces = torch.mean(torch.sum(sensor.data.force_matrix_w_history, dim=3), dim=1)
         
-        # 2. 센서 위치 (num_envs, 3)
-        sensor_pos_w = sensor.data.pos_w[:, 0, :]
+        # 각 바디별 힘의 크기 계산 (L2 Norm)
+        force_mag = torch.norm(filtered_net_forces[:, 0, :], dim=-1)
         
-        # 3. 물체 중심 -> 센서로 향하는 방향 벡터 (Normal Vector)
-        # 이 벡터의 반대 방향으로 힘을 줘야 물체를 조이는 힘이 됨
-        dir_to_sensor = sensor_pos_w - object_pos
-        dir_to_sensor = torch.nn.functional.normalize(dir_to_sensor, dim=-1)
-        
-        # 4. 내적 계산: (힘 벡터) ⋅ (중심->센서 벡터)
-        # 값이 음수일수록 물체 안쪽을 향하는 '조이는 힘'임
-        dot_product = torch.sum(net_force_w * dir_to_sensor, dim=-1)
-        
-        # 5. 보상 계산: 안쪽으로 향하는 힘(negative dot)만 양수 보상으로 변환
-        # threshold 이상의 힘이 가해질 때만 계산
-        force_mag = torch.norm(net_force_w, dim=-1)
-        is_contacted = (force_mag > threshold)
-        
-        # 조이는 방향의 힘만 보상 (안쪽으로 밀 때 dot은 음수이므로 -를 붙임)
-        normal_force_reward = torch.clamp(-dot_product, min=0.0)
-        
-        total_normal_reward += normal_force_reward * is_contacted.float()
-        contact_count += is_contacted.float()
+        forces[:, i] = force_mag
+        contacted_flags[name] = (force_mag > threshold)
 
-    # 6. 제안한 'good_contact' 조건 추가 (엄지 + 나머지 중 하나 이상)
-    # sensor_names[0]이 엄지(link4)라고 가정
-    thumb_contact = (torch.norm(torch.sum(env.scene[sensor_names[0]].data.force_matrix_w, dim=2)[:, 0, :], dim=-1) > threshold)
-    others_contact = (contact_count > 1.0) # 엄지 포함 2개 이상 접촉
-    
-    valid_grasp = thumb_contact & others_contact
-    
-    # 최종 보상: 조이는 힘의 합 * 유효한 파지 조건
-    return total_normal_reward * valid_grasp.float()
+    good_contact = contacted_flags[sensor_names[0]] & (
+        contacted_flags[sensor_names[1]] | contacted_flags[sensor_names[2]]
+        | contacted_flags[sensor_names[3]] | contacted_flags[sensor_names[4]]
+    )
 
-# def contact_forces_reward(env: ManagerBasedRLEnv, sensor_names: list, threshold: float = 1.0) -> torch.Tensor:      
-#     num_sensors = len(sensor_names)
-#     forces = torch.zeros((env.num_envs, num_sensors), device=env.device)
-#     contacted_flags = {}
-    
-#     for i, name in enumerate(sensor_names):
-#         sensor: ContactSensor = env.scene[name]
-        
-#         # 필터링된 힘 합산 (num_envs, num_bodies, 3)
-#         filtered_net_forces = torch.sum(sensor.data.force_matrix_w, dim=2)
-        
-#         # 각 바디별 힘의 크기 계산 (L2 Norm)
-#         force_mag = torch.norm(filtered_net_forces[:, 0, :], dim=-1)
-        
-#         forces[:, i] = force_mag
-#         contacted_flags[name] = (force_mag > threshold)
-
-#     good_contact = contacted_flags[sensor_names[0]] & (
-#         contacted_flags[sensor_names[1]] | contacted_flags[sensor_names[2]]
-#         | contacted_flags[sensor_names[3]] | contacted_flags[sensor_names[4]]
-#     )
-
-#     return good_contact
+    return good_contact
