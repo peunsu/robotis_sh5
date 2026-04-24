@@ -64,6 +64,66 @@ def get_virtual_link_poses(env: ManagerBasedRLEnv, fingertip_names: list, palm_n
 
 _TRAJECTORY_CACHE = {}
 
+# def get_trajectory_data(env: ManagerBasedRLEnv, file_path: str, frame_idx: int = 0, obj_idx: int = 0):
+#     """
+#     npy 파일에서 특정 프레임의 데이터를 추출하여 
+#     오브젝트 포즈, 오브젝트 기준 핸드 포즈, 관절 각도, 관절 이름을 반환합니다.
+#     """
+#     global _TRAJECTORY_CACHE
+    
+#     if file_path not in _TRAJECTORY_CACHE:
+#         if not os.path.exists(file_path):
+#             raise FileNotFoundError(f"Trajectory file not found: {file_path}")
+        
+#         # 데이터를 로드해서 캐시에 저장 (메모리에 유지)
+#         _TRAJECTORY_CACHE[file_path] = np.load(file_path, allow_pickle=True).item()
+#         # print(f"[Cache] Loaded and cached: {file_path}") # 디버깅용
+    
+#     # 1. 데이터 로드
+#     data = _TRAJECTORY_CACHE[file_path]
+#     frame_idx = data["motion_start_frame"] if frame_idx == 0 else frame_idx # 기본값 0이면 motion_start_frame 사용
+    
+#     # --- World Frame 데이터 추출 ---
+#     # obj_pos_w = torch.tensor(data["obj_poses"][obj_idx][frame_idx], device=env.device, dtype=torch.float32)
+#     # obj_quat_w = torch.tensor(data["obj_quats"][obj_idx][frame_idx], device=env.device, dtype=torch.float32)
+#     obj_pos_w = torch.tensor(data["obj_pos"][frame_idx], device=env.device, dtype=torch.float32)
+#     obj_quat_w = torch.tensor(data["obj_quat"][frame_idx], device=env.device, dtype=torch.float32)
+    
+#     hand_pos_w = torch.tensor(data["root_pos"][frame_idx], device=env.device, dtype=torch.float32)
+#     hand_quat_w = torch.tensor(data["root_quat"][frame_idx], device=env.device, dtype=torch.float32)
+
+#     # 2. Object Frame 기준의 Hand Pose 계산 (Relative Pose)
+#     obj_quat_inv = quat_inv(obj_quat_w)
+    
+#     # 상대 위치: R_inv * (hand_pos_w - obj_pos_w)
+#     relative_hand_pos = quat_apply(obj_quat_inv, (hand_pos_w - obj_pos_w).view(1, 3)).squeeze(0)
+    
+#     # 상대 회전: obj_quat_inv * hand_quat_w
+#     relative_hand_quat = quat_mul(obj_quat_inv, hand_quat_w)
+
+#     # World Frame 기준 관절 위치 Shape: (21, 3)
+#     kpos_w = torch.tensor(data["kpos"][frame_idx], device=env.device, dtype=torch.float32)
+#     relative_kpos = quat_apply(obj_quat_inv, (kpos_w - obj_pos_w).view(1, -1, 3)).squeeze(0)  # (21, 3)
+
+#     link_names = [
+#         None,
+#         None, "finger_r_link2", "finger_r_link3", "finger_r_link4",
+#         None, "finger_r_link6", "finger_r_link7", "finger_r_link8",
+#         None, "finger_r_link10", "finger_r_link11", "finger_r_link12",
+#         None, "finger_r_link14", "finger_r_link15", "finger_r_link16",
+#         None, "finger_r_link18", "finger_r_link19", "finger_r_link20",
+#     ]
+
+#     # 결과 반환
+#     return {
+#         "obj_pos": obj_pos_w,               # World 기준 오브젝트 위치
+#         "obj_quat": obj_quat_w,             # World 기준 오브젝트 회전
+#         "root_pos": relative_hand_pos,      # 오브젝트 기준 핸드(Root) 상대 위치
+#         "root_quat": relative_hand_quat,    # 오브젝트 기준 핸드(Root) 상대 회전
+#         "link_names": link_names,           # 링크 이름 리스트
+#         "kpos": relative_kpos      # 오브젝트 기준 관절 상대 위치
+#     }
+
 def get_trajectory_data(env: ManagerBasedRLEnv, file_path: str, frame_idx: int = 0, obj_idx: int = 0):
     """
     npy 파일에서 특정 프레임의 데이터를 추출하여 

@@ -181,7 +181,7 @@ class RobotisSh5PickAndPlaceSceneCfg(InteractiveSceneCfg):
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
                 velocity_limit_sim=2.2,
-                effort_limit_sim=15.0,  # 20.0
+                effort_limit_sim=15.0,  # 15.0
                 stiffness=1.0,  # 20.0
                 damping=0.2,  # 0.5
             ),
@@ -400,6 +400,18 @@ class ObservationsCfg:
 
         # The last input action
         actions = ObservationTermCfg(func=mdp.last_action)
+
+        phase = ObservationTermCfg(
+            func=mdp.phase_obs,
+            params={
+                "command_name": "hand_pose_r",
+                "asset_cfg": SceneEntityCfg("robot"),
+                "object_name": "object",
+                "fingertip_names": MISSING,
+                "wrist_link_name": MISSING,
+                "thresholds": MISSING
+            }
+        )
         
         # marker_debugger = ObservationTermCfg(
         #     func=mdp.visual_marker_obs,
@@ -513,6 +525,9 @@ class RewardsCfg:
         func=mdp.contact_forces_reward,
         weight=1.0,
         params={
+            "command_name": "hand_pose_r",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "wrist_link_name": MISSING,
             "sensor_names": [
                 "contact_forces_r_link_4",
                 "contact_forces_r_link_8",
@@ -521,7 +536,7 @@ class RewardsCfg:
                 "contact_forces_r_link_20",
                 # "contact_forces_r_base"
             ],
-            "threshold": 1.0,
+            "threshold": 1.0 # 접촉으로 간주할 힘의 범위
         }
     )
 
@@ -755,6 +770,10 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         
         self.commands.hand_pose_r.file_path = file_path
         self.events.reset_object_from_data.params["file_path"] = file_path
+
+        self.observations.policy.phase.params["fingertip_names"] = fingertip_links_r
+        self.observations.policy.phase.params["wrist_link_name"] = ee_link_r
+        self.observations.policy.phase.params["thresholds"] = thresholds
         
         # self.rewards.dist_reward.params["fingertip_names"] = fingertip_links_r
         # self.rewards.dist_reward.params["wrist_link_name"] = wrist_link_r
@@ -783,6 +802,8 @@ class RobotisSh5PickAndPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.rewards.object_moving.params["fingertip_names"] = fingertip_links_r
         self.rewards.object_moving.params["wrist_link_name"] = ee_link_r
         self.rewards.object_moving.params["thresholds"] = thresholds
+
+        self.rewards.contact_forces.params["wrist_link_name"] = ee_link_r
         
         self.events.reset_object_from_data.params["table_height"] = table_height
         

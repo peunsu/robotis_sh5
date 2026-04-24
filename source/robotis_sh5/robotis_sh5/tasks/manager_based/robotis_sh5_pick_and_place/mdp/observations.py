@@ -14,7 +14,7 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
-from .utils import get_virtual_link_poses
+from .utils import get_virtual_link_poses, compute_hand_pos_error, compute_hand_rot_error, compute_finger_qpos_error, get_grasping_flags
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -180,3 +180,40 @@ def contact_forces(env, sensor_names: list):
     
     # 6. 최종 접촉력 관측값 반환
     return combined_forces
+
+def phase_obs(
+    env,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    object_name: str,
+    fingertip_names: list,
+    wrist_link_name: str,
+    thresholds: dict = {"lambda_fingertip": 0.60, "lambda_palm": 0.12, "lambda_d_obj": 0.05}
+) -> torch.Tensor:
+    command = env.command_manager.get_command(command_name)
+    command_term = env.command_manager.get_term(command_name)
+
+    flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
+    target_flag = sum([
+        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
+        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
+        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
+    ])
+
+    # 2. 결과 텐서 초기화 (기본 Phase 0)
+    # shape: (num_envs, 1)
+    phases = torch.zeros(env.num_envs, 1, device=env.device, dtype=torch.float32)
+
+    # 3. 조건별 마스킹 연산 (Vectorized Operation)
+    # Phase 1 조건: Fingertips are close (is_f1 + is_f2 == 2)
+    is_phase1 = (flags["is_f1"].int() + flags["is_f2"].int() == 2)
+    
+    # Phase 2 조건: Phase 1 조건 만족 + Target pose correct (target_flag_sum == 3)
+    # (원래 코드의 2+3=5 로직을 유지)
+    is_phase2 = is_phase1 & (target_flag == 3)
+
+    # 4. 단계별로 값 할당 (높은 단계부터 덮어쓰거나 torch.where 사용)
+    phases[is_phase1] = 1.0
+    phases[is_phase2] = 2.0
+
+    return phases

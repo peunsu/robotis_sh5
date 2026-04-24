@@ -31,21 +31,6 @@ def joint_angle_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: Scen
     
     finger_qpos_error = compute_finger_qpos_error(env, command, command_term)
     return finger_qpos_error
-    
-    # 1. command에서 손가락 부분만 추출 (중간에 딱 손가락 개수만큼 있음)
-    # 7번 인덱스부터 (7 + 손가락 개수)까지
-    num_fingers = len(command_term.robot_finger_indices)
-    target_finger_qpos = command[:, 7:7+num_fingers]
-    
-    # 2. 로봇에서도 미리 찾아둔 손가락 인덱스만 슬라이싱
-    current_finger_qpos = robot.data.joint_pos[:, command_term.robot_finger_indices]
-    
-    # print(f"Env 0 Joint 1 desired position: {target_finger_qpos[0, 0]}")
-    # print(f"Env 0 Joint 1 position: {robot.data.joint_pos[0, command_term.robot_finger_indices[0]]}")
-    # print(f"Joint angle error: {torch.sum(torch.abs(current_finger_qpos - target_finger_qpos), dim=-1)}")
-    
-    # 3. 오차 계산 (훨씬 가벼움!)
-    return torch.sum(torch.abs(current_finger_qpos - target_finger_qpos), dim=-1)
 
 def root_translation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """수식 두 번째 항: ||th_obj - th_g||2"""
@@ -54,26 +39,6 @@ def root_translation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg:
     
     hand_pos_error = compute_hand_pos_error(env, command, asset_cfg, asset_cfg.body_names[0])
     return hand_pos_error
-    
-    # 1. 커맨드에 저장된 목표 위치 (Base 기준 상대 좌표)
-    # DexYCBCommandTerm의 pose_command_b 부분이 0:3에 해당함
-    target_pos_b = command[:, :3]
-    
-    # 2. 현재 End-effector의 Base 기준 상대 위치 계산
-    # EE_pos_w - Robot_root_pos_w 를 하면 베이스 기준 상대 위치가 나옴
-    # (더 정확하게는 subtract_frame_transforms를 써야 하지만, 
-    #  단순 거리 비교라면 베이스 기준 좌표계 변환만으로도 충분해)
-    ee_pos_w = robot.data.body_state_w[:, asset_cfg.body_ids[0], :3]
-    root_pos_w = robot.data.root_pos_w
-    root_quat_w = robot.data.root_quat_w
-    
-    # 월드 EE 좌표를 로봇 베이스 좌표계로 변환
-    curr_pos_b, _ = subtract_frame_transforms(
-        root_pos_w, root_quat_w, ee_pos_w, robot.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]
-    )
-    
-    # 3. 목표 상대 위치와 현재 상대 위치 사이의 L2 Norm
-    return torch.norm(curr_pos_b - target_pos_b, dim=-1)
 
 def root_rotation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """수식 세 번째 항: L_rot (Geodesic distance)"""
@@ -82,22 +47,6 @@ def root_rotation_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: Sc
     
     hand_rot_error = compute_hand_rot_error(env, command, asset_cfg, asset_cfg.body_names[0])
     return hand_rot_error
-    
-    # 1. 목표 회전 (쿼터니언, 인덱스 3:7)
-    target_quat_b = command[:, 3:7]
-    
-    # 2. 현재 End-effector의 Base 기준 상대 회전 계산
-    ee_quat_w = robot.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]
-    root_quat_w = robot.data.root_quat_w
-    
-    # 베이스 기준 현재 EE 회전 (q_rel = q_root_inv * q_ee)
-    _, curr_quat_b = subtract_frame_transforms(
-        robot.data.root_pos_w, root_quat_w, 
-        robot.data.body_state_w[:, asset_cfg.body_ids[0], :3], ee_quat_w
-    )
-    
-    # 3. 두 쿼터니언 사이의 각도 차이 (라디안) 계산
-    return quat_error_magnitude(curr_quat_b, target_quat_b)
 
 def reaching_reward(
     env: ManagerBasedRLEnv, 
@@ -186,7 +135,7 @@ def moving_reward(
 
     # 2. 기본 거리 페널티
     # reward = weight_m * (0.3 - d_obj)  # 부호가 잘못되어 있었음
-    # reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, 0.9 - weight_m * d_obj, torch.zeros_like(d_obj))
+    # reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, torch.clip(weight_m * (0.3 - d_obj), min=0.0), torch.zeros_like(d_obj))
     reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, torch.clip(weight_m * (0.3 - d_obj), min=0.0), torch.zeros_like(d_obj))
 
     # 3. 보너스 조건 (d_obj < lambda_d_obj)
@@ -195,18 +144,17 @@ def moving_reward(
 
     return reward
 
-def grasp_contact_reward(env, sensor_names: list, threshold: float = 1.0) -> torch.Tensor:
-    total_reward = torch.zeros(env.num_envs, device=env.device)
-    
-    for name in sensor_names:
-        sensor: ContactSensor = env.scene[name]
-        # 각 센서가 임계값 이상의 힘을 감지하지 못한 경우 패널티 -1, 감지한 경우 0 보상
-        not_contacted = (torch.norm(sensor.data.net_forces_w[:, 0, :], dim=-1) < threshold)
-        total_reward += not_contacted.float()
-        
-    return total_reward # 손가락마다 접촉이 안 된 경우 -1, 모두 접촉한 경우 0 보상
+def contact_forces_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str, 
+    asset_cfg: SceneEntityCfg,
+    wrist_link_name: str,
+    sensor_names: list,
+    threshold: float = 1.0
+) -> torch.Tensor:
+    command = env.command_manager.get_command(command_name)
+    command_term = env.command_manager.get_term(command_name)
 
-def contact_forces_reward(env: ManagerBasedRLEnv, sensor_names: list, threshold: float = 1.0) -> torch.Tensor:      
     num_sensors = len(sensor_names)
     forces = torch.zeros((env.num_envs, num_sensors), device=env.device)
     contacted_flags = {}
@@ -222,11 +170,19 @@ def contact_forces_reward(env: ManagerBasedRLEnv, sensor_names: list, threshold:
         force_mag = torch.norm(filtered_net_forces[:, 0, :], dim=-1)
         
         forces[:, i] = force_mag
-        contacted_flags[name] = (force_mag > threshold)
+        contacted_flags[name] = (force_mag >= threshold)
 
     good_contact = contacted_flags[sensor_names[0]] & (
         contacted_flags[sensor_names[1]] | contacted_flags[sensor_names[2]]
         | contacted_flags[sensor_names[3]] | contacted_flags[sensor_names[4]]
     )
 
-    return good_contact
+    target_flag = sum([
+        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
+        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
+        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
+    ])
+
+    reward = torch.where(good_contact & (target_flag == 3), 1.0, 0.0)  # 모든 조건 만족 시 보상 1.0, 그렇지 않으면 0.0
+
+    return reward
