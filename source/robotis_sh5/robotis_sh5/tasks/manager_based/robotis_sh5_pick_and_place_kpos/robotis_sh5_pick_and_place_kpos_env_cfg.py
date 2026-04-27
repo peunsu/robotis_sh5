@@ -485,7 +485,7 @@ class RewardsCfg:
     
     joint_pos_imitation = RewardTermCfg(
         func=mdp.joint_position_error,
-        weight=-0.6,  # 페널티이므로 음수
+        weight=-1.0,  # 페널티이므로 음수
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot")

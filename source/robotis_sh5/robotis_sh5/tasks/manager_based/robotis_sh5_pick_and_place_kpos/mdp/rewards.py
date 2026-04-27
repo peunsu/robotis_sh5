@@ -138,7 +138,7 @@ def moving_reward(
     target_flag = sum([
         (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),  # 0.4
         (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 0.5).int(),  # 1.0
-        (compute_finger_kpos_error(env, command, command_term) < 0.1).int()  # 0.1
+        (compute_finger_kpos_error(env, command, command_term) < 0.5).int()  # 0.1
     ])
 
     # 2. 기본 거리 페널티
@@ -188,7 +188,7 @@ def contact_forces_reward(
     target_flag = sum([
         (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),  # 0.4
         (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 0.5).int(),  # 1.0
-        (compute_finger_kpos_error(env, command, command_term) < 0.1).int()  # 0.1
+        (compute_finger_kpos_error(env, command, command_term) < 0.5).int()  # 0.1
     ])
 
     reward = torch.where(good_contact & (target_flag == 3), 1.0, 0.0)  # 모든 조건 만족 시 보상 1.0, 그렇지 않으면 0.0

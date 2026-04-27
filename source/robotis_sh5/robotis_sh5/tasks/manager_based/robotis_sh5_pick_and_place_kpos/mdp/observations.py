@@ -197,7 +197,7 @@ def phase_obs(
     target_flag = sum([
         (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),  # 0.4
         (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 0.5).int(),  # 1.0
-        (compute_finger_kpos_error(env, command, command_term) < 0.1).int()  # 0.1
+        (compute_finger_kpos_error(env, command, command_term) < 0.5).int()  # 0.1
     ])
 
     # 2. 결과 텐서 초기화 (기본 Phase 0)

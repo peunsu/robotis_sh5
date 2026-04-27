@@ -107,11 +107,11 @@ def get_trajectory_data(env: ManagerBasedRLEnv, file_path: str, frame_idx: int =
 
     link_names = [
         None,
-        None, "finger_r_link2", "finger_r_link3", "finger_r_link4",
-        None, "finger_r_link6", "finger_r_link7", "finger_r_link8",
-        None, "finger_r_link10", "finger_r_link11", "finger_r_link12",
-        None, "finger_r_link14", "finger_r_link15", "finger_r_link16",
-        None, "finger_r_link18", "finger_r_link19", "finger_r_link20",
+        "finger_r_link2", "finger_r_link3", "finger_r_link4", None,
+        "finger_r_link6", "finger_r_link7", "finger_r_link8", None,
+        "finger_r_link10", "finger_r_link11", "finger_r_link12", None,
+        "finger_r_link14", "finger_r_link15", "finger_r_link16", None,
+        "finger_r_link18", "finger_r_link19", "finger_r_link20", None,
     ]
 
     # 결과 반환
