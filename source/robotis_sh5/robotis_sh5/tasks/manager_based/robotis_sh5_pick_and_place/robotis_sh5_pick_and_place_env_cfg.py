@@ -547,7 +547,7 @@ class RewardsCfg:
     # 수식 (8): 파지 성공 후 들어올리기 보상
     object_lifting = RewardTermCfg(
         func=mdp.lifting_reward_fullbody,
-        weight=0.1,
+        weight=0.01,
         params={
             "command_name": "hand_pose_r",
             "asset_cfg": SceneEntityCfg("robot"),
@@ -570,7 +570,7 @@ class RewardsCfg:
             "object_name": "object",
             "fingertip_names": MISSING,
             "wrist_link_name": MISSING,
-            "weight_m": 3.0,   # 거리 페널티 wm
+            "weight_m": 10.0,   # 거리 페널티 wm
             "weight_b": 10.0,  # 보너스 가중치 wb
             "thresholds": MISSING
         },
@@ -604,14 +604,14 @@ class TerminationsCfg:
     
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
     
-    # object_dropping = TerminationTermCfg(
-    #     func=mdp.root_height_below_minimum, params={"minimum_height": 0.95, "asset_cfg": SceneEntityCfg("object")}
-    # )
+    object_dropping = TerminationTermCfg(
+        func=mdp.root_height_below_minimum, params={"minimum_height": 0.95, "asset_cfg": SceneEntityCfg("object")}
+    )
     
     object_out_of_bound = TerminationTermCfg(
         func=mdp.out_of_bound,
         params={
-            "in_bound_range": {"x": 1.0, "y": 0.5, "z": 1.0},
+            "in_bound_range": {"x": 1.0, "z": 1.0},
             "asset_cfg": SceneEntityCfg("object"),
         },
     )

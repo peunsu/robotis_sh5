@@ -127,20 +127,20 @@ def moving_reward(
     flags = get_grasping_flags(env, command_name, asset_cfg, object_name, fingertip_names, wrist_link_name, thresholds)
     d_obj = flags["d_obj"]
     
-    # target_flag = sum([
-    #     (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
-    #     (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
-    #     (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
-    # ])
+    target_flag = sum([
+        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),  # 0.4
+        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 0.5).int(),  # 1.0
+        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()  # 6.0
+    ])
 
     # 2. 기본 거리 페널티
     # reward = weight_m * (0.3 - d_obj)  # 부호가 잘못되어 있었음
-    # reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, torch.clip(weight_m * (0.3 - d_obj), min=0.0), torch.zeros_like(d_obj))
-    reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, torch.clip(weight_m * (0.3 - d_obj), min=0.0), torch.zeros_like(d_obj))
+    reward = torch.where(flags["is_f1"] + flags["is_f2"] + target_flag == 5, torch.clip(weight_m * (0.3 - d_obj), min=0.05), torch.zeros_like(d_obj))
+    # reward = torch.where(flags["is_f1"] + flags["is_f2"] == 2, torch.clip(weight_m * (0.3 - d_obj), min=0.0), torch.zeros_like(d_obj))
 
     # 3. 보너스 조건 (d_obj < lambda_d_obj)
-    bonus = 1.0 / (1.0 + weight_b * d_obj)
-    reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, reward + bonus, reward)
+    # bonus = 1.0 / (1.0 + weight_b * d_obj)
+    # reward = torch.where(flags["is_f1"] + flags["is_f2"] + flags["is_f3"] == 3, reward + bonus, reward)
 
     return reward
 
@@ -178,9 +178,9 @@ def contact_forces_reward(
     )
 
     target_flag = sum([
-        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),
-        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 1.0).int(),
-        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()
+        (compute_hand_pos_error(env, command, asset_cfg, wrist_link_name) < 0.4).int(),  # 0.4
+        (compute_hand_rot_error(env, command, asset_cfg, wrist_link_name) < 0.5).int(),  # 1.0
+        (compute_finger_qpos_error(env, command, command_term) < 6.0).int()  # 6.0
     ])
 
     reward = torch.where(good_contact & (target_flag == 3), 1.0, 0.0)  # 모든 조건 만족 시 보상 1.0, 그렇지 않으면 0.0

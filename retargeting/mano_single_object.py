@@ -22,6 +22,22 @@ np.complex = complex
 np.object = object
 np.unicode = np.str_
 
+OPERATOR2MANO_RIGHT = np.array(
+    [
+        [0, 0, -1],
+        [-1, 0, 0],
+        [0, 1, 0],
+    ]
+)
+
+OPERATOR2MANO_LEFT = np.array(
+    [
+        [0, 0, -1],
+        [1, 0, 0],
+        [0, -1, 0],
+    ]
+)
+
 class WorldTrajectoryGenerator:
     def __init__(self, dexycb_dir: str, hand_type: str = "right"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,7 +78,7 @@ class WorldTrajectoryGenerator:
         with torch.no_grad():
             _, joint = self.mano_layer(p, t)
             
-        joint_cam = joint.cpu().numpy()[0] # (21, 3)
+        joint_cam = joint.cpu().numpy()[0] # (21, 3) 
         
         # World Space로 변환
         joint_world = joint_cam @ self.camera_to_world[:3, :3].T + self.camera_to_world[:3, 3]
@@ -71,6 +87,10 @@ class WorldTrajectoryGenerator:
         wrist_q_cam = rotations.quaternion_from_compact_axis_angle(hand_pose_frame[0, :3])
         wrist_R_cam = rotations.matrix_from_quaternion(wrist_q_cam)
         wrist_R_world = self.camera_to_world[:3, :3] @ wrist_R_cam
+        
+        operator2mano = OPERATOR2MANO_RIGHT if self.hand_type == "right" else OPERATOR2MANO_LEFT
+        wrist_R_world = wrist_R_world @ operator2mano
+        
         wrist_q_world = rotations.quaternion_from_matrix(wrist_R_world)
         
         return joint_world, wrist_q_world
