@@ -15,7 +15,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [1024, 1024, 512, 512]
         activations: elu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [1024, 1024, 512, 512]
         activations: elu
     output: ONE
 
@@ -36,19 +36,19 @@ memory:
   memory_size: -1  # automatically determined (same as agent:rollouts)
 
 
-# IPPO agent configuration (field names are from IPPO_DEFAULT_CONFIG)
-# https://skrl.readthedocs.io/en/latest/api/multi_agents/ippo.html
+# PPO agent configuration (field names are from PPO_DEFAULT_CONFIG)
+# https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
-  class: IPPO
-  rollouts: 16
-  learning_epochs: 8
-  mini_batches: 1
-  discount_factor: 0.99
+  class: PPO
+  rollouts: 8           # horizon length (MassDexMimic: 8 steps)
+  learning_epochs: 5    # mini_epochs (MassDexMimic: 5)
+  mini_batches: 4
+  discount_factor: 0.96  # gamma (MassDexMimic: 0.96)
   lambda: 0.95
-  learning_rate: 3.0e-04
+  learning_rate: 3.0e-04  # MassDexMimic: 3e-4
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.016   # MassDexMimic KL threshold
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
@@ -56,25 +56,26 @@ agent:
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 1.0
-  ratio_clip: 0.2
+  ratio_clip: 0.2       # clip epsilon (MassDexMimic: 0.2)
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.0
-  value_loss_scale: 2.0
+  entropy_loss_scale: 0.01
+  value_loss_scale: 1.0
   kl_threshold: 0.0
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "cart_double_pendulum_direct"
-    experiment_name: ""
-    write_interval: auto
-    checkpoint_interval: auto
+    directory: "robotis_sh5_grasp"
+    experiment_name: "default"
+    write_interval: 100
+    checkpoint_interval: 1000
+    wandb: False
 
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 4800
+  timesteps: 100000000  # 100M steps (MassDexMimic scale)
   environment_info: log

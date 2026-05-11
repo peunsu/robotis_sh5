@@ -134,6 +134,142 @@ Some examples of packages that can likely be excluded are:
 ...
 ```
 
+---
+
+## Robotis-Sh5-Grasp: OakInk Dexterous Grasping
+
+### Overview
+
+`Robotis-Sh5-Grasp-Direct-v0` is a dexterous grasping environment for the FFW-SH5 full-body robot.
+The policy controls 20 right-hand finger joints while the arm is held at a fixed pre-grasp pose.
+Reference trajectories come from the [OakInk-Image](https://oakink.net/) dataset (SPIDER format).
+
+### Data Preparation
+
+#### 1. Download OakInk-Image dataset
+
+Place the raw dataset at:
+
+```
+source/robotis_sh5/data/raw/oakink/image/
+```
+
+#### 2. Process OakInk → SPIDER format
+
+```bash
+python scripts/process_dataset/oakink.py
+```
+
+Output:
+- `data/processed/oakink/mano/right/{task}/{data_id}/trajectory_keypoints.npz` — reference trajectories
+- `data/processed/oakink/assets/objects/{obj_id}/visual.obj` — centered object meshes
+
+#### 3. Convert object meshes to USD
+
+Must be run inside the Isaac Lab Python environment:
+
+```bash
+# Convert a single object
+isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --object-id A01001
+
+# Convert all objects
+isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py
+
+# Re-convert (overwrite existing USD)
+isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --overwrite
+
+# Custom mass / friction
+isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --mass 0.15 --friction 0.9
+```
+
+Converted USD files are written to `data/processed/oakink/assets/objects/{obj_id}/visual.usd`.
+
+### Running the Environment
+
+#### Verify registration
+
+```bash
+python scripts/list_envs.py
+```
+
+#### Sanity-check with dummy agents
+
+```bash
+# Zero-action agent (checks env reset / obs / reward shapes)
+python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
+
+# Random-action agent
+python scripts/random_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
+```
+
+#### Train with SKRL (recommended)
+
+```bash
+python scripts/skrl/train.py --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048
+```
+
+#### Train with other RL frameworks
+
+```bash
+python scripts/rsl_rl/train.py  --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048
+python scripts/rl_games/train.py --task=Robotis-Sh5-Grasp-Direct-v0
+python scripts/sb3/train.py      --task=Robotis-Sh5-Grasp-Direct-v0
+```
+
+#### Play / inference
+
+```bash
+python scripts/skrl/play.py --task=Robotis-Sh5-Grasp-Direct-v0 --checkpoint=<CHECKPOINT_PATH>
+```
+
+#### Debug visualization
+
+Enable reference fingertip and wrist 6D-pose markers in the sim:
+
+```python
+# In robotis_sh5_grasp_env_cfg.py
+debug_vis: bool = True
+debug_vis_num_envs: int = 16  # show markers for first N envs
+```
+
+Or pass at launch (if your runner supports it):
+
+```bash
+python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
+```
+
+### Environment Details
+
+| Item | Value |
+|---|---|
+| Action space | 20 (right finger joint deltas) |
+| Observation space | 134 |
+| Control frequency | 30 Hz (decimation=4 @ 120 Hz physics) |
+| Episode length | 5 s |
+| Default num_envs | 2048 |
+| Default object | `A01001` |
+
+**Observation breakdown (134-dim):**
+
+| Group | Dim | Description |
+|---|---|---|
+| `joint_pos` | 20 | Right finger joint angles |
+| `joint_vel` | 20 | Right finger joint velocities |
+| `fingertip_pos` | 15 | Fingertip world positions (5×3) |
+| `fingertip_vel` | 15 | Fingertip linear velocities (5×3) |
+| `obj_pos` | 3 | Object position |
+| `obj_quat` | 4 | Object orientation (wxyz) |
+| `obj_linvel` | 3 | Object linear velocity |
+| `obj_angvel` | 3 | Object angular velocity |
+| `delta_fingertip` | 15 | Fingertip − ref_fingertip (object frame) |
+| `delta_obj_pos` | 3 | obj_pos − ref_obj_pos |
+| `delta_obj_rot` | 3 | Rotation error (axis-angle) |
+| `future_contact` | 5 | Predicted contact flag per fingertip |
+| `prev_action` | 20 | Previous action |
+| `fingertip_forces` | 5 | Normal contact force per fingertip |
+
+---
+
 ## Acknowledgement
 - [Isaac Lab](https://github.com/isaac-sim/IsaacLab)
 - [robotis_lab](https://github.com/ROBOTIS-GIT/robotis_lab)
