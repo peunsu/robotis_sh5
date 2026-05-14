@@ -30,6 +30,7 @@ from .robotis_sh5_grasp_env_cfg import FFW_SH5_DEX_CFG
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
 _OAKINK_DATA_DIR = str(_DATA_DIR / "processed" / "oakink")
+_HOCAP_DATA_DIR = str(_DATA_DIR / "processed" / "hocap")
 
 
 @configclass
@@ -133,16 +134,18 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     canonical_ref_pos_env: tuple | None = None  # set to shoulder XY after running env
 
     # Dataset
+    dataset: str = "oakink"   # "oakink" | "hocap"
     oakink_data_dir: str = _OAKINK_DATA_DIR
-    object_id: str = "A01001"
-    trajectory_task: str = "A01001-0001-0000"
+    hocap_data_dir: str = _HOCAP_DATA_DIR
+    object_id: str = "C11001"
+    trajectory_task: str = "C11001-0001-0007" # "A01001-0001-0000"
     trajectory_data_id: int = 0
 
     # Table
     table_pos_env: tuple = (0.3, 0.0, 0.0)
     table_size: tuple = (0.6, 0.6, 1.0)
 
-    # Object physics (pretrain: gravity disabled, object is teleported)
+    # Object physics disabled
     object_mass: float = 0.2
     object_static_friction: float = 0.8
     object_dynamic_friction: float = 0.6

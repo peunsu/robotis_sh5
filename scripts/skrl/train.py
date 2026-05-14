@@ -38,8 +38,13 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
-parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--timesteps", type=int, default=None, help="Total environment steps to train; overrides agent YAML trainer.timesteps.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+# Dataset / sequence overrides — allow per-sequence training from bash scripts.
+parser.add_argument("--dataset", type=str, default=None, help="Dataset name (e.g. 'oakink'); overrides env_cfg.dataset.")
+parser.add_argument("--object_id", type=str, default=None, help="Object ID; overrides env_cfg.object_id.")
+parser.add_argument("--trajectory_task", type=str, default=None, help="Trajectory task directory name; overrides env_cfg.trajectory_task.")
+parser.add_argument("--trajectory_data_id", type=int, default=None, help="Trajectory data sub-index; overrides env_cfg.trajectory_data_id.")
 parser.add_argument(
     "--ml_framework",
     type=str,
@@ -74,11 +79,13 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import json
 import logging
 import os
 import random
 import time
 from datetime import datetime
+from pathlib import Path
 
 import gymnasium as gym
 import skrl
@@ -129,7 +136,7 @@ else:
 
 
 _MASS_LR_SCALE = 33.333  # mass optimizer group: 33.333× higher LR (matches original rl_games config)
-_ENTROPY_FLIP_SCALE = -0.002  # entropy coef when is_reached_end=True (mirrors GR: -0.002 * sigma_weight)
+_ENTROPY_FLIP_SCALE = -0.002  # entropy coef when is_reached_end=True (GR: -0.002 * sigma_weight)
 
 
 def _patch_mass_policy(agent, policy_cfg: dict, learning_rate: float) -> None:
@@ -218,28 +225,190 @@ def _patch_mass_policy(agent, policy_cfg: dict, learning_rate: float) -> None:
 
 
 def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
-    """Flip entropy coefficient sign when is_reached_end (mirrors GR a2c_continuous.py sigma_weight logic).
+    """GR-faithful entropy scheduling.
 
-    GR formula: entropy_weight = entropy_coef * (1 - sigma_weight) - 0.002 * sigma_weight
-      sigma_weight = float(is_reached_end)
-      → is_reached_end=False: entropy_weight = +entropy_coef  (maximize entropy, std grows)
-      → is_reached_end=True:  entropy_weight = -0.002         (minimize entropy, std shrinks)
+    Faithfully mirrors GR (rl_games/a2c_continuous.py):
+      1. At each rollout step: store is_reached_end as sigma_grad_flg in the rollout memory.
+      2. At training time, per mini-batch:
+           sigma_weight = sigma_grad_flg[0].float()   # first element of mini-batch
+           entropy_weight = entropy_coef * (1 - sigma_weight) - 0.002 * sigma_weight
+           loss -= entropy * entropy_weight
 
-    skrl uses the same sign convention: loss += -entropy_loss_scale * entropy
-    so setting _entropy_loss_scale to negative has the identical effect.
+    skrl sign convention: entropy_loss = -entropy_scale * entropy.mean()
+      entropy_scale = entropy_coef * (1 - sw) - 0.002 * sw   (same formula as GR)
     """
-    _orig_update = agent._update
+    import itertools
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from skrl import config
+    from skrl.resources.schedulers.torch import KLAdaptiveLR
 
-    def _update_with_entropy_flip(timestep: int, timesteps: int) -> None:
-        actual_env = env_wrapper.unwrapped
-        sigma_weight = float(actual_env.is_reached_end)
-        agent._entropy_loss_scale = (
-            base_entropy_scale * (1.0 - sigma_weight) + _ENTROPY_FLIP_SCALE * sigma_weight
+    # ── Step 1: Add sigma_grad_flg tensor to rollout memory ───────────────────
+    agent.memory.create_tensor(name="sigma_grad_flg", size=1, dtype=torch.float32)
+    agent._tensors_names.append("sigma_grad_flg")
+
+    # ── Step 2: Store sigma_grad_flg at each rollout step ─────────────────────
+    _orig_record = agent.record_transition
+
+    def _record_with_sigma(states, actions, rewards, next_states, terminated, truncated,
+                           infos, timestep, timesteps):
+        _orig_record(states, actions, rewards, next_states, terminated, truncated,
+                     infos, timestep, timesteps)
+        # Write is_reached_end into the slot just committed by add_samples.
+        # add_samples increments memory_index after writing, so the written slot is index-1.
+        prev_idx = (agent.memory.memory_index - 1) % agent.memory.memory_size
+        sigma = float(env_wrapper.unwrapped.is_reached_end)
+        agent.memory.tensors["sigma_grad_flg"][prev_idx].fill_(sigma)
+
+    agent.record_transition = _record_with_sigma
+
+    # ── Step 3: Replace _update with per-mini-batch entropy weighting ─────────
+    def _update_with_per_batch_entropy(timestep: int, timesteps: int) -> None:
+
+        def compute_gae(rewards, dones, values, next_values,
+                        discount_factor=0.99, lambda_coefficient=0.95):
+            advantage = 0
+            advantages = torch.zeros_like(rewards)
+            not_dones = dones.logical_not()
+            memory_size = rewards.shape[0]
+            for i in reversed(range(memory_size)):
+                next_v = values[i + 1] if i < memory_size - 1 else next_values
+                advantage = (
+                    rewards[i]
+                    - values[i]
+                    + discount_factor * not_dones[i] * (next_v + lambda_coefficient * advantage)
+                )
+                advantages[i] = advantage
+            returns = advantages + values
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            return returns, advantages
+
+        with torch.no_grad(), torch.autocast(device_type=agent._device_type, enabled=agent._mixed_precision):
+            agent.value.train(False)
+            last_values, _, _ = agent.value.act(
+                {"states": agent._state_preprocessor(agent._current_next_states.float())}, role="value"
+            )
+            agent.value.train(True)
+            last_values = agent._value_preprocessor(last_values, inverse=True)
+
+        values = agent.memory.get_tensor_by_name("values")
+        returns, advantages = compute_gae(
+            rewards=agent.memory.get_tensor_by_name("rewards"),
+            dones=(agent.memory.get_tensor_by_name("terminated")
+                   | agent.memory.get_tensor_by_name("truncated")),
+            values=values,
+            next_values=last_values,
+            discount_factor=agent._discount_factor,
+            lambda_coefficient=agent._lambda,
         )
-        _orig_update(timestep, timesteps)
+        agent.memory.set_tensor_by_name("values", agent._value_preprocessor(values, train=True))
+        agent.memory.set_tensor_by_name("returns", agent._value_preprocessor(returns, train=True))
+        agent.memory.set_tensor_by_name("advantages", advantages)
 
-    agent._update = _update_with_entropy_flip
-    print(f"[entropy_flip] Patched _update: base={base_entropy_scale}, flip={_ENTROPY_FLIP_SCALE}")
+        sampled_batches = agent.memory.sample_all(
+            names=agent._tensors_names, mini_batches=agent._mini_batches
+        )
+
+        cumulative_policy_loss = 0
+        cumulative_entropy_loss = 0
+        cumulative_value_loss = 0
+
+        for epoch in range(agent._learning_epochs):
+            kl_divergences = []
+
+            for (
+                sampled_states,
+                sampled_actions,
+                sampled_log_prob,
+                sampled_values,
+                sampled_returns,
+                sampled_advantages,
+                sampled_sigma,          # sigma_grad_flg: (mini_batch_size, 1)
+            ) in sampled_batches:
+
+                with torch.autocast(device_type=agent._device_type, enabled=agent._mixed_precision):
+
+                    sampled_states = agent._state_preprocessor(sampled_states, train=not epoch)
+
+                    _, next_log_prob, _ = agent.policy.act(
+                        {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
+                    )
+
+                    with torch.no_grad():
+                        ratio = next_log_prob - sampled_log_prob
+                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                        kl_divergences.append(kl_divergence)
+
+                    if agent._kl_threshold and kl_divergence > agent._kl_threshold:
+                        break
+
+                    # ── GR-faithful per-mini-batch entropy weight ──────────
+                    sw = sampled_sigma[0].item()   # first element (scalar), mirrors GR sigma_grad_flg[0]
+                    entropy_scale = base_entropy_scale * (1.0 - sw) + _ENTROPY_FLIP_SCALE * sw
+                    entropy_loss = -entropy_scale * agent.policy.get_entropy(role="policy").mean()
+
+                    ratio = torch.exp(next_log_prob - sampled_log_prob)
+                    surrogate = sampled_advantages * ratio
+                    surrogate_clipped = sampled_advantages * torch.clip(
+                        ratio, 1.0 - agent._ratio_clip, 1.0 + agent._ratio_clip
+                    )
+                    policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+                    predicted_values, _, _ = agent.value.act({"states": sampled_states}, role="value")
+                    if agent._clip_predicted_values:
+                        predicted_values = sampled_values + torch.clip(
+                            predicted_values - sampled_values,
+                            min=-agent._value_clip, max=agent._value_clip,
+                        )
+                    value_loss = agent._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+
+                agent.optimizer.zero_grad()
+                agent.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+
+                if config.torch.is_distributed:
+                    agent.policy.reduce_parameters()
+                    if agent.policy is not agent.value:
+                        agent.value.reduce_parameters()
+
+                if agent._grad_norm_clip > 0:
+                    agent.scaler.unscale_(agent.optimizer)
+                    if agent.policy is agent.value:
+                        nn.utils.clip_grad_norm_(agent.policy.parameters(), agent._grad_norm_clip)
+                    else:
+                        nn.utils.clip_grad_norm_(
+                            itertools.chain(agent.policy.parameters(), agent.value.parameters()),
+                            agent._grad_norm_clip,
+                        )
+
+                agent.scaler.step(agent.optimizer)
+                agent.scaler.update()
+
+                cumulative_policy_loss += policy_loss.item()
+                cumulative_value_loss += value_loss.item()
+                cumulative_entropy_loss += entropy_loss.item()
+
+            if agent._learning_rate_scheduler:
+                if isinstance(agent.scheduler, KLAdaptiveLR):
+                    kl = torch.tensor(kl_divergences, device=agent.device).mean()
+                    if config.torch.is_distributed:
+                        torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                        kl /= config.torch.world_size
+                    agent.scheduler.step(kl.item())
+                else:
+                    agent.scheduler.step()
+
+        n = agent._learning_epochs * agent._mini_batches
+        agent.track_data("Loss / Policy loss", cumulative_policy_loss / n)
+        agent.track_data("Loss / Value loss", cumulative_value_loss / n)
+        agent.track_data("Loss / Entropy loss", cumulative_entropy_loss / n)
+        agent.track_data("Policy / Standard deviation",
+                         agent.policy.distribution(role="policy").stddev.mean().item())
+        if agent._learning_rate_scheduler:
+            agent.track_data("Learning / Learning rate", agent.scheduler.get_last_lr()[0])
+
+    agent._update = _update_with_per_batch_entropy
+    print(f"[entropy_flip] GR-faithful: base={base_entropy_scale}, flip={_ENTROPY_FLIP_SCALE}")
 
 
 def _load_partial_checkpoint(agent, path: str) -> None:
@@ -289,6 +458,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
+    # Dataset / sequence overrides (for per-sequence training via benchmark scripts)
+    if args_cli.dataset is not None:
+        env_cfg.dataset = args_cli.dataset
+    if args_cli.object_id is not None:
+        env_cfg.object_id = args_cli.object_id
+    if args_cli.trajectory_task is not None:
+        env_cfg.trajectory_task = args_cli.trajectory_task
+    if args_cli.trajectory_data_id is not None:
+        env_cfg.trajectory_data_id = args_cli.trajectory_data_id
+
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
@@ -299,9 +478,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # multi-gpu training config
     if args_cli.distributed:
         env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
-    # max iterations for training
-    if args_cli.max_iterations:
-        agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
+    if args_cli.timesteps:
+        agent_cfg["trainer"]["timesteps"] = args_cli.timesteps
     agent_cfg["trainer"]["close_environment_at_exit"] = False
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
@@ -428,7 +606,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # run training
     runner.run()
 
-    print(f"Training time: {round(time.time() - start_time, 2)} seconds")
+    training_time = round(time.time() - start_time, 2)
+    print(f"Training time: {training_time} seconds")
+
+    # Save task_info.json to the processed output directory (only for grasp tasks with sequence info).
+    _has_seq = (
+        hasattr(env_cfg, "trajectory_task")
+        and hasattr(env_cfg, "dataset")
+        and env_cfg.trajectory_task
+    )
+    if _has_seq:
+        _data_root = Path(
+            env_cfg.hocap_data_dir if env_cfg.dataset == "hocap" else env_cfg.oakink_data_dir
+        )
+        _ckpt_dir = (
+            _data_root / "ffw_sh5" / "right"
+            / env_cfg.trajectory_task
+            / str(env_cfg.trajectory_data_id)
+        )
+        _ckpt_dir.mkdir(parents=True, exist_ok=True)
+        _task_info = {
+            "task": args_cli.task,
+            "dataset": env_cfg.dataset,
+            "object_id": env_cfg.object_id,
+            "trajectory_task": env_cfg.trajectory_task,
+            "trajectory_data_id": env_cfg.trajectory_data_id,
+            "num_envs": env_cfg.scene.num_envs,
+            "timesteps": agent_cfg["trainer"]["timesteps"],
+            "seed": agent_cfg["seed"],
+            "checkpoint": str(Path(resume_path).resolve()) if resume_path else None,
+            "log_dir": log_dir,
+            "skrl_version": skrl.__version__,
+            "training_time_s": training_time,
+            "trained_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _info_path = _ckpt_dir / "task_info.json"
+        with open(_info_path, "w") as _f:
+            json.dump(_task_info, _f, indent=2)
+        print(f"[INFO] Task info saved → {_info_path}")
 
     # close the simulator
     env.close()

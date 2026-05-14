@@ -56,7 +56,8 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _load_reference_trajectories(self, cfg: RobotisSh5GraspPretrainEnvCfg) -> None:
-        data_dir = Path(cfg.oakink_data_dir) / "mano" / "right"
+        _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
+        data_dir = _data_root / "mano" / "right"
 
         if cfg.trajectory_task:
             traj_path = (
@@ -124,7 +125,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             future_contact_list.append(fc)
             mano_kpts_list.append(kp)
 
-        mesh_path = Path(cfg.oakink_data_dir) / "assets" / "objects" / cfg.object_id / "visual.obj"
+        mesh_path = _data_root / "assets" / "objects" / cfg.object_id / "visual.obj"
         if mesh_path.exists():
             _mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
             mesh_z_min = float(_mesh.vertices[:, 2].min())

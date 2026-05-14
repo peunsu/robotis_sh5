@@ -15,6 +15,7 @@ from isaaclab.utils import configclass
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
 _ROBOT_USD = str(_DATA_DIR / "robots" / "FFW" / "FFW_SH5_simplified_dex.usd")
 _OAKINK_DATA_DIR = str(_DATA_DIR / "processed" / "oakink")
+_HOCAP_DATA_DIR = str(_DATA_DIR / "processed" / "hocap")
 
 
 ##
@@ -235,14 +236,19 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     canonical_ref_pos_env: tuple | None = None
 
     # Dataset
+    dataset: str = "oakink"   # "oakink" | "hocap"
     oakink_data_dir: str = _OAKINK_DATA_DIR
-    object_id: str = "A01001"  # OakInk object to use (must have pre-converted USD)
+    hocap_data_dir: str = _HOCAP_DATA_DIR
+    object_id: str = "C11001" # "A01001"  # OakInk object to use (must have pre-converted USD)
+    # Path to per-object mass JSON produced by scripts/process_dataset/estimate_object_mass.py.
+    # If the file exists and object_id is found in it, object_mass_min/max are overridden at init.
+    object_mass_json: str = str(_DATA_DIR / "processed" / "oakink" / "object_mass.json")
 
     # Trajectory selection: which specific trajectory to train on.
     # task: directory name under data/processed/oakink/mano/right/  (e.g. "A01001-0001-0000")
     # data_id: sub-index within that task directory (0, 1, 2, ...)
     # If task is empty, all trajectories matching object_id are loaded and assigned randomly.
-    trajectory_task: str = "A01001-0001-0000"
+    trajectory_task: str = "C11001-0001-0007" # "A01001-0001-0000"
     trajectory_data_id: int = 0
 
     # Table (static cuboid): bottom center at table_pos_env, top surface at z = table_size[2]
@@ -251,8 +257,8 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
 
     # Object physics
     object_mass: float = 0.2              # default mass (kg) used if mass-as-action is disabled
-    object_mass_min: float = 0.05         # minimum object mass for mass-as-action sampling (kg)
-    object_mass_max: float = 0.85         # maximum object mass for mass-as-action sampling (kg)
+    object_mass_min: float = 0.04         # minimum object mass for mass-as-action sampling (kg)
+    object_mass_max: float = 0.10         # maximum object mass for mass-as-action sampling (kg)
     object_static_friction: float = 0.8
     object_dynamic_friction: float = 0.6
     object_restitution: float = 0.1

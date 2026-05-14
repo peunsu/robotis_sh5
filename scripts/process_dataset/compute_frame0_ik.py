@@ -263,7 +263,7 @@ def main():
             processed += 1
 
     print(f"\nDone: {processed} processed, {skipped} skipped, {errors} errors.")
-    simulation_app.close()
+    import os; os._exit(0)
 
 
 if __name__ == "__main__":

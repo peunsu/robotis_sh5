@@ -15,6 +15,7 @@ Incorporates MassDexMimic (NeurIPS 2026) and GR env techniques:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from collections.abc import Sequence
 
@@ -66,6 +67,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
     def __init__(self, cfg: RobotisSh5GraspEnvCfg, render_mode: str | None = None, **kwargs):
         self._load_reference_trajectories(cfg)
+        self._apply_object_mass_from_json(cfg)
         self._object_cfg = self._build_object_cfg(cfg)
         # Match episode length to the longest trajectory so time_out fires at the right frame.
         action_fps = round(1.0 / (cfg.sim.dt * cfg.decimation))
@@ -79,7 +81,8 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
     def _load_reference_trajectories(self, cfg: RobotisSh5GraspEnvCfg) -> None:
         """Load trajectory_keypoints.npz file(s) for the configured object and trajectory."""
-        data_dir = Path(cfg.oakink_data_dir) / "mano" / "right"
+        _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
+        data_dir = _data_root / "mano" / "right"
 
         if cfg.trajectory_task:
             # Load a single specific trajectory
@@ -151,7 +154,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         # We need the mesh Z minimum (in the centered mesh) to offset the centroid above the table.
         # Shift wrist and fingertip positions by the same 3D offset to preserve
         # the relative geometry between hand and object.
-        mesh_path = Path(cfg.oakink_data_dir) / "assets" / "objects" / cfg.object_id / "visual.obj"
+        mesh_path = _data_root / "assets" / "objects" / cfg.object_id / "visual.obj"
         if mesh_path.exists():
             _mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
             mesh_z_min = float(_mesh.vertices[:, 2].min())
@@ -343,6 +346,33 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             print(f"[grasp] {missing}/{n_traj} frame0 IK files missing; arm stays at default on cache miss.")
 
         print(f"[grasp] Loaded {n_traj} trajectories for '{cfg.object_id}', max_len={max_len}")
+
+    @staticmethod
+    def _apply_object_mass_from_json(cfg: RobotisSh5GraspEnvCfg) -> None:
+        """Override cfg.object_mass_min/max from the per-object mass JSON if available."""
+        json_path = Path(cfg.object_mass_json)
+        if not json_path.exists():
+            return
+        try:
+            with open(json_path) as f:
+                mass_table: dict = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[grasp] WARNING: Could not load object_mass_json ({json_path}): {e}")
+            return
+        _DEFAULT_MIN, _DEFAULT_MAX = 0.05, 0.20
+
+        entry = mass_table.get(cfg.object_id)
+        if entry is None:
+            lo, hi = _DEFAULT_MIN, _DEFAULT_MAX
+            print(f"[grasp] object_mass: {cfg.object_id} not in JSON → default [{lo:.3f}, {hi:.3f}] kg")
+        elif entry[0] is None or entry[1] is None:
+            lo, hi = _DEFAULT_MIN, _DEFAULT_MAX
+            print(f"[grasp] object_mass: {cfg.object_id} has null in JSON → default [{lo:.3f}, {hi:.3f}] kg")
+        else:
+            lo, hi = float(entry[0]), float(entry[1])
+            print(f"[grasp] object_mass from JSON: {cfg.object_id} → [{lo:.3f}, {hi:.3f}] kg")
+        cfg.object_mass_min = lo
+        cfg.object_mass_max = hi
 
     def _build_object_cfg(self, cfg: RobotisSh5GraspEnvCfg) -> RigidObjectCfg:
         usd_path = (
@@ -569,6 +599,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._last_wrist_err = torch.zeros(B, device=self.device)
         self._last_wrist_rot_err = torch.zeros(B, device=self.device)
         self._last_obj_pos_err = torch.zeros(B, device=self.device)
+        self._last_kpts_err = torch.zeros(B, device=self.device)  # unweighted mean over all 21 keypoints (m); for evaluation E_j metric
 
     def _resolve_fingertip_ids(self) -> torch.Tensor:
         ids = []
@@ -956,6 +987,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         delta_kpts_w = delta_kpts.clone()
         delta_kpts_w[:, :, 2] *= 1.5
         kpts_err_w = torch.norm(delta_kpts_w, dim=-1).mean(dim=-1)        # (B,)
+        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1) # (B,) unweighted; stored for E_j evaluation metric
 
         # Wrist error from keypoint 0 (unweighted, for termination check).
         wrist_err = torch.norm(delta_kpts[:, 0, :], dim=-1)               # (B,)
