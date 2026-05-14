@@ -142,9 +142,7 @@ def process_sequence(
         return False
 
     N = len(frames)
-    wrist_pos_raw = np.zeros((N, 3))
-    wrist_rot_raw = np.zeros((N, 3, 3))
-    fingertip_raw = np.zeros((N, 5, 3))
+    all_joints_raw = np.zeros((N, 21, 3))  # all 21 MANO keypoints per frame
     obj_T_w_o = np.zeros((N, 4, 4))
     valid = np.ones(N, dtype=bool)
 
@@ -166,9 +164,7 @@ def process_sequence(
         hj_h = np.concatenate([hj_cam, np.ones((21, 1))], axis=1)
         joints_world = (T_w_c @ hj_h.T).T[:, :3]
 
-        wrist_pos_raw[i] = joints_world[0]
-        wrist_rot_raw[i] = extract_wrist_rotation(joints_world)
-        fingertip_raw[i] = joints_world[FINGERTIP_INDICES]
+        all_joints_raw[i] = joints_world  # all 21 joints
         obj_T_w_o[i] = gi["obj_anno"].numpy()  # T_w_o (world←obj canonical)
 
     # Fill missing frames by nearest-neighbour
@@ -181,16 +177,19 @@ def process_sequence(
             return False
         for m in np.where(~valid)[0]:
             nn = valid_idxs[np.argmin(np.abs(valid_idxs - m))]
-            wrist_pos_raw[m] = wrist_pos_raw[nn]
-            wrist_rot_raw[m] = wrist_rot_raw[nn]
-            fingertip_raw[m] = fingertip_raw[nn]
+            all_joints_raw[m] = all_joints_raw[nn]
             obj_T_w_o[m] = obj_T_w_o[nn]
 
     if smooth:
-        wrist_pos_raw = moving_average_filter(wrist_pos_raw, window_size=5)
-        fingertip_raw = moving_average_filter(fingertip_raw.reshape(N, 15), window_size=5).reshape(N, 5, 3)
+        all_joints_raw = moving_average_filter(all_joints_raw.reshape(N, 63), window_size=5).reshape(N, 21, 3)
         obj_trans = moving_average_filter(obj_T_w_o[:, :3, 3], window_size=5)
         obj_T_w_o[:, :3, 3] = obj_trans
+
+    # Derive wrist and fingertip from (smoothed) all_joints_raw
+    wrist_pos_raw = all_joints_raw[:, 0]                    # (N, 3)
+    fingertip_raw = all_joints_raw[:, FINGERTIP_INDICES]    # (N, 5, 3)
+    # Recompute wrist rotation from smoothed joints for consistency
+    wrist_rot_raw = np.array([extract_wrist_rotation(all_joints_raw[i]) for i in range(N)])
 
     qpos_wrist_right = np.zeros((N, 7))
     qpos_finger_right = np.zeros((N, 5, 7))
@@ -248,6 +247,7 @@ def process_sequence(
         qpos_finger_left=qpos_finger_left,
         qpos_obj_left=qpos_obj_left,
         contact=np.zeros((N, 10)),
+        mano_kpts_right=all_joints_raw,  # (N, 21, 3) all MANO keypoints in world frame
     )
 
     mesh_dir_rel = str(mesh_dir.relative_to(data_dir))

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
-from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -45,7 +45,7 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.9, 0.8, 0.0),
+        pos=(0.65, 0.60, 0.0),
         rot=(0.70711, 0.0, 0.0, -0.70711),
         joint_pos={
             # Swerve base
@@ -139,25 +139,38 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     Policy controls: right-hand fingers (20) + right arm (7) + lift (1) = 28 DOF total.
     Additional output: 1D normalized object mass parameter (MassDexMimic).
 
-    Observation space (total=159):
-        joint_pos        [28]      controlled joint angles (fingers + arm + lift)
-        joint_vel        [28]      controlled joint velocities
-        fingertip_pos    [5*3]     fingertip positions in world
-        fingertip_vel    [5*3]     fingertip linear velocities
-        obj_pos          [3]       object position
-        obj_quat         [4]       object orientation (wxyz)
-        obj_linvel       [3]       object linear velocity
-        obj_angvel       [3]       object angular velocity
-        delta_fingertip  [5*3]     next-frame fingertip error in object frame (look-ahead)
-        delta_obj_pos    [3]       next-frame obj position error
-        delta_obj_rot    [3]       next-frame rotation error (axis-angle approximation)
-        future_contact   [5]       predicted contact flag per fingertip
-        prev_action      [29]      previous action (28 joints + 1 mass)
-        fingertip_forces [5]       normal contact force per fingertip
+    Observation space (total=280, paper S4.1 layout):
+        hand_kpts_pos      [21*3]   all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
+        wrist_quat         [4]      wrist global orientation (wxyz)
+        wrist_linvel       [3]      wrist global linear velocity
+        wrist_angvel       [3]      wrist global angular velocity
+        fingertip_vel      [5*3]    fingertip linear velocities
+        joint_pos          [28]     controlled joint angles (normalized)
+        joint_vel          [28]     controlled joint velocities
+        obj_pos            [3]      object position
+        obj_quat           [4]      object orientation (wxyz)
+        obj_linvel         [3]      object linear velocity
+        obj_angvel         [3]      object angular velocity
+        delta_kpts_world   [21*3]   next-frame delta for all 21 keypoints in world frame
+        delta_ft_obj       [5*3]    next-frame fingertip error in object frame (contact-cond.)
+        delta_obj_pos      [3]      next-frame obj position error
+        delta_obj_rot      [3]      next-frame rotation error (axis-angle approximation)
+        future_contact     [5]      predicted contact flag per fingertip
+        prev_action        [29]     previous action (28 joints + 1 mass)
+        fingertip_forces   [5]      normal contact force per fingertip
 
     Action space (29): [fingers(20) | arm_r(7) | lift(1) | mass(1)] from default pose.
         mass dim [-1,1] → [object_mass_min, object_mass_max] applied at episode start.
     """
+
+    # Viewer: positioned in front of and to the right of the table, elevated, looking
+    # at the table surface (z=1.0) where the robot hand approaches from behind.
+    # Robot base is at env-local (0.65, 0.60); table top is at (0.3, 0.0, 1.0).
+    viewer: ViewerCfg = ViewerCfg(
+        eye=(0.2, 0.15, 2.2),
+        lookat=(-0.2, 0.5, 1.9),
+        resolution=(1280, 720),
+    )
 
     # Simulation
     decimation: int = 4  # control at 30 Hz (120 / 4)
@@ -168,7 +181,7 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     num_arm_r_dofs: int = 7   # arm_r_joint1-7
     num_lift_dofs: int = 1    # lift_joint
     action_space: int = 29    # 20 + 7 + 1 + 1(mass)
-    observation_space: int = 159  # 2*28 + 15+15+3+4+3+3+15+3+3+5 + 29 + 5
+    observation_space: int = 280  # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+29+5
     state_space: int = 0
 
     # Physics
@@ -214,6 +227,13 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Right-hand wrist link name (end-effector base)
     wrist_body_name: str = "hx5_d20_right_base"
 
+    # Canonical reference XY (env-local) for trajectory orientation alignment.
+    # Trajectories are rotated in XY so the reference wrist approaches the object
+    # from the same direction as (canonical_ref_pos_env → object).
+    # None → robot body origin (cfg.robot_cfg.init_state.pos[:2]).
+    # Set to the right-arm shoulder XY so alignment is relative to the arm, not the torso.
+    canonical_ref_pos_env: tuple | None = None
+
     # Dataset
     oakink_data_dir: str = _OAKINK_DATA_DIR
     object_id: str = "A01001"  # OakInk object to use (must have pre-converted USD)
@@ -227,12 +247,12 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
 
     # Table (static cuboid): bottom center at table_pos_env, top surface at z = table_size[2]
     table_pos_env: tuple = (0.3, 0.0, 0.0)   # env-local XYZ of table bottom center
-    table_size: tuple = (0.8, 0.8, 1.0)       # X × Y × Z dimensions in meters
+    table_size: tuple = (0.6, 0.6, 1.0)       # X × Y × Z dimensions in meters
 
     # Object physics
     object_mass: float = 0.2              # default mass (kg) used if mass-as-action is disabled
     object_mass_min: float = 0.05         # minimum object mass for mass-as-action sampling (kg)
-    object_mass_max: float = 0.5          # maximum object mass for mass-as-action sampling (kg)
+    object_mass_max: float = 0.85         # maximum object mass for mass-as-action sampling (kg)
     object_static_friction: float = 0.8
     object_dynamic_friction: float = 0.6
     object_restitution: float = 0.1
@@ -240,24 +260,20 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Contact threshold for future_contact precomputation
     contact_dist_threshold: float = 0.05  # m
 
-    # Action scales (delta from default pose)
-    action_scale: float = 0.5       # fingers: ±0.5 rad
-    arm_action_scale: float = 0.5   # arm joints: ±0.5 rad
-    lift_action_scale: float = 0.05  # lift: ±0.05 m
-
     # Action smoothing (EMA): smoothed = alpha*prev + (1-alpha)*current
-    # 0.0 = no smoothing; 0.5 = equal mix (GR env default)
-    action_smoothing: float = 0.5
+    # 0.0 = no smoothing; 0.5 = equal mix (GR env default); higher = smoother (less trembling)
+    action_smoothing: float = 0.7
 
-    # Reward scales
-    rew_alive: float = 0.5
-    rew_obj_pos: float = -10.0
-    rew_obj_rot: float = -1.0
-    rew_fingertip: float = -5.0
-    rew_fingertip_force: float = 1.0
-    rew_wrist: float = -2.0              # wrist position tracking reward scale
-    rew_action_reg: float = -0.01
-    rew_pose_reg: float = -0.005
+    # Reward scales (GR env: 1.5*alive - clamp(4.26*pos + 1.0*rot + 5.2*ft + 1.76*kpts, 1.5) + force + reg)
+    rew_alive: float = 1.5
+    rew_kpts: float = -1.76           # GR env: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
+    rew_obj_pos: float = -4.26        # GR env: 4.26
+    rew_obj_rot: float = -1.0         # GR env: 1.0
+    rew_fingertip: float = -5.2       # GR env: 5.2
+    rew_fingertip_force: float = 1.0  # GR env: 1.125 (slightly different normalization)
+    rew_action_reg: float = -0.004    # GR env: action_penalty_scale
+    rew_pose_reg: float = -0.001      # GR env: dof_penalty_scale
+    rew_action_rate: float = -0.01    # penalize rapid action changes to reduce trembling
 
     # Termination
     # termination=False disables early termination entirely (only timeout) — use for warm-up.
@@ -268,7 +284,8 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     max_obj_pos_err: float = 0.15     # object position tracking error (m) — matches GR env
     max_obj_rot_err: float = 0.75     # object rotation tracking error (rad)
     max_wrist_pos_err: float = 0.15   # wrist (arm end-effector) position tracking error (m)
-    max_ft_mean_err: float = 0.15     # mean fingertip position tracking error (m)
+    max_wrist_rot_err: float = 0.75   # wrist rotation tracking error (rad) — matches GR env
+    max_ft_mean_err: float = 0.10     # mean fingertip tracking error (m) — GR uses > 0.1 threshold
 
     # Adaptive rollout sampling (GR env style)
     adaptive_sampling: bool = True
@@ -283,7 +300,7 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
 
     # Debug visualization (requires GUI — do not use with --headless)
     debug_vis: bool = True
-    debug_vis_num_envs: int = 4            # show markers for first N environments only
+    debug_vis_num_envs: int = 16            # show markers for first N environments only
 
     # ── WARMUP ────────────────────────────────────────────────────────────────
     # Warm-up mechanism: freeze the target at start_frame and disable early
@@ -295,6 +312,7 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # To restore original behavior (no warm-up logic): set enable_warmup=False
     # and remove the [WARMUP] blocks in robotis_sh5_grasp_env.py.
     # ── END WARMUP ────────────────────────────────────────────────────────────
-    enable_warmup: bool = True
-    warmup_ft_threshold: float = 0.10    # exit warm-up when ft mean err < this (m)
-    warmup_wrist_threshold: float = 0.10  # exit warm-up when wrist err < this (m)
+    enable_warmup: bool = False
+    warmup_ft_threshold: float = 0.10          # exit warm-up when ft mean err < this (m)
+    warmup_wrist_threshold: float = 0.10       # exit warm-up when wrist pos err < this (m)
+    warmup_wrist_rot_threshold: float = 0.75   # exit warm-up when wrist rot err < this (rad)

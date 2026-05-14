@@ -1,16 +1,17 @@
 """Configuration for the OakInk dexterous grasping **pretrain** environment.
 
-Pretrain phase: object is teleported to the reference trajectory every step.
-The policy learns to track hand keypoints (fingertips + wrist) without needing
-to manipulate a real physics object. This mirrors the gr_env_pretrain design.
+Pretrain phase: the object is entirely removed from the physics simulation.
+The policy learns to track hand keypoints (fingertips + wrist) with all object-related
+inputs provided directly from the kinematic reference trajectory. Object tracking rewards
+are excluded. This follows the paper's Section 3.3 progressive training design.
 
 Key differences from the main grasp env:
   - Action space: 28D (no mass dim)
-  - Observation space: 152D (no obj linvel/angvel; wrist rot delta instead of obj rot delta)
+  - Observation space: 189D (same structure as train 190D; prev_action 28 vs 29)
+  - No physics object in scene; object inputs from kinematic reference
   - No state cache, no adaptive sampling
-  - Reward: fingertip + wrist tracking only (no object physics reward)
+  - Reward: fingertip + wrist tracking only (no object position/rotation reward)
   - Termination: fingertip + wrist error only (no object-based termination)
-  - Object has gravity disabled and is teleported each step
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
-from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -37,24 +38,38 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
 
     Robot: FFW-SH5 full-body (fix_root_link=True).
     Policy controls: right-hand fingers (20) + right arm (7) + lift (1) = 28 DOF.
-    Object is teleported to the reference trajectory every physics step (no real physics).
+    Object is entirely removed from the physics simulation; all object-related inputs
+    come directly from the kinematic reference. Object tracking rewards are excluded.
 
-    Observation space (total=152):
-        joint_pos          [28]     controlled joint angles (fingers + arm + lift)
-        joint_vel          [28]     controlled joint velocities
-        fingertip_pos      [5*3]    fingertip positions in world
+    Observation space (total=279, same structure as train env except prev_action 28 vs 29):
+        hand_kpts_pos      [21*3]   all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
+        wrist_quat         [4]      wrist global orientation (wxyz)
+        wrist_linvel       [3]      wrist global linear velocity
+        wrist_angvel       [3]      wrist global angular velocity
         fingertip_vel      [5*3]    fingertip linear velocities
-        ref_obj_pos        [3]      reference object position (env-local)
-        ref_obj_quat       [4]      reference object orientation (wxyz)
-        delta_fingertip    [5*3]    next-frame fingertip error (look-ahead)
-        delta_wrist_pos    [3]      current-frame wrist position error
-        delta_wrist_rot    [3]      current-frame wrist rotation error (axis-angle)
+        joint_pos          [28]     controlled joint angles (normalized)
+        joint_vel          [28]     controlled joint velocities
+        ref_obj_pos        [3]      reference object position (world frame, from kinematic ref)
+        ref_obj_quat       [4]      reference object orientation (wxyz, from kinematic ref)
+        obj_linvel         [3]      zeros (no physics object)
+        obj_angvel         [3]      zeros (no physics object)
+        delta_kpts_world   [21*3]   next-frame delta for all 21 keypoints in world frame
+        delta_ft_obj       [5*3]    next-frame fingertip error in object frame (contact-cond.)
+        delta_obj_pos      [3]      next-frame ref obj position delta (ref traj dynamics)
+        delta_obj_rot      [3]      next-frame ref obj rotation delta
         future_contact     [5]      predicted contact flag per fingertip
         prev_action        [28]     previous action
         fingertip_forces   [5]      normal contact force per fingertip
 
     Action space (28): [fingers(20) | arm_r(7) | lift(1)] delta from default pose.
     """
+
+    # Viewer: same viewpoint as train env — front-right of table, elevated.
+    viewer: ViewerCfg = ViewerCfg(
+        eye=(0.2, 0.15, 2.2),
+        lookat=(-0.2, 0.5, 1.9),
+        resolution=(1280, 720),
+    )
 
     # Simulation
     decimation: int = 4
@@ -64,8 +79,8 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     num_hand_dofs: int = 20
     num_arm_r_dofs: int = 7
     num_lift_dofs: int = 1
-    action_space: int = 28           # no mass dim in pretrain
-    observation_space: int = 152     # 28+28+15+15+3+4+15+3+3+5+28+5
+    action_space: int = 28           # fingers(20) + arm_r(7) + lift(1)
+    observation_space: int = 279     # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+28+5
     state_space: int = 0
 
     # Physics
@@ -110,6 +125,13 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # Wrist link name
     wrist_body_name: str = "hx5_d20_right_base"
 
+    # Canonical reference XY (env-local) for trajectory orientation alignment.
+    # Trajectories are rotated in XY so the reference wrist approaches the object
+    # from the same direction as (canonical_ref_pos_env → object).
+    # None → robot body origin (cfg.robot_cfg.init_state.pos[:2]).
+    # Set to the right-arm shoulder XY so alignment is relative to the arm, not the torso.
+    canonical_ref_pos_env: tuple | None = None  # set to shoulder XY after running env
+
     # Dataset
     oakink_data_dir: str = _OAKINK_DATA_DIR
     object_id: str = "A01001"
@@ -118,7 +140,7 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
 
     # Table
     table_pos_env: tuple = (0.3, 0.0, 0.0)
-    table_size: tuple = (0.8, 0.8, 1.0)
+    table_size: tuple = (0.6, 0.6, 1.0)
 
     # Object physics (pretrain: gravity disabled, object is teleported)
     object_mass: float = 0.2
@@ -129,29 +151,27 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # Contact threshold for future_contact precomputation
     contact_dist_threshold: float = 0.05
 
-    # Action scales
-    action_scale: float = 0.5
-    arm_action_scale: float = 0.5
-    lift_action_scale: float = 0.05
+    # Action: [-1, 1] → full joint range via scale(). EMA smoothing in normalized space.
+    action_smoothing: float = 0.7
 
-    # Action smoothing (EMA)
-    action_smoothing: float = 0.5
-
-    # Reward scales (no object physics rewards in pretrain)
-    rew_alive: float = 0.5
-    rew_fingertip: float = -5.0
+    # Reward scales (GR pretrain: 1.5*alive - clamp(1.76*kpts + 12.5*ft, 1.5) + reg)
+    rew_alive: float = 1.5
+    rew_kpts: float = -1.76           # GR pretrain: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
+    rew_fingertip: float = -12.5
     rew_fingertip_force: float = 0.0
-    rew_wrist: float = -2.0
-    rew_action_reg: float = -0.004
+    rew_action_reg: float = -0.004    # action_penalty_scale in GR
+    rew_pose_reg: float = -0.001      # dof_penalty_scale in GR
+    rew_action_rate: float = -0.01    # penalize rapid action changes to reduce trembling
 
     # Termination (fingertip + wrist only — no object-based termination)
     termination: bool = True
     max_wrist_pos_err: float = 0.15
-    max_ft_mean_err: float = 0.15
+    max_wrist_rot_err: float = 0.75   # GR pretrain: delta_hand_rot_value > 0.75
+    max_ft_mean_err: float = 0.15     # GR uses > 0.1 threshold
 
     # Debug visualization
     debug_vis: bool = True
-    debug_vis_num_envs: int = 4
+    debug_vis_num_envs: int = 16
 
     # ── WARMUP ────────────────────────────────────────────────────────────────
     # Warm-up mechanism: freeze the target at frame 0 and disable early
@@ -162,6 +182,7 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # To restore original behavior (no warm-up logic): set enable_warmup=False
     # and remove the [WARMUP] blocks in robotis_sh5_grasp_pretrain_env.py.
     # ── END WARMUP ────────────────────────────────────────────────────────────
-    enable_warmup: bool = True
-    warmup_ft_threshold: float = 0.10    # exit warm-up when ft mean err < this (m)
-    warmup_wrist_threshold: float = 0.10  # exit warm-up when wrist err < this (m)
+    enable_warmup: bool = False
+    warmup_ft_threshold: float = 0.15          # exit warm-up when ft mean err < this (m)
+    warmup_wrist_threshold: float = 0.15       # exit warm-up when wrist pos err < this (m)
+    warmup_wrist_rot_threshold: float = 0.75   # exit warm-up when wrist rot err < this (rad)

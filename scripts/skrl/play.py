@@ -83,6 +83,78 @@ import skrl
 import torch
 from packaging import version
 
+# ── MassDexMimic helpers ──────────────────────────────────────────────────────
+
+
+def _patch_mass_policy_for_play(agent, policy_cfg: dict) -> None:
+    """Replace the Runner-created policy with MassDexMimicPolicy for evaluation.
+
+    Mirrors _patch_mass_policy() from train.py but skips optimizer / scheduler
+    / record_transition patching — none of those are needed during play.
+
+    Must be called AFTER runner = Runner(env, agent_cfg) and BEFORE checkpoint loading.
+    """
+    from robotis_sh5.tasks.direct.robotis_sh5_grasp.agents.mass_gaussian_model import MassDexMimicPolicy
+
+    device = agent.device
+    model_kwargs = {k: v for k, v in policy_cfg.items() if k not in ("class", "output")}
+
+    new_policy = MassDexMimicPolicy(
+        observation_space=agent.observation_space,
+        action_space=agent.action_space,
+        device=device,
+        **model_kwargs,
+    ).to(device)
+
+    agent.models["policy"] = new_policy
+    agent.policy = new_policy
+    agent.checkpoint_modules["policy"] = new_policy
+
+    print("[mass_policy] Patched policy with MassDexMimicPolicy for evaluation.")
+
+
+def _load_partial_checkpoint(agent, path: str) -> None:
+    """Load a checkpoint with mismatched sizes (e.g. pretrain → train transfer).
+
+    For each parameter in the checkpoint:
+    - Exact shape match → copy as-is.
+    - Checkpoint smaller on every dim → copy into the top-left corner; remainder
+      keeps current (random) initialization.
+    - Otherwise → skip with a warning.
+    """
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    for module_name, module in agent.checkpoint_modules.items():
+        if module_name not in data:
+            continue
+        # Skip optimizers and schedulers — they are not nn.Modules and their
+        # state dicts contain nested dicts, not tensors.
+        if not isinstance(module, torch.nn.Module):
+            continue
+        ckpt_sd = data[module_name]
+        cur_sd = module.state_dict()
+        updated_sd = {}
+        for param_name, cur_tensor in cur_sd.items():
+            if param_name not in ckpt_sd:
+                print(f"[partial load] {module_name}.{param_name}: not in checkpoint, keeping init")
+                updated_sd[param_name] = cur_tensor
+                continue
+            ckpt_tensor = ckpt_sd[param_name]
+            if ckpt_tensor.shape == cur_tensor.shape:
+                updated_sd[param_name] = ckpt_tensor
+            elif all(c <= t for c, t in zip(ckpt_tensor.shape, cur_tensor.shape)):
+                new_tensor = cur_tensor.clone()
+                slices = tuple(slice(0, s) for s in ckpt_tensor.shape)
+                new_tensor[slices] = ckpt_tensor
+                updated_sd[param_name] = new_tensor
+                print(f"[partial load] {module_name}.{param_name}: "
+                      f"{list(ckpt_tensor.shape)} → {list(cur_tensor.shape)} (partial copy)")
+            else:
+                print(f"[partial load] {module_name}.{param_name}: "
+                      f"incompatible {list(ckpt_tensor.shape)} vs {list(cur_tensor.shape)}, skipping")
+                updated_sd[param_name] = cur_tensor
+        module.load_state_dict(updated_sd)
+    print("[partial load] Done.")
+
 # check for minimum supported skrl version
 SKRL_VERSION = "1.4.3"
 if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
@@ -204,8 +276,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
     runner = Runner(env, experiment_cfg)
 
+    # For the grasp train task: replace the Runner-created GaussianMixin with
+    # MassDexMimicPolicy so checkpoint shapes match (paper Section 3.2).
+    _is_grasp_train = (
+        args_cli.task is not None
+        and "Grasp" in args_cli.task
+        and "Pretrain" not in args_cli.task
+    )
+    if _is_grasp_train:
+        _patch_mass_policy_for_play(runner.agent, experiment_cfg["models"]["policy"])
+
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
-    runner.agent.load(resume_path)
+    try:
+        runner.agent.load(resume_path)
+    except (RuntimeError, KeyError, ValueError) as e:
+        err = str(e)
+        if not any(kw in err for kw in (
+            "size mismatch", "Missing key", "unexpected key", "KeyError",
+            "parameter groups",   # optimizer group count mismatch (train 2-group vs play 1-group)
+        )):
+            raise
+        print(f"[INFO] Checkpoint load issue ({err[:120]}); loading model weights only.")
+        _load_partial_checkpoint(runner.agent, resume_path)
+
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")
 
@@ -227,7 +320,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
+            obs, _, terminated, truncated, _ = env.step(actions)
+            # Propagate episode terminations to MassDexMimicPolicy so mass is
+            # re-sampled only at episode boundaries (not every step).
+            _policy = getattr(runner.agent, "policy", None)
+            if _policy is not None and hasattr(_policy, "update_mass_terminated"):
+                _policy.update_mass_terminated(terminated | truncated)
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video

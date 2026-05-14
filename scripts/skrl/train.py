@@ -128,6 +128,160 @@ else:
     algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
 
 
+_MASS_LR_SCALE = 33.333  # mass optimizer group: 33.333× higher LR (matches original rl_games config)
+_ENTROPY_FLIP_SCALE = -0.002  # entropy coef when is_reached_end=True (mirrors GR: -0.002 * sigma_weight)
+
+
+def _patch_mass_policy(agent, policy_cfg: dict, learning_rate: float) -> None:
+    """Replace the Runner-created policy with MassDexMimicPolicy and rebuild the optimizer.
+
+    Must be called AFTER runner = Runner(env, agent_cfg) but BEFORE checkpoint loading.
+    This implements Section 3.2 of MassDexMimic:
+      - mu_mass and log_std_mass as separate learnable scalars
+      - 33.333× higher LR for mass parameters
+      - Per-episode mass cache (fixed within an episode, resampled on termination)
+
+    policy_cfg: the ``models.policy`` dict from agent_cfg (YAML), used to pass network
+    architecture and hyperparameters through to MassDexMimicPolicy.
+    """
+    import itertools
+    import torch
+    from robotis_sh5.tasks.direct.robotis_sh5_grasp.agents.mass_gaussian_model import MassDexMimicPolicy
+
+    old_policy = agent.models["policy"]
+    device = agent.device
+
+    # Forward all YAML policy fields to the constructor; 'class' and 'output' are
+    # handled internally and must be excluded.
+    model_kwargs = {k: v for k, v in policy_cfg.items() if k not in ("class", "output")}
+
+    # Create new policy with mass-specific parameters.
+    new_policy = MassDexMimicPolicy(
+        observation_space=agent.observation_space,
+        action_space=agent.action_space,
+        device=device,
+        **model_kwargs,
+    ).to(device)
+
+    # Transfer overlapping weights from Runner-created policy to new policy.
+    old_sd = old_policy.state_dict()
+    new_sd = new_policy.state_dict()
+    merged = {}
+    for k, v in new_sd.items():
+        if k in old_sd and old_sd[k].shape == v.shape:
+            merged[k] = old_sd[k]
+        else:
+            merged[k] = v  # keep default init (e.g., mu_mass=-0.25, log_std_mass=-1.25)
+    new_policy.load_state_dict(merged)
+
+    # Replace policy in agent.
+    agent.models["policy"] = new_policy
+    agent.policy = new_policy
+    agent.checkpoint_modules["policy"] = new_policy
+
+    # Rebuild optimizer with separate parameter groups.
+    value = agent.models.get("value")
+    mass_params = list(new_policy.mass_params())
+    base_params = list(itertools.chain(
+        new_policy.non_mass_params(),
+        value.parameters() if value is not None else [],
+    ))
+    agent.optimizer = torch.optim.Adam(
+        [
+            {"params": base_params, "lr": learning_rate},
+            {"params": mass_params, "lr": learning_rate * _MASS_LR_SCALE},
+        ],
+        eps=1e-8,
+    )
+    agent.checkpoint_modules["optimizer"] = agent.optimizer
+
+    # Rebuild LR scheduler if configured.
+    if agent._learning_rate_scheduler is not None:
+        agent.scheduler = agent._learning_rate_scheduler(
+            agent.optimizer, **agent.cfg["learning_rate_scheduler_kwargs"]
+        )
+
+    # Monkey-patch record_transition to propagate terminated signal to the mass cache.
+    _orig_record = agent.record_transition
+
+    def _record_with_mass(states, actions, rewards, next_states, terminated, truncated,
+                          infos, timestep, timesteps):
+        done = (terminated | truncated).squeeze(-1)
+        new_policy.update_mass_terminated(done)
+        _orig_record(states, actions, rewards, next_states, terminated, truncated,
+                     infos, timestep, timesteps)
+
+    agent.record_transition = _record_with_mass
+
+    print(f"[mass_policy] Patched policy with MassDexMimicPolicy "
+          f"(base_lr={learning_rate:.2e}, mass_lr={learning_rate * _MASS_LR_SCALE:.4f})")
+
+
+def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
+    """Flip entropy coefficient sign when is_reached_end (mirrors GR a2c_continuous.py sigma_weight logic).
+
+    GR formula: entropy_weight = entropy_coef * (1 - sigma_weight) - 0.002 * sigma_weight
+      sigma_weight = float(is_reached_end)
+      → is_reached_end=False: entropy_weight = +entropy_coef  (maximize entropy, std grows)
+      → is_reached_end=True:  entropy_weight = -0.002         (minimize entropy, std shrinks)
+
+    skrl uses the same sign convention: loss += -entropy_loss_scale * entropy
+    so setting _entropy_loss_scale to negative has the identical effect.
+    """
+    _orig_update = agent._update
+
+    def _update_with_entropy_flip(timestep: int, timesteps: int) -> None:
+        actual_env = env_wrapper.unwrapped
+        sigma_weight = float(actual_env.is_reached_end)
+        agent._entropy_loss_scale = (
+            base_entropy_scale * (1.0 - sigma_weight) + _ENTROPY_FLIP_SCALE * sigma_weight
+        )
+        _orig_update(timestep, timesteps)
+
+    agent._update = _update_with_entropy_flip
+    print(f"[entropy_flip] Patched _update: base={base_entropy_scale}, flip={_ENTROPY_FLIP_SCALE}")
+
+
+def _load_partial_checkpoint(agent, path: str) -> None:
+    """Load a checkpoint with mismatched input/output sizes (pretrain → train transfer).
+
+    For each parameter in the checkpoint:
+    - If shapes match exactly: copy as-is.
+    - If checkpoint is smaller on every dim: copy into the top-left corner of the
+      current parameter; the remainder keeps its current (random) initialization.
+    - Otherwise: skip with a warning.
+    """
+    import torch
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    # skrl stores model state dicts nested under module names
+    for module_name, module in agent.models.items():
+        key = module_name  # e.g. "policy", "value"
+        if key not in data:
+            continue
+        ckpt_sd = data[key]
+        cur_sd = module.state_dict()
+        updated_sd = {}
+        for param_name, cur_tensor in cur_sd.items():
+            if param_name not in ckpt_sd:
+                print(f"[partial load] {key}.{param_name}: not in checkpoint, keeping random init")
+                updated_sd[param_name] = cur_tensor
+                continue
+            ckpt_tensor = ckpt_sd[param_name]
+            if ckpt_tensor.shape == cur_tensor.shape:
+                updated_sd[param_name] = ckpt_tensor
+            elif all(c <= t for c, t in zip(ckpt_tensor.shape, cur_tensor.shape)):
+                new_tensor = cur_tensor.clone()
+                slices = tuple(slice(0, s) for s in ckpt_tensor.shape)
+                new_tensor[slices] = ckpt_tensor
+                updated_sd[param_name] = new_tensor
+                print(f"[partial load] {key}.{param_name}: {list(ckpt_tensor.shape)} → {list(cur_tensor.shape)} (partial copy)")
+            else:
+                print(f"[partial load] {key}.{param_name}: shape incompatible {list(ckpt_tensor.shape)} vs {list(cur_tensor.shape)}, skipping")
+                updated_sd[param_name] = cur_tensor
+        module.load_state_dict(updated_sd)
+    print("[partial load] Done.")
+
+
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with skrl agent."""
@@ -225,10 +379,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
     runner = Runner(env, agent_cfg)
 
+    # For the grasp train task: replace policy with mass-as-an-action model (Section 3.2).
+    _is_grasp_train = "Grasp" in (args_cli.task or "") and "Pretrain" not in (args_cli.task or "")
+    if _is_grasp_train:
+        _patch_mass_policy(runner.agent, agent_cfg["models"]["policy"], agent_cfg["agent"]["learning_rate"])
+        _patch_entropy_flip(runner.agent, env, agent_cfg["agent"]["entropy_loss_scale"])
+
     # load checkpoint (if specified)
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
-        runner.agent.load(resume_path)
+        try:
+            runner.agent.load(resume_path)
+        except RuntimeError as e:
+            err = str(e)
+            if not any(kw in err for kw in ("size mismatch", "Missing key", "unexpected key")):
+                raise
+            print(f"[INFO] Checkpoint mismatch ({err[:80]}...); attempting partial weight loading.")
+            _load_partial_checkpoint(runner.agent, resume_path)
     
     #####################
     # Custom callback to log success rate from environment's extras during training
