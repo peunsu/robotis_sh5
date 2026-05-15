@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Isaac Lab extension for the FFW-SH5 (Fully Functional Wheeled - Super Hand 5) robotic platform. Implements RL-based manipulation tasks with hand pose retargeting from the DexYCB dataset using the MANO hand model.
+Isaac Lab extension for the FFW-SH5 robotic platform implementing RL-based dexterous grasping.
+The primary task (`Robotis-Sh5-Grasp-Direct-v0`) trains a policy to retarget human hand motion
+from the OakInk or HO-Cap dataset onto the robot's right hand and arm.
 
 ## Commands
 
@@ -18,42 +20,60 @@ python -m pip install -e source/robotis_sh5
 python scripts/list_envs.py
 ```
 
-**Test environments with dummy agents:**
+**Test with dummy agents (sanity-check obs/reward shapes before training):**
 ```bash
-python scripts/zero_agent.py --task=<TASK_NAME>
-python scripts/random_agent.py --task=<TASK_NAME>
+python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
+python scripts/random_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
 ```
 
-**Train with RL frameworks:**
+**Train (SKRL is primary framework):**
 ```bash
-python scripts/rsl_rl/train.py --task=<TASK_NAME> --num_envs=4096
-python scripts/rl_games/train.py --task=<TASK_NAME>
-python scripts/skrl/train.py --task=<TASK_NAME>
-python scripts/sb3/train.py --task=<TASK_NAME>
+python scripts/skrl/train.py --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048
+python scripts/skrl/train.py --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048 --headless \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0 \
+    --timesteps 10000 --checkpoint <PRETRAIN_CKPT>
 ```
 
-**Play/inference:**
+**Rollout / evaluation:**
 ```bash
-python scripts/rsl_rl/play.py --task=<TASK_NAME> --checkpoint=<CHECKPOINT_PATH>
+python scripts/skrl/rollout.py \
+    --task Robotis-Sh5-Grasp-Direct-v0 \
+    --checkpoint <CKPT> --output_dir <DIR> --n_rollouts 32 --headless \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+```
+
+**Full benchmark pipeline (train all sequences then evaluate):**
+```bash
+bash scripts/benchmark/train_sequences.sh       # set DATASET, SEQUENCES at top of file
+FORCE=1 bash scripts/benchmark/train_sequences.sh
+bash scripts/benchmark/evaluate_sequences.sh
+bash scripts/benchmark/evaluate.bash source/robotis_sh5/data/processed/oakink
+```
+
+**Dataset preprocessing:**
+```bash
+python scripts/process_dataset/oakink.py
+python scripts/process_dataset/hocap.py
+isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py   # requires Isaac Lab env
+python scripts/process_dataset/compute_frame0_ik.py --dataset oakink  # or hocap
 ```
 
 **Code formatting:**
 ```bash
-pip install pre-commit
 pre-commit run --all-files
 ```
 
 ## Registered Environments
 
-**Direct RL tasks** (`source/robotis_sh5/robotis_sh5/tasks/direct/`):
-- `Template-Robotis-Sh5-Direct-v0` — single-agent direct RL template
-- `Template-Robotis-Sh5-Marl-Direct-v0` — multi-agent variant
-- `Robotis-Sh5-Grasp-Direct-v0` — grasp task (in development)
-
-**Manager-based tasks** (`source/robotis_sh5/robotis_sh5/tasks/manager_based/`):
-- `Robotis-SH5-Pick-and-Place-v0` — primary dexterous manipulation task
-- `Robotis-SH5-Reach-v0` — bimanual reaching
-- `Robotis-SH5-Navigation-v0` — wheeled base navigation
+| Task ID | Description |
+|---|---|
+| `Robotis-Sh5-Grasp-Direct-v0` | Full grasping task: 29D action (fingers+arm+lift+mass), 280D obs |
+| `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | Pretraining without physics object: 28D action, 189D obs |
+| `Template-Robotis-Sh5-Direct-v0` | Single-agent direct RL template |
+| `Template-Robotis-Sh5-Marl-Direct-v0` | Multi-agent variant |
+| `Robotis-SH5-Pick-and-Place-v0` | Manager-based dexterous manipulation |
 
 ## Architecture
 
@@ -61,97 +81,134 @@ pre-commit run --all-files
 
 ```
 source/robotis_sh5/robotis_sh5/
-├── tasks/
-│   ├── direct/          # DirectRLEnv subclasses
-│   └── manager_based/   # ManagerBasedRLEnv with modular managers
-├── assets/              # Python robot asset configs
+├── tasks/direct/robotis_sh5_grasp/   ← primary task (see below)
+├── tasks/direct/robotis_sh5*/        ← template tasks
+├── tasks/manager_based/              ← pick-and-place, reach, navigation
 └── data/
-    ├── robots/FFW/      # USD robot models (FFW_SH5*.usd)
-    ├── object/          # YCB object meshes with textures
-    └── raw/, processed/ # Dataset storage
+    ├── robots/FFW/                   ← USD robot models
+    └── processed/{oakink,hocap}/     ← SPIDER-format trajectories + assets
 
-retargeting/             # MANO hand pose retargeting pipeline
-scripts/                 # Training/evaluation entry points per RL framework
+scripts/
+├── skrl/train.py                     ← primary training entry point
+├── skrl/rollout.py                   ← evaluation / metrics generation
+├── benchmark/train_sequences.sh      ← per-sequence pipeline (IK → pretrain → train)
+├── benchmark/evaluate_sequences.sh   ← per-sequence rollout + aggregation
+├── benchmark/evaluate.bash           ← CSV aggregation only
+└── process_dataset/                  ← data conversion scripts
 ```
 
-### Two Environment Paradigms
+### Grasp Task: Two-Phase Training
 
-**Direct RL** (`direct/*/`): Each task subclasses `DirectRLEnv`. The env file contains the full `_pre_physics_step`, `_apply_action`, `_get_observations`, `_get_rewards`, `_get_dones`, `_reset_idx` logic. Config is a `*EnvCfg` dataclass. Use for custom reward/obs pipelines that don't fit manager decomposition.
+**Phase 1 — Pretrain** (`Robotis-Sh5-Grasp-Pretrain-Direct-v0`):
+No physics object in the scene. Policy learns hand/wrist keypoint tracking purely from kinematic
+reference data. Saves `pretrain.pt` under `data/processed/<dataset>/ffw_sh5/right/<task>/<id>/`.
 
-**Manager-Based** (`manager_based/*/`): Uses Isaac Lab's modular manager system. The entry point is always `isaaclab.envs:ManagerBasedRLEnv`. Config hierarchy:
-- `SceneCfg` — robot, objects, sensors with prim paths and actuator groups
-- `CommandsCfg` — command generators (e.g., `UniformPoseCommandCfg` for EE targets)
-- `ActionsCfg` — action terms (e.g., `JointPositionActionCfg`, custom `JointPositionLowPassAction`)
-- `ObservationsCfg` — groups of `ObservationTermCfg` entries that concatenate into policy input
-- `EventCfg` — reset and domain randomization events
-- `RewardsCfg` — weighted sum of `RewardTermCfg` entries
-- `TerminationsCfg` — done conditions
-- `CurriculumCfg` — curriculum schedule via direct config address modification
+**Phase 2 — Train** (`Robotis-Sh5-Grasp-Direct-v0`):
+Full grasping with a physics object. Loads `pretrain.pt` via `--checkpoint`. Saves `agent.pt`
+and `task_info.json` to the same directory.
 
-### Manager-Based MDP Module Structure
+### Grasp Environment Internals (`robotis_sh5_grasp_env.py`)
 
-Each manager-based task has an `mdp/` package with these modules (all exported via `__init__.py` alongside `from isaaclab.envs.mdp import *`):
-- `actions.py` — custom action classes (e.g., low-pass filtered joint position)
-- `commands.py` — custom command generators
-- `observations.py` — custom observation functions; may include visualization helpers
-- `rewards.py` — reward functions keyed by `(env, ...)` signature
-- `terminations.py` — done condition functions
-- `events.py` — reset/randomization event functions
-- `curriculum.py` — curriculum schedule functions (e.g., `fade_in_reward_weight`)
-- `utils.py` — shared helpers (e.g., `get_virtual_link_poses`, `compute_hand_pos_error`)
+`RobotisSh5GraspEnv.__init__` call order:
+1. `_load_reference_trajectories(cfg)` — loads `trajectory_keypoints.npz`, computes normalization
+   (table placement, XY canonicalization toward robot approach direction), pads to max length
+2. `_apply_object_mass_from_json(cfg)` — overrides `cfg.object_mass_min/max` from
+   `data/processed/<dataset>/object_mass.json` if the object ID is present
+3. `_build_object_cfg(cfg)` — resolves dataset-aware USD path:
+   `data/processed/<dataset>/assets/objects/<object_id>/visual.usd`
+4. `super().__init__()` — Isaac Lab scene setup
+5. `_post_init_buffers()` — allocates GPU tensors for state cache, adaptive sampling weights, EMA
 
-### Key Config Conventions
+Key design patterns:
+- **Mass-as-action** (MassDexMimic): action dim 29 = 28 joints + 1 mass. The mass dim maps
+  `[-1,1] → [object_mass_min, object_mass_max]` and is applied at episode reset.
+- **Adaptive rollout sampling**: failure-weighted start-frame sampling; EMA tracks per-frame
+  failure counts; `adaptive_alpha=0.001`, `adaptive_uniform_ratio=0.1`.
+- **Frame-0 arm IK**: precomputed wrist pose for frame 0 is loaded from
+  `frame0_arm_joint_pos.npy` in each trajectory directory (generated by `compute_frame0_ik.py`).
+- **EMA action smoothing**: `action_smoothing=0.7` by default.
 
-**`@configclass` and `__post_init__`**: All configs use `@configclass` (Isaac Lab's dataclass wrapper). Dynamic setup (e.g., filling `MISSING` body names from the robot model, enabling/disabling observation normalization) goes in `__post_init__()`.
+### train.py Patches (applied after runner construction)
 
-**`MISSING` fields**: Fields that depend on runtime context (e.g., EE body name) are set to `MISSING` in the base class and filled in `__post_init__()`.
+Two monkey-patches are applied for the grasp train task only:
 
-**Curriculum via config address**: Curriculum terms use `mdp.modify_env_param` with a dot-separated `address` string pointing into the live config (e.g., `"reward_manager.cfg.action_rate.weight"`).
+**`_patch_mass_policy`**: Replaces the skrl Gaussian policy with `MassGaussianModel`
+(`agents/mass_gaussian_model.py`), which uses a separate head with a lower initial mean for the
+mass dimension.
 
-**Actuator groups use regex**: Joint names in `ImplicitActuatorCfg` use regex expressions like `["arm_l_joint[1-7]", "arm_r_joint[1-7]"]`.
+**`_patch_entropy_flip`** (GR-faithful entropy scheduling):
+- Adds `sigma_grad_flg` tensor to skrl rollout memory.
+- Patches `record_transition` to write `is_reached_end` (whether the episode reached end-of-trajectory)
+  into `sigma_grad_flg` at each rollout step.
+- Replaces `agent._update` entirely with a custom function that reads `sampled_sigma[0].item()`
+  per mini-batch and applies:
+  `entropy_scale = base_entropy_coef * (1 - sw) - 0.002 * sw`
 
-**`SceneEntityCfg` for asset selection**: Observation and reward functions receive an `asset_cfg: SceneEntityCfg("robot", joint_names=[...])` parameter that selects specific joints from the scene.
+### PPO Hyperparameters (skrl_ppo_cfg.yaml)
 
-### Environment Registration
+| Parameter | Value | Note |
+|---|---|---|
+| `rollouts` | 8 | horizon length (= 1 PPO update per 8 timesteps) |
+| `learning_epochs` | 5 | passes over the rollout buffer per update |
+| `mini_batches` | 4 | buffer of 8×num_envs samples split into 4 |
+| `discount_factor` | 0.96 | |
+| `learning_rate` | 3e-4 | KLAdaptiveLR scheduler, kl_threshold=0.016 |
+| `entropy_loss_scale` | 0.004 | base value; modified per mini-batch by `_patch_entropy_flip` |
 
-Each task's `__init__.py` calls `gym.register()` with:
-- `env_cfg_entry_point` → config class
-- `rsl_rl_cfg_entry_point` → `agents/rsl_rl_ppo_cfg.py:PPORunnerCfg`
-- `rl_games_cfg_entry_point` → `agents/rl_games_ppo_cfg.yaml`
-- `skrl_cfg_entry_point` → `agents/skrl_ppo_cfg.yaml`
-- `sb3_cfg_entry_point` → `agents/sb3_ppo_cfg.yaml`
+Epoch relationship: `10000 timesteps / 8 rollouts = 1250 PPO updates`.
+
+### Data Directory Layout
+
+```
+data/processed/<dataset>/              # oakink or hocap
+├── object_mass.json                   # {object_id: [min_kg, max_kg]}
+├── mano/right/<task>/<id>/
+│   ├── trajectory_keypoints.npz       # wrist, fingertip, obj poses + mano keypoints
+│   └── frame0_arm_joint_pos.npy       # precomputed IK for arm init
+└── ffw_sh5/right/<task>/<id>/
+    ├── pretrain.pt
+    ├── agent.pt
+    ├── task_info.json                  # training metadata (checkpoint path, timesteps, seed, …)
+    └── evaluation_ep_le_<N>/metrics.csv
+```
 
 ### Robot Platform: FFW-SH5
 
-**Joint groups and DOF:**
-- Base: 6 swerve joints (`*_wheel_drive`, `*_wheel_steer` for left/right/rear)
-- Lift: 1 DOF
-- Arms: 7×2 = 14 DOF (`arm_l/r_joint[1-7]`), actuated by DY_80/DY_70/DP-42 motors
-- Hands: 20×2 = 40 DOF (`finger_l/r_joint[1-20]`), low stiffness (2.0), low effort (1kN)
-- Head: 2 DOF
+USD variants (in `data/robots/FFW/`):
+- `FFW_SH5_simplified_dex.usd` — used for grasp tasks (enhanced hand collision)
+- `FFW_SH5_simplified.usd` — standard training
+- `FFW_SH5.usd` — full fidelity
 
-**USD model variants:**
-- `FFW_SH5.usd` — full fidelity (evaluation/visualization)
-- `FFW_SH5_simplified.usd` — lighter collision geometry (standard training)
-- `FFW_SH5_simplified_dex.usd` — enhanced hand model for dexterous manipulation tasks
+Joint groups:
+- Base: 6 swerve (`*_wheel_drive/steer`)
+- Lift: 1 (`lift_joint`)
+- Arms: 7×2 (`arm_l/r_joint[1-7]`), actuated by DY_80/DY_70/DP-42
+- Hands: 20×2 (`finger_l/r_joint[1-20]`), stiffness=20, damping=0.5
 
-### Hand Retargeting Pipeline
+The grasp task fixes the robot base (`fix_root_link=True`) and controls only the right side:
+20 fingers + 7 arm_r + 1 lift.
 
-`retargeting/` processes DexYCB dataset recordings into robot-ready `.npy` trajectories:
-- `dataset.py` — `DexYCBVideoDataset`; defines `YCB_CLASSES` and 21-point MANO joint layout
-- `mano_single_object.py` — `WorldTrajectoryGenerator`: loads subject/object data, applies MANO to get hand geometry, transforms camera→world coordinates, detects motion onset, saves per-frame `joints_world`, `wrist_pos/quat_world`, `obj_pos/quat_world`
-- `mano_trajectories/` — pre-computed `.npy` files organized by YCB object ID
-- `manopth/` — PyTorch MANO layer implementation
+## Key Config Fields (`RobotisSh5GraspEnvCfg`)
+
+Fields most likely to need adjustment:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `dataset` | `"oakink"` | `"oakink"` or `"hocap"` |
+| `object_id` | `"C11001"` | must have a converted USD under `assets/objects/` |
+| `trajectory_task` | `"C11001-0001-0007"` | mano/right subdirectory name |
+| `trajectory_data_id` | `0` | sub-index within trajectory_task |
+| `object_mass_json` | oakink path | override to point at a different JSON |
+| `object_mass_min/max` | 0.04 / 0.10 | overridden from JSON at init if available |
+| `action_smoothing` | `0.7` | EMA coefficient for action smoothing |
+| `adaptive_sampling` | `True` | failure-weighted start-frame resampling |
+| `termination` | `True` | set False during warm-up / pretrain |
+| `debug_vis` | `False` | enables fingertip/wrist marker visualization |
 
 ## Code Style
 
-- **Ruff** for linting/formatting: line-length 120, Python 3.10 target
-- **Pyright** in basic mode for type checking
-- Import order: `omniverse-extensions` → `isaaclab` → `isaaclab-*` → first-party
+- **Ruff**: line-length 120, Python 3.10 target
+- **Pyright** in basic mode
+- Import order: omniverse-extensions → isaaclab → isaaclab-* → first-party
 - `__init__.py` files may have unused imports (F401 ignored)
-
-## Key Simulation Parameters
-
-- Physics timestep: `dt = 1/120s`
-- Default parallel envs: 4096 (GPU-accelerated)
-- Robot models: `FFW_SH5_simplified.usd` for training, `FFW_SH5.usd` for full fidelity
+- Physics timestep: `dt = 1/120s`, control at 30 Hz (`decimation=4`)

@@ -136,17 +136,21 @@ Some examples of packages that can likely be excluded are:
 
 ---
 
-## Robotis-Sh5-Grasp: OakInk Dexterous Grasping
+## Robotis-Sh5-Grasp: Dexterous Grasping
 
 ### Overview
 
 `Robotis-Sh5-Grasp-Direct-v0` is a dexterous grasping environment for the FFW-SH5 full-body robot.
-The policy controls 20 right-hand finger joints while the arm is held at a fixed pre-grasp pose.
-Reference trajectories come from the [OakInk-Image](https://oakink.net/) dataset (SPIDER format).
+The policy controls 28 joints (20 right-hand fingers + 7 right arm + 1 lift) and outputs one additional
+mass parameter (MassDexMimic), totalling a **29-dimensional action space**.
+Reference trajectories come from the [OakInk-Image](https://oakink.net/) dataset or the
+[HO-Cap](https://github.com/NVlabs/HO-Cap) dataset, both stored in SPIDER format.
 
 ### Data Preparation
 
-#### 1. Download OakInk-Image dataset
+#### OakInk dataset
+
+##### 1. Download OakInk-Image dataset
 
 Place the raw dataset at:
 
@@ -154,7 +158,7 @@ Place the raw dataset at:
 source/robotis_sh5/data/raw/oakink/image/
 ```
 
-#### 2. Process OakInk → SPIDER format
+##### 2. Process OakInk → SPIDER format
 
 ```bash
 python scripts/process_dataset/oakink.py
@@ -164,7 +168,7 @@ Output:
 - `data/processed/oakink/mano/right/{task}/{data_id}/trajectory_keypoints.npz` — reference trajectories
 - `data/processed/oakink/assets/objects/{obj_id}/visual.obj` — centered object meshes
 
-#### 3. Convert object meshes to USD
+##### 3. Convert object meshes to USD
 
 Must be run inside the Isaac Lab Python environment:
 
@@ -184,23 +188,60 @@ isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --mass 0.15 --fr
 
 Converted USD files are written to `data/processed/oakink/assets/objects/{obj_id}/visual.usd`.
 
-#### 4. Estimate per-object mass (optional, requires `pip install anthropic`)
+##### 4. Per-object mass ranges
 
-Uses the Claude Vision API to estimate a plausible mass range for each object from its RGB images.
-Run this once; the resulting JSON is automatically loaded at training time.
+A pre-built mass table is provided at:
+
+```
+data/processed/oakink/object_mass.json
+```
+
+Format: `{"A01001": [min_kg, max_kg], ...}`
+
+This file is loaded automatically at training time to set `object_mass_min` / `object_mass_max`
+per object. If an object is missing from the JSON or has `null` values, the default
+`[0.05, 0.20] kg` is used as fallback.
+
+To regenerate the table using the Claude Vision API (requires `pip install anthropic`):
 
 ```bash
-# Estimate mass for all 99 objects (skips already-processed entries)
+# Estimate mass for all objects (skips already-processed entries)
 python scripts/process_dataset/estimate_object_mass.py --resume
 
 # Force re-estimation of all objects
 python scripts/process_dataset/estimate_object_mass.py
 ```
 
-Output: `data/processed/oakink/object_mass.json` — format `{"A01001": [min_kg, max_kg], ...}`
+#### HO-Cap dataset
 
-If the JSON is missing or an object is not found in it, the defaults in `RobotisSh5GraspEnvCfg`
-(`object_mass_min=0.04`, `object_mass_max=0.10`) are used as fallback.
+##### 1. Download HO-Cap dataset
+
+Place the raw dataset at:
+
+```
+source/robotis_sh5/data/raw/hocap/
+```
+
+##### 2. Process HO-Cap → SPIDER format
+
+```bash
+python scripts/process_dataset/hocap.py
+```
+
+Output mirrors the OakInk layout under `data/processed/hocap/`.
+
+##### 3. Convert object meshes to USD
+
+```bash
+isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py
+```
+
+Place or symlink the HO-Cap object meshes under `data/processed/hocap/assets/objects/` first.
+
+##### 4. Per-object mass ranges
+
+Place a mass table at `data/processed/hocap/object_mass.json` (same format as OakInk).
+If absent, the default `[0.05, 0.20] kg` is used for all HO-Cap objects.
 
 ### Running the Environment
 
@@ -242,7 +283,9 @@ python scripts/skrl/play.py --task=Robotis-Sh5-Grasp-Direct-v0 --checkpoint=<CHE
 
 ### Benchmark: Multi-sequence Training & Evaluation
 
-Scripts under `scripts/benchmark/` provide an end-to-end pipeline for training one checkpoint per sequence and evaluating with standardised metrics (E_t, E_r, E_j, E_ft) compatible with the [ManipTrans / DexMachina evaluation protocol](https://github.com).
+Scripts under `scripts/benchmark/` provide an end-to-end pipeline for training one checkpoint per sequence
+and evaluating with standardised metrics (E_t, E_r, E_j, E_ft) compatible with the
+[ManipTrans / DexMachina evaluation protocol](https://github.com).
 
 #### Directory layout produced
 
@@ -252,9 +295,11 @@ The `ffw_sh5/` tree mirrors the `mano/` tree exactly.
 ```
 source/robotis_sh5/data/processed/<dataset>/   # e.g. oakink/ or hocap/
 ├── mano/right/<trajectory_task>/<data_id>/    ← reference trajectories (source)
+├── object_mass.json                           ← per-object mass ranges
 ├── ffw_sh5/right/<trajectory_task>/<data_id>/
 │   ├── pretrain.pt              ← saved after pretrain
 │   ├── agent.pt                 ← saved after train
+│   ├── task_info.json           ← training metadata (checkpoint path, timesteps, seed, …)
 │   └── evaluation_ep_le_<N>/
 │       └── metrics.csv          ← 32 rollout rows per sequence
 ├── ffw_sh5_method1.csv          ← ManipTrans aggregate (all 4 metrics)
@@ -262,20 +307,38 @@ source/robotis_sh5/data/processed/<dataset>/   # e.g. oakink/ or hocap/
 └── ffw_sh5_method3.csv          ← Mean over all rollouts
 ```
 
+`task_info.json` is written automatically after each training run and records:
+
+| Field | Description |
+|---|---|
+| `task` | Isaac Lab task name |
+| `dataset` | `"oakink"` or `"hocap"` |
+| `object_id` | Object identifier |
+| `trajectory_task` | Trajectory directory name |
+| `trajectory_data_id` | Sub-index within the trajectory directory |
+| `num_envs` | Number of parallel environments |
+| `timesteps` | Total training timesteps |
+| `seed` | Random seed |
+| `checkpoint` | Absolute path to the resume checkpoint (pretrain.pt for train step) |
+| `log_dir` | skrl experiment log directory |
+| `skrl_version` | skrl library version |
+| `training_time_s` | Wall-clock training time in seconds |
+| `trained_at` | ISO-8601 timestamp |
+
 #### Step 1 — Configure sequences
 
-Edit the `SEQUENCES` array at the top of each script.
+Edit the `SEQUENCES` array and `DATASET` variable at the top of each script.
 Each entry matches the corresponding `mano/right/` folder name: `{OBJECT_ID}-{SEQ}-{GESTURE}`.
 
 ```bash
 # scripts/benchmark/train_sequences.sh  (and evaluate_sequences.sh)
+DATASET="oakink"   # change to "hocap" for HO-Cap sequences
+
 SEQUENCES=(
     "C11001-0001-0007"   # → object_id=C11001, task=C11001-0001-0007
     "A01001-0001-0000"   # → object_id=A01001, task=A01001-0001-0000
 )
 ```
-
-For a new dataset, add the corresponding `data_dir` field to `RobotisSh5GraspEnvCfg` and update the env's data-loading dispatch.
 
 #### Step 2 — Train (dataset → IK → pretrain → train)
 
@@ -292,7 +355,7 @@ FORCE=1 bash scripts/benchmark/train_sequences.sh
 | Step | Action | Skip condition |
 |---|---|---|
 | 1. Data check | Verify `mano/right/<task>/` exists | Error if missing |
-| 2. Frame-0 arm IK | `scripts/process_dataset/compute_frame0_ik.py` | `frame0_arm_joint_pos.npy` exists |
+| 2. Frame-0 arm IK | `scripts/process_dataset/compute_frame0_ik.py --dataset <DATASET>` | `frame0_arm_joint_pos.npy` exists |
 | 3. Pretrain | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | `pretrain.pt` exists |
 | 4. Train | `Robotis-Sh5-Grasp-Direct-v0` | `agent.pt` exists |
 
@@ -300,14 +363,16 @@ Key settings at the top of the script:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `DATASET` | `oakink` | Dataset to use (`oakink` or `hocap`) |
 | `TASK_PRETRAIN` | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | Pretrain task name |
 | `TASK` | `Robotis-Sh5-Grasp-Direct-v0` | Train task name |
 | `PRETRAIN_NUM_ENVS` | `4096` | Parallel environments for pretrain |
 | `NUM_ENVS` | `2048` | Parallel environments for train |
-| `PRETRAIN_TIMESTEPS` | `3000` | Pretrain env steps |
-| `TIMESTEPS` | `10000` | Train env steps |
+| `PRETRAIN_TIMESTEPS` | `3000` | Pretrain env steps (≈ 375 PPO updates) |
+| `TIMESTEPS` | `10000` | Train env steps (≈ 1250 PPO updates) |
 
-Checkpoints are saved to `source/robotis_sh5/data/processed/<dataset>/ffw_sh5/right/<trajectory_task>/<data_id>/`.
+Checkpoints and `task_info.json` are saved to
+`source/robotis_sh5/data/processed/<dataset>/ffw_sh5/right/<trajectory_task>/<data_id>/`.
 
 You can also run individual steps manually for a single sequence:
 
@@ -318,7 +383,7 @@ python scripts/process_dataset/oakink.py \
 
 # Step 2: frame-0 arm IK
 python scripts/process_dataset/compute_frame0_ik.py \
-    --task C11001-0001-0007 --data_id 0
+    --dataset oakink --task C11001-0001-0007 --data_id 0
 
 # Step 3: pretrain
 python scripts/skrl/train.py \
@@ -350,6 +415,7 @@ Key settings at the top of `evaluate_sequences.sh`:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `DATASET` | `oakink` | Dataset to use (`oakink` or `hocap`) |
 | `N_ROLLOUTS` | `32` | Parallel rollout episodes per sequence |
 | `TIMESTEPS` | `10000` | Used only for output directory naming (must match training) |
 
@@ -410,30 +476,44 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
 
 | Item | Value |
 |---|---|
-| Action space | 20 (right finger joint deltas) |
-| Observation space | 134 |
+| Action space | 29 (fingers 20 + arm_r 7 + lift 1 + mass 1) |
+| Observation space | 280 |
 | Control frequency | 30 Hz (decimation=4 @ 120 Hz physics) |
-| Episode length | 5 s |
+| Episode length | matched to trajectory length |
 | Default num_envs | 2048 |
-| Default object | `A01001` |
+| Default object | `C11001` |
+| Supported datasets | `oakink`, `hocap` |
 
-**Observation breakdown (134-dim):**
+**Action breakdown (29-dim):**
 
 | Group | Dim | Description |
 |---|---|---|
-| `joint_pos` | 20 | Right finger joint angles |
-| `joint_vel` | 20 | Right finger joint velocities |
-| `fingertip_pos` | 15 | Fingertip world positions (5×3) |
+| `fingers` | 20 | Right finger joint position deltas (`finger_r_joint1-20`) |
+| `arm_r` | 7 | Right arm joint position deltas (`arm_r_joint1-7`) |
+| `lift` | 1 | Lift joint position delta |
+| `mass` | 1 | Normalised object mass parameter in `[-1, 1]` → `[mass_min, mass_max]` |
+
+**Observation breakdown (280-dim):**
+
+| Group | Dim | Description |
+|---|---|---|
+| `hand_kpts_pos` | 63 | All 21 MANO keypoints in world frame (21×3) |
+| `wrist_quat` | 4 | Wrist global orientation (wxyz) |
+| `wrist_linvel` | 3 | Wrist global linear velocity |
+| `wrist_angvel` | 3 | Wrist global angular velocity |
 | `fingertip_vel` | 15 | Fingertip linear velocities (5×3) |
+| `joint_pos` | 28 | Controlled joint angles (normalised) |
+| `joint_vel` | 28 | Controlled joint velocities |
 | `obj_pos` | 3 | Object position |
 | `obj_quat` | 4 | Object orientation (wxyz) |
 | `obj_linvel` | 3 | Object linear velocity |
 | `obj_angvel` | 3 | Object angular velocity |
-| `delta_fingertip` | 15 | Fingertip − ref_fingertip (object frame) |
-| `delta_obj_pos` | 3 | obj_pos − ref_obj_pos |
-| `delta_obj_rot` | 3 | Rotation error (axis-angle) |
+| `delta_kpts_world` | 63 | Next-frame delta for all 21 keypoints in world frame |
+| `delta_ft_obj` | 15 | Next-frame fingertip error in object frame |
+| `delta_obj_pos` | 3 | Next-frame object position error |
+| `delta_obj_rot` | 3 | Next-frame rotation error (axis-angle) |
 | `future_contact` | 5 | Predicted contact flag per fingertip |
-| `prev_action` | 20 | Previous action |
+| `prev_action` | 29 | Previous action (28 joints + 1 mass) |
 | `fingertip_forces` | 5 | Normal contact force per fingertip |
 
 ---

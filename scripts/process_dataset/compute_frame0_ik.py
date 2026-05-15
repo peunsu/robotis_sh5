@@ -16,7 +16,8 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Precompute arm IK for trajectory frame 0.")
-parser.add_argument("--object_id", type=str, default="", help="OakInk object ID to process (empty = all objects).")
+parser.add_argument("--dataset", type=str, default="oakink", choices=["oakink", "hocap"], help="Dataset to process.")
+parser.add_argument("--object_id", type=str, default="", help="Object ID to process (empty = all objects).")
 parser.add_argument("--task", type=str, default="", help="Specific task directory (empty = all tasks).")
 parser.add_argument("--data_id", type=int, default=-1, help="Specific data ID (-1 = all).")
 parser.add_argument("--num_iter", type=int, default=300, help="IK iteration count.")
@@ -45,6 +46,7 @@ from robotis_sh5.tasks.direct.robotis_sh5_grasp.robotis_sh5_grasp_env_cfg import
 
 _DATA_DIR = _SCRIPT_DIR / "source" / "robotis_sh5" / "data"
 _OAKINK_DIR = _DATA_DIR / "processed" / "oakink"
+_HOCAP_DIR = _DATA_DIR / "processed" / "hocap"
 
 # Must match RobotisSh5GraspPretrainEnvCfg defaults
 _TABLE_POS = (0.3, 0.0, 0.0)
@@ -56,7 +58,7 @@ _ROBOT_POS = (0.65, 0.55, 0.0)
 # Canonicalization helpers (mirrors _load_reference_trajectories logic)
 # ---------------------------------------------------------------------------
 
-def _canonicalize_frame0(traj_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+def _canonicalize_frame0(traj_path: Path, dataset_dir: Path) -> tuple[np.ndarray, np.ndarray] | None:
     """Return canonicalized frame-0 wrist (pos, quat-wxyz) in env-local coords."""
     data = np.load(str(traj_path))
     wp = data["qpos_wrist_right"][:, :3].astype(np.float32)
@@ -65,7 +67,7 @@ def _canonicalize_frame0(traj_path: Path) -> tuple[np.ndarray, np.ndarray] | Non
 
     # Infer object_id from directory structure: .../mano/right/<task>/<id>/...
     object_id = traj_path.parent.parent.name.split("-")[0]
-    mesh_path = _OAKINK_DIR / "assets" / "objects" / object_id / "visual.obj"
+    mesh_path = dataset_dir / "assets" / "objects" / object_id / "visual.obj"
     if mesh_path.exists():
         mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
         mesh_z_min = float(mesh.vertices[:, 2].min())
@@ -216,7 +218,8 @@ def main():
     ik_ctrl = DifferentialIKController(ik_cfg, num_envs=1, device=device)
 
     # Collect trajectory paths
-    mano_dir = _OAKINK_DIR / "mano" / "right"
+    _dataset_dir = _HOCAP_DIR if args_cli.dataset == "hocap" else _OAKINK_DIR
+    mano_dir = _dataset_dir / "mano" / "right"
     if args_cli.task:
         task_dirs = [mano_dir / args_cli.task]
     else:
@@ -239,11 +242,11 @@ def main():
 
             out_path = data_dir / "frame0_arm_joint_pos.npy"
             if out_path.exists() and not args_cli.overwrite:
-                print(f"[skip] {out_path.relative_to(_OAKINK_DIR)} already exists")
+                print(f"[skip] {out_path.relative_to(_dataset_dir)} already exists")
                 skipped += 1
                 continue
 
-            result = _canonicalize_frame0(traj_path)
+            result = _canonicalize_frame0(traj_path, _dataset_dir)
             if result is None:
                 errors += 1
                 continue

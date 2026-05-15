@@ -350,7 +350,12 @@ class RobotisSh5GraspEnv(DirectRLEnv):
     @staticmethod
     def _apply_object_mass_from_json(cfg: RobotisSh5GraspEnvCfg) -> None:
         """Override cfg.object_mass_min/max from the per-object mass JSON if available."""
+        # Resolve dataset-aware path: prefer cfg.object_mass_json if it points to an existing file,
+        # otherwise fall back to <dataset_data_dir>/object_mass.json.
+        _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
         json_path = Path(cfg.object_mass_json)
+        if not json_path.exists():
+            json_path = _data_root / "object_mass.json"
         if not json_path.exists():
             return
         try:
@@ -375,10 +380,8 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         cfg.object_mass_max = hi
 
     def _build_object_cfg(self, cfg: RobotisSh5GraspEnvCfg) -> RigidObjectCfg:
-        usd_path = (
-            Path(cfg.oakink_data_dir)
-            / "assets" / "objects" / cfg.object_id / "visual.usd"
-        )
+        _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
+        usd_path = _data_root / "assets" / "objects" / cfg.object_id / "visual.usd"
         if not usd_path.exists():
             raise FileNotFoundError(
                 f"Object USD not found: {usd_path}\n"
