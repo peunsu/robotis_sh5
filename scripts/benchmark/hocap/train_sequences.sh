@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# train_sequences.sh — Full pipeline: dataset → IK → pretrain → train.
+# train_sequences_hocap.sh — Full pipeline for HO-Cap: dataset → IK → pretrain
+# → train.
 #
-# For each sequence this script:
-#   1. Processes the raw OakInk sequence into SPIDER format (skipped if done).
+# For each HO-Cap sequence this script:
+#   1. Checks the processed mano data is present (skipped if done).
 #   2. Computes frame-0 arm IK (skipped if done).
 #   3. Pretrains for PRETRAIN_TIMESTEPS steps; saves pretrain.pt.
 #   4. Trains for TIMESTEPS steps starting from pretrain.pt; saves agent.pt.
 #
+# HO-Cap key format differs from OakInk:
+#   OakInk : {OBJECT_ID}-{SEQ}-{GESTURE}              e.g. A01005-0001-0000
+#   HO-Cap : subject_{N}-{DATE_TIME}-{G_OBJECT_ID}    e.g. subject_1-20231025_170231-G10_1
+#
 # Checkpoints are written alongside evaluation results:
-#   data/processed/<dataset>/ffw_sh5/<object_id>/<trajectory_task>/<data_id>/
+#   data/processed/hocap/ffw_sh5/right/<trajectory_task>/<data_id>/
 #       pretrain.pt   ← after pretrain
 #       agent.pt      ← after train
 #
@@ -21,80 +26,54 @@ set -euo pipefail
 
 TASK_PRETRAIN="Robotis-Sh5-Grasp-Pretrain-Direct-v0"
 TASK="Robotis-Sh5-Grasp-Direct-v0"
-DATASET="oakink"
+DATASET="hocap"
 PRETRAIN_NUM_ENVS=4096
 NUM_ENVS=2048
-PRETRAIN_TIMESTEPS=3000
-TIMESTEPS=10000
+PRETRAIN_TIMESTEPS=10000
+TIMESTEPS=40000
 
-# Sequence keys — format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
+# Sequence keys — format matches mano/right folder names: subject_{N}-{DATE_TIME}-{G_OBJECT_ID}
 SEQUENCES=(
-    "A01005-0001-0000"
-    "A01005-0001-0001"
-    "A01006-0001-0000"
-    "A01026-0001-0000"
-    "A01026-0001-0001"
-    "A02012-0001-0004"
-    "A02014-0001-0005"
-    "A02021-0001-0005"
-    "A02028-0001-0005"
-    "A02031-0001-0005"
-    "A15015-0001-0007"
-    "A15015-0001-0008"
-    "A15027-0001-0007"
-    "A16013-0001-0006"
-    "A16026-0001-0005"
-    "C11001-0001-0007"
-    "C13001-0001-0005"
-    "C20001-0001-0009"
-    "C22001-0001-0010"
-    "C25001-0001-0009"
-    "C35001-0001-0000"
-    "C50001-0001-0000"
-    "C91001-0001-0002"
-    "O01000-0001-0001"
-    "O02001-0001-0005"
-    "O03001-0001-0007"
-    "O03003-0001-0007"
-    "O03003-0001-0008"
-    "O21001-0001-0010"
-    "O24001-0001-0010"
-    "O36002-0001-0002"
-    "O50002-0001-0001"
-    "O93001-0001-0000"
-    "S10002-0001-0000"
-    "S10002-0001-0002"
-    "S10003-0001-0001"
-    "S10007-0001-0001"
-    "S10008-0001-0003"
-    "S10011-0001-0003"
-    "S10012-0001-0003"
-    "S10014-0001-0001"
-    "S10015-0001-0001"
-    "S10016-0001-0002"
-    "S10019-0001-0001"
-    "S10019-0001-0002"
-    "S10019-0001-0003"
-    "S10021-0001-0000"
-    "S10023-0001-0001"
-    "S10024-0001-0001"
-    "S10024-0001-0003"
-    "S15004-0001-0008"
-    "S16001-0001-0005"
-    "S16005-0001-0002"
-    "S20005-0001-0010"
-    "S20021-0001-0010"
-    "S20022-0001-0010"
-    "Y03006-0001-0007"
-    "Y03021-0001-0000"
-    "Y27035-0001-0000"
-    "Y35037-0001-0002"
+    "subject_1-20231025_170231-G10_1"
+    "subject_1-20231025_170231-G10_2"
+    "subject_1-20231025_170231-G10_3"
+    "subject_1-20231025_170231-G10_4"
+    "subject_2-20231022_201556-G05_1"
+    "subject_2-20231022_201556-G05_2"
+    "subject_2-20231022_203100-G09_2"
+    "subject_2-20231022_203100-G09_4"
+    "subject_2-20231023_164242-G19_1"
+    "subject_2-20231023_164242-G19_2"
+    "subject_2-20231023_164242-G19_4"
+    "subject_2-20231023_164741-G22_2"
+    "subject_2-20231023_164741-G22_3"
+    "subject_2-20231023_164741-G22_4"
+    "subject_3-20231024_154810-G09_1"
+    "subject_3-20231024_154810-G09_2"
+    "subject_3-20231024_154810-G09_4"
+    "subject_4-20231026_162248-G11_1"
+    "subject_4-20231026_162248-G11_2"
+    "subject_4-20231026_164958-G21_1"
+    "subject_4-20231026_164958-G21_3"
+    "subject_4-20231026_164958-G21_4"
+    "subject_6-20231025_111357-G06_1"
+    "subject_6-20231025_111357-G06_2"
+    "subject_6-20231025_111357-G06_3"
+    "subject_6-20231025_111357-G06_4"
+    "subject_6-20231025_112332-G09_1"
+    "subject_6-20231025_112332-G09_2"
+    "subject_6-20231025_112332-G09_3"
+    "subject_6-20231025_112332-G09_4"
+    "subject_9-20231027_125019-G16_1"
+    "subject_9-20231027_125019-G16_2"
+    "subject_9-20231027_125019-G16_3"
+    "subject_9-20231027_125019-G16_4"
 )
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/${DATASET}"
 CHECKPOINT_BASE="${DATA_BASE}/ffw_sh5/right"
 LOG_PRETRAIN="${PROJECT_DIR}/logs/skrl/robotis_sh5_grasp_pretrain"
@@ -103,14 +82,14 @@ LOG_BASE="${PROJECT_DIR}/logs/skrl/robotis_sh5_grasp"
 FORCE="${FORCE:-0}"
 
 # ── Parse sequence key → (object_id, trajectory_task, data_id) ───────────────
-# Key format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
-# Example: A01005-0001-0000  →  object_id=A01005, trajectory_task=A01005-0001-0000
+# HO-Cap key format: subject_{N}-{DATE_TIME}-{G_OBJECT_ID}
+# Example: subject_1-20231025_170231-G10_1  →  object_id=G10_1
 parse_seq() {
     local key="$1"
     IFS='-' read -ra parts <<< "${key}"
-    OBJECT_ID="${parts[0]}"
-    SEQ="${parts[1]}"
-    GESTURE="${parts[2]}"
+    SUBJECT="${parts[0]}"
+    DATETIME="${parts[1]}"
+    OBJECT_ID="${parts[2]}"
     TRAJECTORY_TASK="${key}"
     DATA_ID="0"
 }
@@ -149,7 +128,7 @@ for key in "${SEQUENCES[@]}"; do
     echo "[train] Step 1/4 — Dataset check: ${TRAJECTORY_TASK}"
     MANO_DIR="${DATA_BASE}/mano/right/${TRAJECTORY_TASK}"
     if [[ ! -d "${MANO_DIR}" ]]; then
-        echo "[train] ERROR: Mano data not found — run oakink.py or hocap.py first."
+        echo "[train] ERROR: Mano data not found — run hocap.py first."
         echo "        Expected: ${MANO_DIR}"
         continue
     fi

@@ -46,9 +46,16 @@ python scripts/skrl/rollout.py \
 
 **Full benchmark pipeline (train all sequences then evaluate):**
 ```bash
-bash scripts/benchmark/train_sequences.sh       # set DATASET, SEQUENCES at top of file
-FORCE=1 bash scripts/benchmark/train_sequences.sh
-bash scripts/benchmark/evaluate_sequences.sh
+# OakInk
+bash scripts/benchmark/oakink/train_sequences.sh
+FORCE=1 bash scripts/benchmark/oakink/train_sequences.sh
+bash scripts/benchmark/oakink/evaluate_sequences.sh
+
+# HO-Cap
+bash scripts/benchmark/hocap/train_sequences.sh
+bash scripts/benchmark/hocap/evaluate_sequences.sh
+
+# Standalone aggregator (dataset-agnostic)
 bash scripts/benchmark/evaluate.bash source/robotis_sh5/data/processed/oakink
 ```
 
@@ -56,7 +63,7 @@ bash scripts/benchmark/evaluate.bash source/robotis_sh5/data/processed/oakink
 ```bash
 python scripts/process_dataset/oakink.py
 python scripts/process_dataset/hocap.py
-isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py   # requires Isaac Lab env
+isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap]   # requires Isaac Lab env
 python scripts/process_dataset/compute_frame0_ik.py --dataset oakink  # or hocap
 ```
 
@@ -91,9 +98,9 @@ source/robotis_sh5/robotis_sh5/
 scripts/
 ├── skrl/train.py                     ← primary training entry point
 ├── skrl/rollout.py                   ← evaluation / metrics generation
-├── benchmark/train_sequences.sh      ← per-sequence pipeline (IK → pretrain → train)
-├── benchmark/evaluate_sequences.sh   ← per-sequence rollout + aggregation
-├── benchmark/evaluate.bash           ← CSV aggregation only
+├── benchmark/{oakink,hocap}/train_sequences.sh     ← per-sequence pipeline (IK → pretrain → train)
+├── benchmark/{oakink,hocap}/evaluate_sequences.sh  ← per-sequence rollout + aggregation
+├── benchmark/evaluate.bash                          ← CSV aggregation only (dataset-agnostic)
 └── process_dataset/                  ← data conversion scripts
 ```
 

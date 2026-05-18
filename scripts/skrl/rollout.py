@@ -33,6 +33,11 @@ parser.add_argument("--max_steps", type=int, default=5000, help="Hard cap on sim
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--deterministic", action="store_true", default=False,
                     help="Use policy mean actions (no sampling noise).")
+# Video recording
+parser.add_argument("--video", action="store_true", default=False,
+                    help="Record a video of the rollout into <output_dir>/videos/.")
+parser.add_argument("--video_length", type=int, default=200,
+                    help="Length of the recorded video (in steps).")
 # Dataset / sequence overrides
 parser.add_argument("--dataset", type=str, default=None)
 parser.add_argument("--object_id", type=str, default=None)
@@ -45,6 +50,9 @@ parser.add_argument(
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+# always enable cameras to record video
+if args_cli.video:
+    args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -134,6 +142,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.adaptive_sampling = False   # always start at frame 0
     env_cfg.enable_warmup = False
     env_cfg.debug_vis = False
+    # Disable early termination so each rollout runs the full trajectory.
+    # Paper E_t/E_r/E_j/E_ft are averaged over T (trajectory length); terminating
+    # at frame 1-2 would average over near-zero initial errors and report
+    # artificially small values.
+    env_cfg.termination = False
 
     # Dataset / sequence overrides
     if args_cli.dataset is not None:
@@ -147,9 +160,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     agent_cfg["seed"] = args_cli.seed
     agent_cfg["trainer"]["close_environment_at_exit"] = False
+    # Disable skrl's experiment logging — rollout only writes metrics.csv to --output_dir
+    # (without this, a `./robotis_sh5_grasp/default/` folder with TensorBoard events
+    # is created in the CWD every run; mirrors play.py).
+    agent_cfg["agent"]["experiment"]["write_interval"] = 0
+    agent_cfg["agent"]["experiment"]["checkpoint_interval"] = 0
 
     # ── Create env & runner ───────────────────────────────────────────────────
-    env = gym.make(args_cli.task, cfg=env_cfg)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # wrap for video recording (before skrl wrapper so RecordVideo sees raw gym API)
+    if args_cli.video:
+        video_folder = os.path.join(args_cli.output_dir, "videos")
+        os.makedirs(video_folder, exist_ok=True)
+        video_kwargs = {
+            "video_folder": video_folder,
+            "step_trigger": lambda step: step == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print(f"[rollout] Recording video to {video_folder} (length={args_cli.video_length}).")
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
     env = SkrlVecEnvWrapper(env, ml_framework="torch")
 
     runner = Runner(env, agent_cfg)
@@ -171,10 +203,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # ── Rollout loop ──────────────────────────────────────────────────────────
     # Per-env accumulators: list-of-lists; indexed by env index.
-    wrist_pos_bufs  = [[] for _ in range(n)]   # m  → E_t
-    wrist_rot_bufs  = [[] for _ in range(n)]   # rad → E_r (converted to deg at save)
-    kpts_bufs       = [[] for _ in range(n)]   # m  → E_j
-    ft_bufs         = [[] for _ in range(n)]   # m  → E_ft
+    # Paper definitions (ManipTrans):
+    #   E_t  = object translation error  (cm)
+    #   E_r  = object rotation error     (deg)
+    #   E_j  = ||j_robot - j_human_ref|| over 21 MANO keypoints  (cm)
+    #   E_ft = ||t_robot - t_human_ref|| over 5 fingertips       (cm)
+    obj_pos_bufs    = [[] for _ in range(n)]   # m   → E_t
+    obj_rot_bufs    = [[] for _ in range(n)]   # rad → E_r (converted to deg at save)
+    kpts_bufs       = [[] for _ in range(n)]   # m   → E_j (raw ref, no drift compensation)
+    ft_bufs         = [[] for _ in range(n)]   # m   → E_ft (raw ref, no contact adjustment)
     reward_sums     = [0.0] * n
     episode_done    = torch.zeros(n, dtype=torch.bool)  # CPU — tracks first-episode completion
 
@@ -202,10 +239,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Accumulate per-step errors for envs still in their first episode.
         for i in range(n):
             if not episode_done[i]:
-                wrist_pos_bufs[i].append(actual_env._last_wrist_err[i].item())
-                wrist_rot_bufs[i].append(actual_env._last_wrist_rot_err[i].item())
-                kpts_bufs[i].append(actual_env._last_kpts_err[i].item())
-                ft_bufs[i].append(actual_env._last_ft_mean_err[i].item())
+                obj_pos_bufs[i].append(actual_env._last_obj_pos_err[i].item())
+                obj_rot_bufs[i].append(actual_env._last_obj_rot_err[i].item())
+                kpts_bufs[i].append(actual_env._last_kpts_err_raw[i].item())
+                ft_bufs[i].append(actual_env._last_ft_raw_err[i].item())
                 r = rewards[i] if rewards.ndim == 1 else rewards[i, 0]
                 reward_sums[i] += float(r)
 
@@ -232,17 +269,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ])
 
         for i in range(n):
-            if not wrist_pos_bufs[i]:
+            if not obj_pos_bufs[i]:
                 # Env never contributed steps — write a failed row.
                 writer.writerow(["eval", seq_name, n_frames, ref_start,
                                  0, 0, 0, 0, 0, "999.0", "999.0", "999.0", "999.0", "0.0"])
                 continue
 
             # Convert accumulated per-step values to per-episode mean metrics.
-            e_t_cm  = float(sum(wrist_pos_bufs[i]) / len(wrist_pos_bufs[i])) * 100.0
-            e_r     = math.degrees(float(sum(wrist_rot_bufs[i]) / len(wrist_rot_bufs[i])))
-            e_j_cm  = float(sum(kpts_bufs[i])       / len(kpts_bufs[i]))       * 100.0
-            e_ft_cm = float(sum(ft_bufs[i])          / len(ft_bufs[i]))         * 100.0
+            e_t_cm  = float(sum(obj_pos_bufs[i]) / len(obj_pos_bufs[i])) * 100.0
+            e_r     = math.degrees(float(sum(obj_rot_bufs[i]) / len(obj_rot_bufs[i])))
+            e_j_cm  = float(sum(kpts_bufs[i])    / len(kpts_bufs[i]))    * 100.0
+            e_ft_cm = float(sum(ft_bufs[i])      / len(ft_bufs[i]))      * 100.0
 
             s_t   = int(e_t_cm  < _M1_ET)
             s_r   = int(e_r     < _M1_ER)

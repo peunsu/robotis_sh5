@@ -94,7 +94,7 @@ SEQUENCES=(
 # ── Path setup ────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/${DATASET}"
 CHECKPOINT_BASE="${DATA_BASE}/ffw_sh5/right"
 
@@ -162,7 +162,7 @@ done
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[eval] Aggregating metrics for dataset '${DATASET}' ..."
-bash "${SCRIPT_DIR}/evaluate.bash" "${DATA_BASE}"
+bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -385,7 +385,8 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         if not usd_path.exists():
             raise FileNotFoundError(
                 f"Object USD not found: {usd_path}\n"
-                "Run: python scripts/process_dataset/convert_oakink_to_usd.py"
+                f"Run: isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py "
+                f"--dataset {cfg.dataset} --object-id {cfg.object_id}"
             )
         return RigidObjectCfg(
             prim_path="/World/envs/env_.*/Object",
@@ -602,7 +603,10 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._last_wrist_err = torch.zeros(B, device=self.device)
         self._last_wrist_rot_err = torch.zeros(B, device=self.device)
         self._last_obj_pos_err = torch.zeros(B, device=self.device)
-        self._last_kpts_err = torch.zeros(B, device=self.device)  # unweighted mean over all 21 keypoints (m); for evaluation E_j metric
+        self._last_obj_rot_err = torch.zeros(B, device=self.device)  # rad; for evaluation E_r metric
+        self._last_kpts_err = torch.zeros(B, device=self.device)  # drift-compensated; used for warmup/termination
+        self._last_kpts_err_raw = torch.zeros(B, device=self.device)  # raw ref vs robot kpts (m); for evaluation E_j metric
+        self._last_ft_raw_err = torch.zeros(B, device=self.device)  # raw ref vs robot fingertips (m); for evaluation E_ft metric
 
     def _resolve_fingertip_ids(self) -> torch.Tensor:
         ids = []
@@ -966,7 +970,8 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         delta_obj_pos_w[:, 2] *= 1.5
         obj_pos_err_w = torch.norm(delta_obj_pos_w, dim=-1)  # Z-weighted — reward
         q_err = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))
-        obj_rot_err = 2.0 * torch.acos(q_err[:, 0].clamp(-1.0, 1.0))
+        # Use |w| for shortest-angle (quaternion double-cover: q and -q are same rotation).
+        obj_rot_err = 2.0 * torch.acos(q_err[:, 0].abs().clamp(max=1.0))
 
         # All 21 MANO keypoints (wrist + MCP/PIP/DIP + fingertips).
         B = self.num_envs
@@ -990,7 +995,11 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         delta_kpts_w = delta_kpts.clone()
         delta_kpts_w[:, :, 2] *= 1.5
         kpts_err_w = torch.norm(delta_kpts_w, dim=-1).mean(dim=-1)        # (B,)
-        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1) # (B,) unweighted; stored for E_j evaluation metric
+        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1) # (B,) drift-compensated; used for warmup/termination
+
+        # Raw E_j metric (paper definition): ||j_d - j_h|| against human ref kpts in world frame, no drift compensation.
+        ref_kpts_world_raw = ref_kpts_local + env_orig.unsqueeze(1)       # (B, 21, 3)
+        self._last_kpts_err_raw = torch.norm(hand_kpts_pos - ref_kpts_world_raw, dim=-1).mean(dim=-1)  # (B,)
 
         # Wrist error from keypoint 0 (unweighted, for termination check).
         wrist_err = torch.norm(delta_kpts[:, 0, :], dim=-1)               # (B,)
@@ -1030,6 +1039,9 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         ft_err_per_finger = torch.norm(ft_pos - ft_target, dim=-1)        # (B, 5)
         ft_err = ft_err_per_finger.mean(dim=-1)                            # (B,)
 
+        # Raw E_ft metric (paper definition): ||t_d - t_h|| against human ref fingertips, no drift/contact adjustment.
+        self._last_ft_raw_err = torch.norm(ft_pos - ref_ft, dim=-1).mean(dim=-1)  # (B,)
+
         # Contact force reward (mirrors GR train env).
         raw_forces = self._get_fingertip_forces()                              # (B, 5)
         contact_condition = (ft_err_per_finger < 0.03).float()                # (B, 5)
@@ -1063,6 +1075,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._last_wrist_err = wrist_err
         self._last_wrist_rot_err = wrist_rot_err
         self._last_obj_pos_err = obj_pos_err
+        self._last_obj_rot_err = obj_rot_err
 
         alive = (~early_terminate).float()
 

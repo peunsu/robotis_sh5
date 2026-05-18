@@ -1,21 +1,22 @@
-"""Convert OakInk centered object meshes (.obj) to USD for Isaac Sim.
+"""Convert centered object meshes (.obj) to USD for Isaac Sim.
 
 Must be run inside the Isaac Lab Python environment:
-    isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py [--object-id A01001]
+    isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap] [--object-id G10_1]
 
-Reads : data/processed/oakink/assets/objects/{obj_id}/visual.obj
-Writes: data/processed/oakink/assets/objects/{obj_id}/visual.usd
+Reads : data/processed/{dataset}/assets/objects/{obj_id}/visual.obj
+Writes: data/processed/{dataset}/assets/objects/{obj_id}/visual.usd
 """
 
 import argparse
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "source" / "robotis_sh5" / "data"
-ASSETS_DIR = DATA_DIR / "processed" / "oakink" / "assets" / "objects"
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="oakink", choices=["oakink", "hocap"],
+                        help="Dataset directory under data/processed/.")
     parser.add_argument("--object-id", type=str, default="", help="Single object ID to convert.")
     parser.add_argument("--mass", type=float, default=0.2, help="Object mass in kg.")
     parser.add_argument("--friction", type=float, default=0.8, help="Friction coefficient.")
@@ -23,15 +24,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def convert_object(obj_id: str, mass: float, friction: float) -> bool:
+def convert_object(assets_dir: Path, obj_id: str, mass: float, friction: float) -> bool:
     # Isaac Sim modules imported here — after SimulationApp is running
     import isaaclab.sim as sim_utils
     from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
     from isaaclab.sim.schemas import schemas_cfg
     from pxr import Usd, UsdPhysics, UsdShade
 
-    obj_path = ASSETS_DIR / obj_id / "visual.obj"
-    usd_path = ASSETS_DIR / obj_id / "visual.usd"
+    obj_path = assets_dir / obj_id / "visual.obj"
+    usd_path = assets_dir / obj_id / "visual.usd"
 
     if not obj_path.exists():
         print(f"[error] OBJ not found: {obj_path}")
@@ -103,17 +104,23 @@ def main():
 
     # --- all Isaac Sim imports happen after this point ---
 
+    assets_dir = DATA_DIR / "processed" / args.dataset / "assets" / "objects"
+    if not assets_dir.exists():
+        raise FileNotFoundError(f"Assets directory not found: {assets_dir}")
+
     if args.overwrite:
-        for usd in ASSETS_DIR.glob("*/visual.usd"):
+        for usd in assets_dir.glob("*/visual.usd"):
             usd.unlink()
 
     obj_ids = [args.object_id] if args.object_id else [
-        p.name for p in sorted(ASSETS_DIR.iterdir()) if p.is_dir()
+        p.name for p in sorted(assets_dir.iterdir()) if p.is_dir()
     ]
+
+    print(f"[dataset={args.dataset}] {len(obj_ids)} object(s) to convert under {assets_dir}")
 
     n_ok, n_fail = 0, 0
     for obj_id in obj_ids:
-        ok = convert_object(obj_id, mass=args.mass, friction=args.friction)
+        ok = convert_object(assets_dir, obj_id, mass=args.mass, friction=args.friction)
         if ok:
             n_ok += 1
         else:

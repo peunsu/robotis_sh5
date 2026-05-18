@@ -173,17 +173,17 @@ Output:
 Must be run inside the Isaac Lab Python environment:
 
 ```bash
-# Convert a single object
-isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --object-id A01001
+# Convert a single object (default --dataset oakink)
+isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --object-id A01001
 
 # Convert all objects
-isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py
+isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py
 
 # Re-convert (overwrite existing USD)
-isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --overwrite
+isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --overwrite
 
 # Custom mass / friction
-isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py --mass 0.15 --friction 0.9
+isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --mass 0.15 --friction 0.9
 ```
 
 Converted USD files are written to `data/processed/oakink/assets/objects/{obj_id}/visual.usd`.
@@ -233,7 +233,7 @@ Output mirrors the OakInk layout under `data/processed/hocap/`.
 ##### 3. Convert object meshes to USD
 
 ```bash
-isaaclab.sh -p scripts/process_dataset/convert_oakink_to_usd.py
+isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --dataset hocap
 ```
 
 Place or symlink the HO-Cap object meshes under `data/processed/hocap/assets/objects/` first.

@@ -411,10 +411,20 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
     print(f"[entropy_flip] GR-faithful: base={base_entropy_scale}, flip={_ENTROPY_FLIP_SCALE}")
 
 
+# Parameter names to keep at their YAML-initialized values when loading a pretrain
+# checkpoint into the train policy (mirrors TJ/rl_games tools/reset_epoch.py, which
+# pops `a2c_network.sigma` so train starts with fresh exploration noise).
+# `log_std_mass` and `mu_mass` are absent from the pretrain ckpt, so they are
+# already freshly initialized via the "not in checkpoint" branch below.
+_PRETRAIN_LOAD_SKIP_KEYS = {"log_std_parameter"}
+
+
 def _load_partial_checkpoint(agent, path: str) -> None:
     """Load a checkpoint with mismatched input/output sizes (pretrain → train transfer).
 
     For each parameter in the checkpoint:
+    - If the param name is in _PRETRAIN_LOAD_SKIP_KEYS: keep YAML-initialized value
+      (TJ-style σ reset).
     - If shapes match exactly: copy as-is.
     - If checkpoint is smaller on every dim: copy into the top-left corner of the
       current parameter; the remainder keeps its current (random) initialization.
@@ -431,6 +441,10 @@ def _load_partial_checkpoint(agent, path: str) -> None:
         cur_sd = module.state_dict()
         updated_sd = {}
         for param_name, cur_tensor in cur_sd.items():
+            if param_name in _PRETRAIN_LOAD_SKIP_KEYS:
+                print(f"[partial load] {key}.{param_name}: SKIPPED — keeping YAML-initialized value (σ reset)")
+                updated_sd[param_name] = cur_tensor
+                continue
             if param_name not in ckpt_sd:
                 print(f"[partial load] {key}.{param_name}: not in checkpoint, keeping random init")
                 updated_sd[param_name] = cur_tensor
@@ -566,14 +580,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load checkpoint (if specified)
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
-        try:
-            runner.agent.load(resume_path)
-        except RuntimeError as e:
-            err = str(e)
-            if not any(kw in err for kw in ("size mismatch", "Missing key", "unexpected key")):
-                raise
-            print(f"[INFO] Checkpoint mismatch ({err[:80]}...); attempting partial weight loading.")
+        if _is_grasp_train:
+            # Pretrain → train transfer (and any train→train resume): always use partial
+            # loading so we can deterministically (1) skip `log_std_parameter` to reset σ
+            # to the YAML initial value, and (2) leave the optimizer untouched. Combined
+            # with the fresh optimizer rebuilt by `_patch_mass_policy`, this mirrors TJ's
+            # tools/reset_epoch.py — fresh σ + cleared optimizer state + lr back to YAML.
             _load_partial_checkpoint(runner.agent, resume_path)
+        else:
+            try:
+                runner.agent.load(resume_path)
+            except RuntimeError as e:
+                err = str(e)
+                if not any(kw in err for kw in ("size mismatch", "Missing key", "unexpected key")):
+                    raise
+                print(f"[INFO] Checkpoint mismatch ({err[:80]}...); attempting partial weight loading.")
+                _load_partial_checkpoint(runner.agent, resume_path)
     
     #####################
     # Custom callback to log success rate from environment's extras during training
