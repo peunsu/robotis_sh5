@@ -22,73 +22,54 @@ set -euo pipefail
 TASK_PRETRAIN="Robotis-Sh5-Grasp-Pretrain-Direct-v0"
 TASK="Robotis-Sh5-Grasp-Direct-v0"
 DATASET="oakink"
-PRETRAIN_NUM_ENVS=4096
-NUM_ENVS=2048
+PRETRAIN_NUM_ENVS="${PRETRAIN_NUM_ENVS:-4096}"
+NUM_ENVS="${NUM_ENVS:-2048}"
 PRETRAIN_TIMESTEPS=3000
 TIMESTEPS=10000
 
+# Set VIDEO=1 to record training mp4 every VIDEO_INTERVAL steps into
+# logs/skrl/<task>/<run>/videos/train/. Reduce {PRETRAIN_,}NUM_ENVS to fit GPU
+# memory when enabling video (camera rendering adds significant VRAM overhead).
+VIDEO="${VIDEO:-0}"
+VIDEO_LENGTH="${VIDEO_LENGTH:-200}"
+VIDEO_INTERVAL="${VIDEO_INTERVAL:-1000}"
+
 # Sequence keys — format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
 SEQUENCES=(
-    "A01005-0001-0000"
-    "A01005-0001-0001"
-    "A01006-0001-0000"
-    "A01026-0001-0000"
-    "A01026-0001-0001"
-    "A02012-0001-0004"
     "A02014-0001-0005"
     "A02021-0001-0005"
     "A02028-0001-0005"
-    "A02031-0001-0005"
-    "A15015-0001-0007"
     "A15015-0001-0008"
-    "A15027-0001-0007"
-    "A16013-0001-0006"
-    "A16026-0001-0005"
-    "C11001-0001-0007"
     "C13001-0001-0005"
     "C20001-0001-0009"
-    "C22001-0001-0010"
-    "C25001-0001-0009"
-    "C35001-0001-0000"
-    "C50001-0001-0000"
-    "C91001-0001-0002"
-    "O01000-0001-0001"
-    "O02001-0001-0005"
-    "O03001-0001-0007"
-    "O03003-0001-0007"
-    "O03003-0001-0008"
-    "O21001-0001-0010"
-    "O24001-0001-0010"
-    "O36002-0001-0002"
     "O50002-0001-0001"
-    "O93001-0001-0000"
-    "S10002-0001-0000"
     "S10002-0001-0002"
-    "S10003-0001-0001"
-    "S10007-0001-0001"
-    "S10008-0001-0003"
-    "S10011-0001-0003"
-    "S10012-0001-0003"
-    "S10014-0001-0001"
-    "S10015-0001-0001"
-    "S10016-0001-0002"
-    "S10019-0001-0001"
-    "S10019-0001-0002"
-    "S10019-0001-0003"
-    "S10021-0001-0000"
-    "S10023-0001-0001"
-    "S10024-0001-0001"
-    "S10024-0001-0003"
-    "S15004-0001-0008"
-    "S16001-0001-0005"
-    "S16005-0001-0002"
-    "S20005-0001-0010"
-    "S20021-0001-0010"
-    "S20022-0001-0010"
-    "Y03006-0001-0007"
-    "Y03021-0001-0000"
     "Y27035-0001-0000"
-    "Y35037-0001-0002"
+    "A01026-0001-0000"
+    "A02012-0001-0004"
+    "S10015-0001-0001"
+    "A02031-0001-0005"
+    "C22001-0001-0010"
+    "S10007-0001-0001"
+    "C50001-0001-0000"
+    "O03001-0001-0007"
+    "A01026-0001-0001"
+    "O03003-0001-0008"
+    "A15027-0001-0007"
+    "S10023-0001-0001"
+    "C11001-0001-0007"
+    "O01000-0001-0001"
+    "O36002-0001-0002"
+    "A01005-0001-0001"
+    "A15015-0001-0007"
+    "S10012-0001-0003"
+    "A16026-0001-0005"
+    "S10003-0001-0001"
+    "S10019-0001-0001"
+    "S10011-0001-0003"
+    "O24001-0001-0010"
+    "O02001-0001-0005"
+    "S15004-0001-0008"
 )
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -163,6 +144,12 @@ for key in "${SEQUENCES[@]}"; do
         --task    "${TRAJECTORY_TASK}" \
         --data_id "${DATA_ID}"
 
+    # Optional video args (apply to both pretrain and train if VIDEO=1).
+    VIDEO_ARGS=()
+    if [[ "${VIDEO}" -eq 1 ]]; then
+        VIDEO_ARGS=(--video --video_length "${VIDEO_LENGTH}" --video_interval "${VIDEO_INTERVAL}")
+    fi
+
     # ── Step 3: Pretrain ──────────────────────────────────────────────────────
     if [[ -f "${PRETRAIN_FILE}" && "${FORCE}" -eq 0 ]]; then
         echo ""
@@ -178,6 +165,7 @@ for key in "${SEQUENCES[@]}"; do
             --num_envs    "${PRETRAIN_NUM_ENVS}" \
             --timesteps   "${PRETRAIN_TIMESTEPS}" \
             --headless \
+            "${VIDEO_ARGS[@]}" \
             --dataset             "${DATASET}" \
             --object_id           "${OBJECT_ID}" \
             --trajectory_task     "${TRAJECTORY_TASK}" \
@@ -213,6 +201,7 @@ for key in "${SEQUENCES[@]}"; do
         --num_envs    "${NUM_ENVS}" \
         --timesteps   "${TIMESTEPS}" \
         --headless \
+        "${VIDEO_ARGS[@]}" \
         --checkpoint  "${PRETRAIN_FILE}" \
         --dataset             "${DATASET}" \
         --object_id           "${OBJECT_ID}" \

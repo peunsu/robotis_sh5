@@ -141,8 +141,10 @@ Some examples of packages that can likely be excluded are:
 ### Overview
 
 `Robotis-Sh5-Grasp-Direct-v0` is a dexterous grasping environment for the FFW-SH5 full-body robot.
-The policy controls 28 joints (20 right-hand fingers + 7 right arm + 1 lift) and outputs one additional
-mass parameter (MassDexMimic), totalling a **29-dimensional action space**.
+The policy controls 27 joints (20 right-hand fingers + 7 right arm) and outputs one additional
+mass parameter (MassDexMimic), totalling a **28-dimensional action space**. The lift joint is
+held at a fixed target (URDF upper limit) by the PD controller every step and is **not part of
+the action**, but remains in the observation for state awareness.
 Reference trajectories come from the [OakInk-Image](https://oakink.net/) dataset or the
 [HO-Cap](https://github.com/NVlabs/HO-Cap) dataset, both stored in SPIDER format.
 
@@ -243,6 +245,22 @@ Place or symlink the HO-Cap object meshes under `data/processed/hocap/assets/obj
 Place a mass table at `data/processed/hocap/object_mass.json` (same format as OakInk).
 If absent, the default `[0.05, 0.20] kg` is used for all HO-Cap objects.
 
+#### Robot USD instancing (memory optimization)
+
+The robot USD imported from URDF stores all mesh data inline, which causes per-env duplication
+when spawning many environments (e.g., `num_envs=2048`) — leading to GPU/CPU memory overflow.
+To enable USD-level instancing, run the post-processing script once to extract each link's
+geometry into separate layers and add `instanceable=True` references back to the main USD:
+
+```bash
+python scripts/process_dataset/make_robot_usd_instanceable.py \
+    source/robotis_sh5/data/robots/FFW/FFW_SH5_simplified_dex.usd \
+    source/robotis_sh5/data/robots/FFW/FFW_SH5_simplified_dex_instanced.usd
+```
+
+The resulting USD is referenced from `robotis_sh5_grasp_env_cfg.py` and shared across all
+envs at spawn time. The original USD is preserved for comparison / rollback.
+
 ### Running the Environment
 
 #### Verify registration
@@ -266,6 +284,10 @@ python scripts/random_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
 ```bash
 python scripts/skrl/train.py --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048
 ```
+
+Add `--video --video_length 200 --video_interval 1000` to record an mp4 every 1000 env-steps
+into `logs/skrl/<task>/<run>/videos/train/`. Camera rendering needs significant VRAM —
+typically reduce `--num_envs` to 128–512 when recording video.
 
 #### Train with other RL frameworks
 
@@ -325,18 +347,19 @@ source/robotis_sh5/data/processed/<dataset>/   # e.g. oakink/ or hocap/
 | `training_time_s` | Wall-clock training time in seconds |
 | `trained_at` | ISO-8601 timestamp |
 
+Per-dataset scripts live under `scripts/benchmark/oakink/` and `scripts/benchmark/hocap/`.
+The two trees mirror each other (same flags, same env-var contract).
+
 #### Step 1 — Configure sequences
 
-Edit the `SEQUENCES` array and `DATASET` variable at the top of each script.
-Each entry matches the corresponding `mano/right/` folder name: `{OBJECT_ID}-{SEQ}-{GESTURE}`.
+Each entry in `SEQUENCES` matches the corresponding `mano/right/` folder name:
+`{OBJECT_ID}-{SEQ}-{GESTURE}` (OakInk) or `subject_{N}-{DATE_TIME}-{G_OBJECT_ID}` (HO-Cap).
 
 ```bash
-# scripts/benchmark/train_sequences.sh  (and evaluate_sequences.sh)
-DATASET="oakink"   # change to "hocap" for HO-Cap sequences
-
+# scripts/benchmark/oakink/train_sequences.sh
 SEQUENCES=(
     "C11001-0001-0007"   # → object_id=C11001, task=C11001-0001-0007
-    "A01001-0001-0000"   # → object_id=A01001, task=A01001-0001-0000
+    "A01001-0001-0000"
 )
 ```
 
@@ -344,10 +367,22 @@ SEQUENCES=(
 
 ```bash
 # Run the full pipeline for all sequences; skip steps already completed.
-bash scripts/benchmark/train_sequences.sh
+bash scripts/benchmark/oakink/train_sequences.sh
+bash scripts/benchmark/hocap/train_sequences.sh
 
 # Force re-running all steps even if outputs already exist.
-FORCE=1 bash scripts/benchmark/train_sequences.sh
+FORCE=1 bash scripts/benchmark/oakink/train_sequences.sh
+
+# Override num_envs (useful when enabling video → camera VRAM overhead).
+NUM_ENVS=256 PRETRAIN_NUM_ENVS=512 bash scripts/benchmark/oakink/train_sequences.sh
+
+# Record training mp4 every 1000 env-steps into logs/skrl/<task>/<run>/videos/train/
+VIDEO=1 NUM_ENVS=256 PRETRAIN_NUM_ENVS=512 \
+    bash scripts/benchmark/oakink/train_sequences.sh
+
+# Custom video length / interval
+VIDEO=1 VIDEO_LENGTH=300 VIDEO_INTERVAL=2000 NUM_ENVS=256 \
+    bash scripts/benchmark/oakink/train_sequences.sh
 ```
 
 `train_sequences.sh` runs **four steps per sequence** in order:
@@ -359,17 +394,21 @@ FORCE=1 bash scripts/benchmark/train_sequences.sh
 | 3. Pretrain | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | `pretrain.pt` exists |
 | 4. Train | `Robotis-Sh5-Grasp-Direct-v0` | `agent.pt` exists |
 
-Key settings at the top of the script:
+Key settings at the top of the script and supported env-var overrides:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DATASET` | `oakink` | Dataset to use (`oakink` or `hocap`) |
-| `TASK_PRETRAIN` | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | Pretrain task name |
-| `TASK` | `Robotis-Sh5-Grasp-Direct-v0` | Train task name |
-| `PRETRAIN_NUM_ENVS` | `4096` | Parallel environments for pretrain |
-| `NUM_ENVS` | `2048` | Parallel environments for train |
-| `PRETRAIN_TIMESTEPS` | `3000` | Pretrain env steps (≈ 375 PPO updates) |
-| `TIMESTEPS` | `10000` | Train env steps (≈ 1250 PPO updates) |
+| Variable | Default | Type | Meaning |
+|---|---|---|---|
+| `DATASET` | `oakink` / `hocap` | fixed | Determined by script subdir |
+| `TASK_PRETRAIN` | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | fixed | Pretrain task name |
+| `TASK` | `Robotis-Sh5-Grasp-Direct-v0` | fixed | Train task name |
+| `PRETRAIN_NUM_ENVS` | `4096` | env-var | Parallel environments for pretrain |
+| `NUM_ENVS` | `2048` | env-var | Parallel environments for train |
+| `PRETRAIN_TIMESTEPS` | `3000` (oakink) / `10000` (hocap) | fixed | Pretrain env steps |
+| `TIMESTEPS` | `10000` (oakink) / `40000` (hocap) | fixed | Train env steps |
+| `FORCE` | `0` | env-var | Re-run even if outputs exist |
+| `VIDEO` | `0` | env-var | Record training videos (`--video`) |
+| `VIDEO_LENGTH` | `200` | env-var | Frames per recording |
+| `VIDEO_INTERVAL` | `1000` | env-var | Env-steps between recordings |
 
 Checkpoints and `task_info.json` are saved to
 `source/robotis_sh5/data/processed/<dataset>/ffw_sh5/right/<trajectory_task>/<data_id>/`.
@@ -399,25 +438,48 @@ python scripts/skrl/train.py \
     --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/pretrain.pt \
     --dataset oakink --object_id C11001 \
     --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+
+# With video recording (reduce num_envs to fit GPU VRAM)
+python scripts/skrl/train.py \
+    --task Robotis-Sh5-Grasp-Direct-v0 \
+    --num_envs 256 --timesteps 10000 --headless \
+    --video --video_length 200 --video_interval 1000 \
+    --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/pretrain.pt \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0
 ```
 
 #### Step 3 — Evaluate
 
 ```bash
 # Run rollouts + produce aggregate CSVs for all sequences.
-bash scripts/benchmark/evaluate_sequences.sh
+bash scripts/benchmark/oakink/evaluate_sequences.sh
+bash scripts/benchmark/hocap/evaluate_sequences.sh
 
 # Force re-running rollouts even if metrics.csv already exists.
-FORCE=1 bash scripts/benchmark/evaluate_sequences.sh
+FORCE=1 bash scripts/benchmark/oakink/evaluate_sequences.sh
+
+# Record an mp4 of env 0's rollout into <OUT_DIR>/videos/ for each sequence.
+VIDEO=1 bash scripts/benchmark/oakink/evaluate_sequences.sh
+
+# Custom video length (default 300 steps)
+VIDEO=1 VIDEO_LENGTH=500 bash scripts/benchmark/oakink/evaluate_sequences.sh
 ```
 
-Key settings at the top of `evaluate_sequences.sh`:
+Key settings and supported env-var overrides for `evaluate_sequences.sh`:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DATASET` | `oakink` | Dataset to use (`oakink` or `hocap`) |
-| `N_ROLLOUTS` | `32` | Parallel rollout episodes per sequence |
-| `TIMESTEPS` | `10000` | Used only for output directory naming (must match training) |
+| Variable | Default | Type | Meaning |
+|---|---|---|---|
+| `DATASET` | `oakink` / `hocap` | fixed | Determined by script subdir |
+| `N_ROLLOUTS` | `32` | fixed | Parallel rollout episodes per sequence |
+| `TIMESTEPS` | `10000` | fixed | Used only for output directory naming (must match training) |
+| `FORCE` | `0` | env-var | Re-run rollouts even if `metrics.csv` exists |
+| `VIDEO` | `0` | env-var | Record video of env 0's rollout |
+| `VIDEO_LENGTH` | `300` | env-var | Frames per recording |
+
+Rollouts are **deterministic by default** (mean action) — matches the rl-games
+`player.deterministic=True` convention used in TJ/GR. Pass `--stochastic` to
+sample from the policy Gaussian instead.
 
 You can also run rollout on a single sequence manually:
 
@@ -430,6 +492,9 @@ python scripts/skrl/rollout.py \
     --headless \
     --dataset oakink --object_id C11001 \
     --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+
+# With video recording
+python scripts/skrl/rollout.py ... --video --video_length 300
 ```
 
 #### Step 4 — Aggregate metrics only
@@ -445,10 +510,10 @@ bash scripts/benchmark/evaluate.bash source/robotis_sh5/data/processed/oakink
 
 | Metric | Column | Unit | M1 threshold | M2 threshold |
 |---|---|---|---|---|
-| E_t — wrist position error | `e_t_cm` | cm | < 3.0 | < 10.0 |
-| E_r — wrist rotation error | `e_r` | deg | < 30.0 | < 28.6 (0.5 rad) |
-| E_j — all 21 keypoint error | `e_j_cm` | cm | < 8.0 | — |
-| E_ft — fingertip error | `e_ft_cm` | cm | < 6.0 | — |
+| E_t — object translation error vs ref | `e_t_cm` | cm | < 3.0 | < 10.0 |
+| E_r — object rotation error vs ref | `e_r` | deg | < 30.0 | < 28.6 (0.5 rad) |
+| E_j — all 21 keypoint error vs MANO ref | `e_j_cm` | cm | < 8.0 | — |
+| E_ft — fingertip error vs MANO ref | `e_ft_cm` | cm | < 6.0 | — |
 
 **Method 1 (ManipTrans):** success if all four metrics are below M1 thresholds.  
 **Method 2 (DexMachina):** success if E_t < 10 cm **and** E_r < 0.5 rad.  
@@ -476,24 +541,27 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
 
 | Item | Value |
 |---|---|
-| Action space | 29 (fingers 20 + arm_r 7 + lift 1 + mass 1) |
-| Observation space | 280 |
+| Action space | 28 (fingers 20 + arm_r 7 + mass 1); lift held fixed at top |
+| Observation space | 279 |
 | Control frequency | 30 Hz (decimation=4 @ 120 Hz physics) |
 | Episode length | matched to trajectory length |
 | Default num_envs | 2048 |
 | Default object | `C11001` |
 | Supported datasets | `oakink`, `hocap` |
 
-**Action breakdown (29-dim):**
+**Action breakdown (28-dim):**
 
 | Group | Dim | Description |
 |---|---|---|
 | `fingers` | 20 | Right finger joint position deltas (`finger_r_joint1-20`) |
 | `arm_r` | 7 | Right arm joint position deltas (`arm_r_joint1-7`) |
-| `lift` | 1 | Lift joint position delta |
 | `mass` | 1 | Normalised object mass parameter in `[-1, 1]` → `[mass_min, mass_max]` |
 
-**Observation breakdown (280-dim):**
+Lift joint is **not in the action**. It is held at `cfg.fixed_lift_target` (default `0.0` = URDF
+upper limit, fully up) by the PD controller every step. To allow the policy to control lift,
+re-add it to `_action_joint_ids` in `robotis_sh5_grasp_env.py` and bump `action_space` by 1.
+
+**Observation breakdown (279-dim):**
 
 | Group | Dim | Description |
 |---|---|---|
@@ -502,8 +570,8 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
 | `wrist_linvel` | 3 | Wrist global linear velocity |
 | `wrist_angvel` | 3 | Wrist global angular velocity |
 | `fingertip_vel` | 15 | Fingertip linear velocities (5×3) |
-| `joint_pos` | 28 | Controlled joint angles (normalised) |
-| `joint_vel` | 28 | Controlled joint velocities |
+| `joint_pos` | 28 | Controlled joint angles, normalised (includes lift for state awareness) |
+| `joint_vel` | 28 | Controlled joint velocities (includes lift) |
 | `obj_pos` | 3 | Object position |
 | `obj_quat` | 4 | Object orientation (wxyz) |
 | `obj_linvel` | 3 | Object linear velocity |
@@ -513,7 +581,7 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
 | `delta_obj_pos` | 3 | Next-frame object position error |
 | `delta_obj_rot` | 3 | Next-frame rotation error (axis-angle) |
 | `future_contact` | 5 | Predicted contact flag per fingertip |
-| `prev_action` | 29 | Previous action (28 joints + 1 mass) |
+| `prev_action` | 28 | Previous action (27 joints + 1 mass) |
 | `fingertip_forces` | 5 | Normal contact force per fingertip |
 
 ---

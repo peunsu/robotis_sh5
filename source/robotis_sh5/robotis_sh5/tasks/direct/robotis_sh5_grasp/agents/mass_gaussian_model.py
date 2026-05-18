@@ -40,11 +40,11 @@ from skrl.models.torch import GaussianMixin, Model
 class MassDexMimicPolicy(GaussianMixin, Model):
     """Gaussian actor where the policy network outputs joint dims only; mass uses separate params.
 
-    Network output  (28D):  joint means (finger + arm + lift)
-    Joint log-std   (28D):  log_std_parameter (learnable, not a network output)
+    Network output  (27D):  joint means (20 fingers + 7 arm — lift is excluded, held fixed by env)
+    Joint log-std   (27D):  log_std_parameter (learnable, not a network output)
     Mass dim        (1D):   mean = mu_mass, log-std = log_std_mass (both nn.Parameters)
 
-    The full 29D action is assembled as [joint_actions | mass_action] at call time.
+    The full 28D action is assembled as [joint_actions | mass_action] at call time.
 
     The ``network`` parameter accepts the YAML ``network`` list-of-dicts directly:
       network:
@@ -83,12 +83,12 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
 
         obs_size = observation_space.shape[0]
-        act_size = action_space.shape[0]  # 29 (28 joints + 1 mass)
-        n_joint = act_size - 1             # 28 — network outputs joint dims only
+        act_size = action_space.shape[0]  # 28 (27 joints + 1 mass)
+        n_joint = act_size - 1             # 27 — network outputs joint dims only (lift excluded)
 
         # Network — named ``net_container`` to match skrl's model_instantiators convention
         # so existing checkpoint files (saved by the standard Runner) can be loaded directly.
-        # Outputs n_joint (28D) only; mass is NOT a network output (paper Section 3.2).
+        # Outputs n_joint (27D) only; mass is NOT a network output (paper Section 3.2).
         if network is not None:
             self.net_container = self._build_net(obs_size, n_joint, network)
         else:
@@ -198,19 +198,19 @@ class MassDexMimicPolicy(GaussianMixin, Model):
     def compute(self, inputs, role):
         """Called by GaussianMixin.act() during PPO training updates.
 
-        Network outputs 28D (joints only). Mass dim is appended from mu_mass / log_std_mass.
-        Returns (mean[29D], log_std[29D], {}).
+        Network outputs 27D (joints only). Mass dim is appended from mu_mass / log_std_mass.
+        Returns (mean[28D], log_std[28D], {}).
         Training uses CURRENT global mu_mass / log_std_mass (no per-env cache replacement),
         which makes the PPO ratio for mass non-trivial vs. the rollout old log_prob.
         """
         B = inputs["states"].shape[0]
-        net_out = self.net_container(inputs["states"])  # (B, 28)
+        net_out = self.net_container(inputs["states"])  # (B, 27)
 
-        # Assemble 29D mean: [joint_mean(28) | mu_mass(1)]
-        mean = torch.cat([net_out, self.mu_mass.expand(B, 1)], dim=-1)  # (B, 29)
+        # Assemble 28D mean: [joint_mean(27) | mu_mass(1)]
+        mean = torch.cat([net_out, self.mu_mass.expand(B, 1)], dim=-1)  # (B, 28)
 
-        # Per-dim log-std: joint dims from log_std_parameter (28D), mass from log_std_mass.
-        log_std_j = self.log_std_parameter.expand(B, -1)  # (B, 28)
+        # Per-dim log-std: joint dims from log_std_parameter (27D), mass from log_std_mass.
+        log_std_j = self.log_std_parameter.expand(B, -1)  # (B, 27)
         log_std_m = self.log_std_mass.expand(B, 1)        # (B, 1)
         log_std = torch.cat([log_std_j, log_std_m], dim=-1)  # (B, 29)
 
@@ -255,13 +255,13 @@ class MassDexMimicPolicy(GaussianMixin, Model):
             self._cache_mu_mass[done] = mu_val
             self._cache_log_std_mass[done] = lsm_val
 
-        # Network forward: outputs joint dims only (28D).
-        net_out = self.net_container(inputs["states"])  # (B, 28)
-        joint_mean = net_out                            # (B, 28)
+        # Network forward: outputs joint dims only (27D — lift excluded).
+        net_out = self.net_container(inputs["states"])  # (B, 27)
+        joint_mean = net_out                            # (B, 27)
 
-        log_std_j = self._clamp_log_std(self.log_std_parameter)  # (28,)
+        log_std_j = self._clamp_log_std(self.log_std_parameter)  # (27,)
         dist_j = Normal(joint_mean, log_std_j.exp())
-        joint_actions = dist_j.rsample()                # (B, 28)
+        joint_actions = dist_j.rsample()                # (B, 27)
 
         # Mass: use cached action (fixed for this episode).
         mass_action = self._cache_action                # (B,) — detached
@@ -274,7 +274,7 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         # so PPO clipping naturally constrains log_std_mass.
         dist_m = Normal(self._cache_mu_mass, self._cache_log_std_mass.exp())
 
-        log_prob_j = dist_j.log_prob(joint_actions)    # (B, 28)
+        log_prob_j = dist_j.log_prob(joint_actions)    # (B, 27)
         log_prob_m = dist_m.log_prob(mass_action)       # (B,)
         log_prob = (log_prob_j.sum(dim=-1) + log_prob_m).unsqueeze(-1)  # (B, 1)
 

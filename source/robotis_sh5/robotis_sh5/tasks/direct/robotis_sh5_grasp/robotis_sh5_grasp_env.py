@@ -1,11 +1,13 @@
 """OakInk dexterous grasping environment — Isaac Lab Direct RL.
 
 Robot: FFW-SH5 full-body (fix_root_link=True).
-Policy controls right-hand fingers (20) + right arm (7) + lift (1) = 28 joint DOFs,
-plus 1 mass parameter dim = 29D action total.
+Policy controls right-hand fingers (20) + right arm (7) = 27 joint DOFs,
+plus 1 mass parameter dim = 28D action total.
+Lift joint is NOT in the action; it is held at `cfg.fixed_lift_target` (0.0 = fully up)
+by the PD controller every step.
 
 Incorporates MassDexMimic (NeurIPS 2026) and GR env techniques:
-  - Mass-as-an-action: policy dim 28 sets object mass per episode
+  - Mass-as-an-action: action's last dim sets object mass per episode
   - EMA action smoothing: smoothed joint commands sent to the robot
   - Next-frame look-ahead: delta observations target next reference frame
   - Wrist tracking reward: keeps wrist on the reference trajectory
@@ -69,9 +71,18 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._load_reference_trajectories(cfg)
         self._apply_object_mass_from_json(cfg)
         self._object_cfg = self._build_object_cfg(cfg)
-        # Match episode length to the longest trajectory so time_out fires at the right frame.
+        # Episode length follows TJ's split (gr_env_cfg.py vs gr_env_cfg_play.py).
+        # TJ computes: num_frame_chunk = min(action_fps * episode_length_s, episode_length).
+        # We do the same: derive num_frame_chunk from cfg.episode_length_s (default 5.0s).
+        #   - Training (adaptive_sampling=True): chunked at num_frame_chunk frames.
+        #   - Rollout / play (adaptive_sampling=False): no chunking; full trajectory.
         action_fps = round(1.0 / (cfg.sim.dt * cfg.decimation))
-        cfg.episode_length_s = self._max_traj_len / action_fps
+        chunk_from_cfg = round(cfg.episode_length_s * action_fps)
+        if cfg.adaptive_sampling:
+            self._num_frame_chunk = min(chunk_from_cfg, self._max_traj_len)
+        else:
+            self._num_frame_chunk = self._max_traj_len
+        cfg.episode_length_s = self._num_frame_chunk / action_fps
         super().__init__(cfg, render_mode, **kwargs)
         self._post_init_buffers()
 
@@ -350,11 +361,13 @@ class RobotisSh5GraspEnv(DirectRLEnv):
     @staticmethod
     def _apply_object_mass_from_json(cfg: RobotisSh5GraspEnvCfg) -> None:
         """Override cfg.object_mass_min/max from the per-object mass JSON if available."""
-        # Resolve dataset-aware path: prefer cfg.object_mass_json if it points to an existing file,
-        # otherwise fall back to <dataset_data_dir>/object_mass.json.
+        # Resolve dataset-aware path: each dataset uses its own
+        # data/processed/<dataset>/object_mass.json by default. ``cfg.object_mass_json``
+        # acts as an explicit override when non-empty.
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
-        json_path = Path(cfg.object_mass_json)
-        if not json_path.exists():
+        if cfg.object_mass_json:
+            json_path = Path(cfg.object_mass_json)
+        else:
             json_path = _data_root / "object_mass.json"
         if not json_path.exists():
             return
@@ -539,14 +552,36 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._kpt_mano_indices_t = torch.tensor(_kpt_mano_indices, dtype=torch.long, device=self.device)
         self._kpt_ft_mano_indices_t = torch.tensor(_MANO_FT_INDICES, dtype=torch.long, device=self.device)
 
-        # Precompute combined joint ID list for reward/obs (find_joints returns lists, not tensors)
+        # Joint ID groups:
+        # - `_all_joint_ids` (28): used for observation (joint_pos/joint_vel include lift)
+        #   and state-cache restoration (must capture full controlled state including lift).
+        # - `_action_joint_ids` (27): subset used by the action — lift is excluded and held
+        #   at `cfg.fixed_lift_target` by the PD controller.
         self._all_joint_ids = self._finger_joint_ids + self._arm_r_joint_ids + self._lift_joint_ids
+        self._action_joint_ids = self._finger_joint_ids + self._arm_r_joint_ids
 
-        # Joint limits for full-range action scaling (GR env style: scale [-1,1] → [lower, upper])
+        # Joint limits for normalization (GR env style: scale [-1,1] → [lower, upper]).
+        # Two variants:
+        #   _ctrl_lower/_ctrl_upper       (27,) — action joints only; used by _scale/_unscale
+        #                                          for action targets and obs[joint_pos] slice
+        #                                          covering action dims.
+        #   _ctrl_lower_all/_ctrl_upper_all (28,) — full controlled-joint set incl. lift;
+        #                                          used by _unscale_all for the 28D joint_pos
+        #                                          slice of the observation.
         dof_limits = self.robot.root_physx_view.get_dof_limits().to(self.device)
+        action_ids_t = torch.tensor(self._action_joint_ids, dtype=torch.long, device=self.device)
         all_ids_t = torch.tensor(self._all_joint_ids, dtype=torch.long, device=self.device)
-        self._ctrl_lower = dof_limits[0, all_ids_t, 0]  # (28,)
-        self._ctrl_upper = dof_limits[0, all_ids_t, 1]  # (28,)
+        self._ctrl_lower = dof_limits[0, action_ids_t, 0]  # (27,)
+        self._ctrl_upper = dof_limits[0, action_ids_t, 1]  # (27,)
+        self._ctrl_lower_all = dof_limits[0, all_ids_t, 0]  # (28,)
+        self._ctrl_upper_all = dof_limits[0, all_ids_t, 1]  # (28,)
+
+        # Lift target tensor (broadcast each step in _apply_action).
+        self._lift_joint_ids_t = torch.tensor(self._lift_joint_ids, dtype=torch.long, device=self.device)
+        self._lift_target = torch.full(
+            (self.num_envs, len(self._lift_joint_ids)), float(self.cfg.fixed_lift_target),
+            device=self.device,
+        )
 
         # Per-env buffers
         B = self.num_envs
@@ -554,11 +589,10 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._frame_idx = torch.zeros(B, dtype=torch.long, device=self.device)
         self._prev_action = torch.zeros(B, self.cfg.action_space, device=self.device)
 
-        # EMA action smoothing buffer (joint dims only, 28D); initialize at normalized default pose
+        # EMA action smoothing buffer (actioned joints only, 27D); initialize at normalized default pose
         default_ctrl = torch.cat([
             self.robot.data.default_joint_pos[:1, self._finger_joint_ids],
             self.robot.data.default_joint_pos[:1, self._arm_r_joint_ids],
-            self.robot.data.default_joint_pos[:1, self._lift_joint_ids],
         ], dim=-1).squeeze(0)
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions = default_normalized.unsqueeze(0).expand(B, -1).clone()
@@ -574,9 +608,9 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._failure_count = torch.zeros(self._max_traj_len, device=self.device)
 
         # State cache: stores simulation state at each trajectory frame for physical curriculum.
-        # Layout (98-dim): reward(1) + obj_pos_local(3) + obj_quat(4) + obj_linvel(3) + obj_angvel(3)
-        #                  + joint_pos(28) + joint_vel(28) + smoothed_act(28)
-        _STATE_DIM = 98
+        # Layout (97-dim): reward(1) + obj_pos_local(3) + obj_quat(4) + obj_linvel(3) + obj_angvel(3)
+        #                  + joint_pos(28) + joint_vel(28) + smoothed_act(27, lift excluded)
+        _STATE_DIM = 97
         self._state_cache = torch.zeros(self._max_traj_len, _STATE_DIM, device=self.device)
         self._state_cache[:, 0] = -float("inf")  # reward col: any real reward beats -inf
         self._init_flg = torch.ones(self._max_traj_len, dtype=torch.bool, device=self.device)  # True = ref data
@@ -617,12 +651,16 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         return torch.tensor(ids, dtype=torch.long, device=self.device)
 
     def _scale(self, x: torch.Tensor) -> torch.Tensor:
-        """Map normalized actions [-1, 1] to joint positions [lower, upper]."""
+        """Map normalized actions [-1, 1] to action-joint positions [lower, upper] (27D)."""
         return 0.5 * (x + 1.0) * (self._ctrl_upper - self._ctrl_lower) + self._ctrl_lower
 
     def _unscale(self, q: torch.Tensor) -> torch.Tensor:
-        """Map joint positions [lower, upper] to normalized actions [-1, 1]."""
+        """Map action-joint positions [lower, upper] to normalized [-1, 1] (27D)."""
         return (2.0 * q - self._ctrl_upper - self._ctrl_lower) / (self._ctrl_upper - self._ctrl_lower).clamp(min=1e-6)
+
+    def _unscale_all(self, q: torch.Tensor) -> torch.Tensor:
+        """Map full controlled-joint positions (incl. lift) [lower, upper] to [-1, 1] (28D)."""
+        return (2.0 * q - self._ctrl_upper_all - self._ctrl_lower_all) / (self._ctrl_upper_all - self._ctrl_lower_all).clamp(min=1e-6)
 
     def _compute_fingertip_positions(self) -> torch.Tensor:
         """Compute world-space virtual fingertip positions by applying local offsets.
@@ -797,32 +835,37 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             self._frame_idx = new_frame
         # ── END WARMUP ────────────────────────────────────────────────────────
 
-        # EMA smoothing on joint actions (dims 0–27); mass dim (28) is not smoothed
-        joint_actions = self.actions[:, :-1]  # (B, 28)
+        # EMA smoothing on joint actions (dims 0–26 = 20 fingers + 7 arm);
+        # mass dim (27) is not smoothed. Lift is NOT in the action.
+        # TJ/rl_games convention: alpha = weight on the new (raw) action.
+        joint_actions = self.actions[:, :-1]  # (B, 27)
         alpha = self.cfg.action_smoothing
-        self._smoothed_actions = alpha * self._smoothed_actions + (1.0 - alpha) * joint_actions
+        self._smoothed_actions = alpha * joint_actions + (1.0 - alpha) * self._smoothed_actions
 
     def _apply_action(self) -> None:
         N_f = self.cfg.num_hand_dofs
         N_a = self.cfg.num_arm_r_dofs
-        # Scale EMA-smoothed normalized actions to full joint range
+        # Scale EMA-smoothed normalized actions to full joint range (action joints only).
         targets = self._scale(self._smoothed_actions).clamp(self._ctrl_lower, self._ctrl_upper)
         self.robot.set_joint_position_target(targets[:, :N_f],          joint_ids=self._finger_joint_ids)
         self.robot.set_joint_position_target(targets[:, N_f:N_f+N_a],  joint_ids=self._arm_r_joint_ids)
-        self.robot.set_joint_position_target(targets[:, N_f+N_a:],     joint_ids=self._lift_joint_ids)
+        # Lift is held at a fixed target every step (NOT in action). PD controller holds it
+        # at this value against gravity / contacts.
+        self.robot.set_joint_position_target(self._lift_target, joint_ids=self._lift_joint_ids)
 
     def _get_observations(self) -> dict:
         frame = self._frame_idx.clamp(max=self._max_traj_len - 1)
         traj = self._traj_idx
         B = self.num_envs
 
-        # Robot state: all controlled joints [fingers | arm_r | lift]
+        # Robot state: all controlled joints [fingers | arm_r | lift] — 28D (lift in obs for
+        # state awareness even though it is not actioned).
         joint_pos = torch.cat([
             self.robot.data.joint_pos[:, self._finger_joint_ids],
             self.robot.data.joint_pos[:, self._arm_r_joint_ids],
             self.robot.data.joint_pos[:, self._lift_joint_ids],
         ], dim=-1)  # (B, 28)
-        joint_pos = self._unscale(joint_pos)   # normalize to [-1, 1]
+        joint_pos = self._unscale_all(joint_pos)   # normalize to [-1, 1] using 28D scales
         joint_vel = torch.cat([
             self.robot.data.joint_vel[:, self._finger_joint_ids],
             self.robot.data.joint_vel[:, self._arm_r_joint_ids],
@@ -1056,6 +1099,15 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         action_reg = (self.actions[:, :-1] ** 2).sum(dim=-1)   # exclude mass dim
         action_rate = ((self.actions[:, :-1] - self._prev_action[:, :-1]) ** 2).sum(dim=-1)
         pose_reg = ((joint_pos - default_pos) ** 2).sum(dim=-1)
+        # Joint-state smoothness penalties (jitter suppression).
+        # joint_vel / joint_acc cover all 28 controlled joints; joint_effort covers the
+        # 27 action joints only (lift's gravity-holding torque is unavoidable, not policy-fault).
+        joint_vel = self.robot.data.joint_vel[:, self._all_joint_ids]
+        joint_acc = self.robot.data.joint_acc[:, self._all_joint_ids]
+        joint_effort = self.robot.data.applied_torque[:, self._action_joint_ids]
+        joint_vel_reg = (joint_vel ** 2).sum(dim=-1)
+        joint_acc_reg = (joint_acc ** 2).sum(dim=-1)
+        joint_effort_reg = (joint_effort ** 2).sum(dim=-1)
 
         # Compute alive signal: 0 on terminated steps, 1 otherwise (GR env pattern).
         # All termination thresholds use unweighted errors (GR env: raw L2 distances).
@@ -1093,6 +1145,9 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             + self.cfg.rew_action_reg * action_reg
             + self.cfg.rew_pose_reg * pose_reg
             + self.cfg.rew_action_rate * action_rate
+            + self.cfg.rew_joint_vel * joint_vel_reg
+            + self.cfg.rew_joint_acc * joint_acc_reg
+            + self.cfg.rew_joint_effort * joint_effort_reg
         )
         reward = reward.clamp(min=0.0)
 
@@ -1118,6 +1173,9 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             "rew/action_reg":        (self.cfg.rew_action_reg * action_reg).mean(),
             "rew/pose_reg":          (self.cfg.rew_pose_reg * pose_reg).mean(),
             "rew/action_rate":       (self.cfg.rew_action_rate * action_rate).mean(),
+            "rew/joint_vel":         (self.cfg.rew_joint_vel * joint_vel_reg).mean(),
+            "rew/joint_acc":         (self.cfg.rew_joint_acc * joint_acc_reg).mean(),
+            "rew/joint_effort":      (self.cfg.rew_joint_effort * joint_effort_reg).mean(),
             "rew/total":             reward.mean(),
             # Curriculum state
             "curriculum/reached_frame":  torch.tensor(float(self._reached_frame), device=self.device),
@@ -1197,6 +1255,15 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             probs = (1.0 - ur) * fail_probs + ur / valid_len          # (valid_len,)
             sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
             start_frames = (sampled - self.cfg.adaptive_back_frames).clamp(min=0)
+            # TJ upper bound: keep at least `num_frame_chunk` frames after start. Mirrors
+            # ``clamp(0, min(max(0, episode_length - num_frame_chunk),
+            #               max(reached_frame - back, 0)))``.
+            # When traj_len ≤ num_frame_chunk, upper_a = 0 → start_frame = 0 → adaptive
+            # sampling effectively disabled (matches TJ behavior on short trajs).
+            upper_a = max(0, self._max_traj_len - self._num_frame_chunk)
+            upper_b = max(self._reached_frame - self.cfg.adaptive_back_frames, 0)
+            upper = min(upper_a, upper_b)
+            start_frames = start_frames.clamp(max=upper)
         else:
             start_frames = torch.zeros(n, dtype=torch.long, device=self.device)
 
@@ -1232,10 +1299,11 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         joint_pos_reset = default_joint_pos.clone()
         joint_vel_reset = torch.zeros_like(default_joint_pos)
 
-        # cached[:, 14:42] = joint_pos (28 controlled), cached[:, 42:70] = joint_vel (28)
+        # cached[:, 14:42] = joint_pos (28 controlled), cached[:, 42:70] = joint_vel (28),
+        # cached[:, 70:97] = smoothed_act (27, lift excluded)
         cached_jp = cached[:, 14:42]
         cached_jv = cached[:, 42:70]
-        cached_sa = cached[:, 70:98]
+        cached_sa = cached[:, 70:97]
 
         joint_pos_reset[:, self._all_joint_ids] = torch.where(
             cache_mask, cached_jp, default_joint_pos[:, self._all_joint_ids]
@@ -1252,11 +1320,15 @@ class RobotisSh5GraspEnv(DirectRLEnv):
                 no_cache_arm, arm_ik, joint_pos_reset[:, self._arm_r_joint_ids]
             )
 
+        # Force lift joint to the fixed target on every reset (not controlled by policy).
+        joint_pos_reset[:, self._lift_joint_ids] = self.cfg.fixed_lift_target
+        joint_vel_reset[:, self._lift_joint_ids] = 0.0
+
         # Build smoothed_actions for cache-miss envs using actual initial joint positions
+        # (action joints only — 20 fingers + 7 arm = 27D; lift is excluded).
         default_ctrl = torch.cat([
             default_joint_pos[:, self._finger_joint_ids],
             joint_pos_reset[:, self._arm_r_joint_ids],   # IK if available and no cache, else default
-            default_joint_pos[:, self._lift_joint_ids],
         ], dim=-1)
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions[env_ids] = torch.where(cache_mask, cached_sa, default_normalized)
@@ -1319,7 +1391,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         joint_pos = self.robot.data.joint_pos[:, self._all_joint_ids]  # (B, 28)
         joint_vel = self.robot.data.joint_vel[:, self._all_joint_ids]  # (B, 28)
 
-        # Build 98-dim state vector per env
+        # Build 97-dim state vector per env (smoothed_act is 27D — lift excluded from action)
         state = torch.cat([
             reward.unsqueeze(-1),   # (B, 1)  — index 0
             obj_pos_local,           # (B, 3)  — indices 1:4
@@ -1328,20 +1400,32 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             obj_angvel,              # (B, 3)  — indices 11:14
             joint_pos,               # (B, 28) — indices 14:42
             joint_vel,               # (B, 28) — indices 42:70
-            self._smoothed_actions,  # (B, 28) — indices 70:98
-        ], dim=-1)  # (B, 98)
+            self._smoothed_actions,  # (B, 27) — indices 70:97
+        ], dim=-1)  # (B, 97)
 
-        # Update per-episode tracking quality (GR env pattern: 2-phase condition).
-        # start_condition: loose thresholds for the first ~20 frames so the cache
-        # gets populated early in training before the policy has learned to track well.
-        # early_condition: tighter thresholds once the initial frames are in cache.
+        # Update per-episode tracking quality — GR/TJ 3-phase condition:
+        #   start: loose thresholds for the first ~20 frames so the cache
+        #          gets populated early in training before the policy has learned to track well.
+        #   early: tighter thresholds once initial frames are in cache (not yet reached end).
+        #   late : even tighter thresholds after the policy has reached the trajectory end —
+        #          encourages refinement of cache quality.
         action_fps = round(1.0 / (self.cfg.sim.dt * self.cfg.decimation))
         start_frame_cutoff = action_fps * 2 // 3  # ~20 frames at 30 Hz (matches GR: fps/1.5)
+        reached_end = self.is_reached_end   # python bool — broadcasts to (B,) implicitly
         start_condition = (obj_pos_err < 0.10) & (obj_rot_err < 0.50) & (frame <= start_frame_cutoff)
-        early_condition = (obj_pos_err < self.cfg.enough_obj_threshold) & (obj_rot_err < self.cfg.enough_obj_rot_threshold)
+        early_condition = (
+            (obj_pos_err < self.cfg.enough_obj_threshold)
+            & (obj_rot_err < self.cfg.enough_obj_rot_threshold)
+            & (not reached_end)
+        )
+        late_condition = (
+            (obj_pos_err < self.cfg.enough_obj_threshold_late)
+            & (obj_rot_err < self.cfg.enough_obj_rot_threshold_late)
+            & reached_end
+        )
         good = (
             (ft_err < self.cfg.enough_ft_threshold)
-            & (start_condition | early_condition)
+            & (start_condition | early_condition | late_condition)
         )
         still_good = self._enough_continued & good
         # Advance _enough_idx while tracking is still good (captures last "good" frame)

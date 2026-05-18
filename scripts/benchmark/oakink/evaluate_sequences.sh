@@ -29,66 +29,40 @@ TIMESTEPS=10000
 
 # Sequence keys — format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
 SEQUENCES=(
-    "A01005-0001-0000"
-    "A01005-0001-0001"
-    "A01006-0001-0000"
-    "A01026-0001-0000"
-    "A01026-0001-0001"
-    "A02012-0001-0004"
     "A02014-0001-0005"
     "A02021-0001-0005"
     "A02028-0001-0005"
-    "A02031-0001-0005"
-    "A15015-0001-0007"
     "A15015-0001-0008"
-    "A15027-0001-0007"
-    "A16013-0001-0006"
-    "A16026-0001-0005"
-    "C11001-0001-0007"
     "C13001-0001-0005"
     "C20001-0001-0009"
-    "C22001-0001-0010"
-    "C25001-0001-0009"
-    "C35001-0001-0000"
-    "C50001-0001-0000"
-    "C91001-0001-0002"
-    "O01000-0001-0001"
-    "O02001-0001-0005"
-    "O03001-0001-0007"
-    "O03003-0001-0007"
-    "O03003-0001-0008"
-    "O21001-0001-0010"
-    "O24001-0001-0010"
-    "O36002-0001-0002"
     "O50002-0001-0001"
-    "O93001-0001-0000"
-    "S10002-0001-0000"
     "S10002-0001-0002"
-    "S10003-0001-0001"
-    "S10007-0001-0001"
-    "S10008-0001-0003"
-    "S10011-0001-0003"
-    "S10012-0001-0003"
-    "S10014-0001-0001"
-    "S10015-0001-0001"
-    "S10016-0001-0002"
-    "S10019-0001-0001"
-    "S10019-0001-0002"
-    "S10019-0001-0003"
-    "S10021-0001-0000"
-    "S10023-0001-0001"
-    "S10024-0001-0001"
-    "S10024-0001-0003"
-    "S15004-0001-0008"
-    "S16001-0001-0005"
-    "S16005-0001-0002"
-    "S20005-0001-0010"
-    "S20021-0001-0010"
-    "S20022-0001-0010"
-    "Y03006-0001-0007"
-    "Y03021-0001-0000"
     "Y27035-0001-0000"
-    "Y35037-0001-0002"
+    "A01026-0001-0000"
+    "A02012-0001-0004"
+    "S10015-0001-0001"
+    "A02031-0001-0005"
+    "C22001-0001-0010"
+    "S10007-0001-0001"
+    "C50001-0001-0000"
+    "O03001-0001-0007"
+    "A01026-0001-0001"
+    "O03003-0001-0008"
+    "A15027-0001-0007"
+    "S10023-0001-0001"
+    "C11001-0001-0007"
+    "O01000-0001-0001"
+    "O36002-0001-0002"
+    "A01005-0001-0001"
+    "A15015-0001-0007"
+    "S10012-0001-0003"
+    "A16026-0001-0005"
+    "S10003-0001-0001"
+    "S10019-0001-0001"
+    "S10011-0001-0003"
+    "O24001-0001-0010"
+    "O02001-0001-0005"
+    "S15004-0001-0008"
 )
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -99,6 +73,12 @@ DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/${DATASET}"
 CHECKPOINT_BASE="${DATA_BASE}/ffw_sh5/right"
 
 FORCE="${FORCE:-0}"
+# Set VIDEO=1 to record an mp4 of env 0's rollout into <OUT_DIR>/videos/
+VIDEO="${VIDEO:-0}"
+VIDEO_LENGTH="${VIDEO_LENGTH:-300}"
+# Set STOCHASTIC=1 to sample actions from the policy Gaussian (matches training behavior).
+# Default 0 = deterministic (mean action; matches rl_games player.deterministic=True).
+STOCHASTIC="${STOCHASTIC:-0}"
 
 # ── Parse sequence key → (object_id, trajectory_task, data_id) ───────────────
 # Key format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
@@ -144,6 +124,16 @@ for key in "${SEQUENCES[@]}"; do
         continue
     fi
 
+    VIDEO_ARGS=()
+    if [[ "${VIDEO}" -eq 1 ]]; then
+        VIDEO_ARGS=(--video --video_length "${VIDEO_LENGTH}")
+    fi
+
+    EXTRA_ARGS=()
+    if [[ "${STOCHASTIC}" -eq 1 ]]; then
+        EXTRA_ARGS+=(--stochastic)
+    fi
+
     cd "${PROJECT_DIR}"
     python scripts/skrl/rollout.py \
         --task        "${TASK}" \
@@ -151,6 +141,8 @@ for key in "${SEQUENCES[@]}"; do
         --output_dir  "${OUT_DIR}" \
         --n_rollouts  "${N_ROLLOUTS}" \
         --headless \
+        "${VIDEO_ARGS[@]}" \
+        "${EXTRA_ARGS[@]}" \
         --dataset             "${DATASET}" \
         --object_id           "${OBJECT_ID}" \
         --trajectory_task     "${TRAJECTORY_TASK}" \

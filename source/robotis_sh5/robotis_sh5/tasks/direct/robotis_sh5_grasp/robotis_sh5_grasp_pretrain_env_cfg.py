@@ -68,7 +68,7 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # Viewer: same viewpoint as train env — front-right of table, elevated.
     viewer: ViewerCfg = ViewerCfg(
         eye=(0.2, 0.15, 2.2),
-        lookat=(-0.2, 0.5, 1.9),
+        lookat=(-0.2, 0.5, 2.0),
         resolution=(1280, 720),
     )
 
@@ -79,10 +79,12 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # DOF counts
     num_hand_dofs: int = 20
     num_arm_r_dofs: int = 7
-    num_lift_dofs: int = 1
-    action_space: int = 28           # fingers(20) + arm_r(7) + lift(1)
-    observation_space: int = 279     # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+28+5
+    num_lift_dofs: int = 1            # lift_joint (NOT in action — held at fixed_lift_target)
+    action_space: int = 27           # fingers(20) + arm_r(7); lift excluded
+    observation_space: int = 278     # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+27+5  (prev_action=27)
     state_space: int = 0
+    # Lift target (joint position). 0.0 = URDF upper limit (fully up).
+    fixed_lift_target: float = 0.0
 
     # Physics
     sim: SimulationCfg = SimulationCfg(
@@ -155,7 +157,10 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     contact_dist_threshold: float = 0.05
 
     # Action: [-1, 1] → full joint range via scale(). EMA smoothing in normalized space.
-    action_smoothing: float = 0.7
+    # TJ/rl_games convention: smoothed = alpha * current + (1 - alpha) * prev
+    # alpha = weight on the new (raw) action. alpha=1.0 → no smoothing; lower alpha = smoother.
+    # alpha=0.3 ≡ legacy (alpha-prev convention) value 0.7, same behavior.
+    action_smoothing: float = 0.3
 
     # Reward scales (GR pretrain: 1.5*alive - clamp(1.76*kpts + 12.5*ft, 1.5) + reg)
     rew_alive: float = 1.5
@@ -165,6 +170,10 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     rew_action_reg: float = -0.004    # action_penalty_scale in GR
     rew_pose_reg: float = -0.001      # dof_penalty_scale in GR
     rew_action_rate: float = -0.01    # penalize rapid action changes to reduce trembling
+    # Joint-state smoothness (see train env_cfg comments for rationale).
+    rew_joint_vel: float = -1.0e-4
+    rew_joint_acc: float = -1.0e-4
+    rew_joint_effort: float = -1.0e-5
 
     # Termination (fingertip + wrist only — no object-based termination)
     termination: bool = True

@@ -13,7 +13,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.utils import configclass
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
-_ROBOT_USD = str(_DATA_DIR / "robots" / "FFW" / "FFW_SH5_simplified_dex.usd")
+_ROBOT_USD = str(_DATA_DIR / "robots" / "FFW" / "FFW_SH5_simplified_dex_instanced.usd")
 _OAKINK_DATA_DIR = str(_DATA_DIR / "processed" / "oakink")
 _HOCAP_DATA_DIR = str(_DATA_DIR / "processed" / "hocap")
 
@@ -137,10 +137,12 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     """Configuration for OakInk dexterous grasping with kinematic reference tracking.
 
     Robot: FFW-SH5 full-body (fix_root_link=True).
-    Policy controls: right-hand fingers (20) + right arm (7) + lift (1) = 28 DOF total.
+    Policy controls: right-hand fingers (20) + right arm (7) = 27 DOF total.
+    Lift joint is excluded from the action and held at `fixed_lift_target` (0.0 = fully up)
+    by the PD controller; lift remains in joint_pos/joint_vel observations for state awareness.
     Additional output: 1D normalized object mass parameter (MassDexMimic).
 
-    Observation space (total=280, paper S4.1 layout):
+    Observation space (total=279, paper S4.1 layout):
         hand_kpts_pos      [21*3]   all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
         wrist_quat         [4]      wrist global orientation (wxyz)
         wrist_linvel       [3]      wrist global linear velocity
@@ -157,10 +159,11 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
         delta_obj_pos      [3]      next-frame obj position error
         delta_obj_rot      [3]      next-frame rotation error (axis-angle approximation)
         future_contact     [5]      predicted contact flag per fingertip
-        prev_action        [29]     previous action (28 joints + 1 mass)
+        prev_action        [28]     previous action (27 joints + 1 mass; lift NOT actioned)
         fingertip_forces   [5]      normal contact force per fingertip
 
-    Action space (29): [fingers(20) | arm_r(7) | lift(1) | mass(1)] from default pose.
+    Action space (28): [fingers(20) | arm_r(7) | mass(1)] from default pose.
+        Lift is NOT in the action — it is fixed at `fixed_lift_target` (0.0 = URDF upper limit).
         mass dim [-1,1] → [object_mass_min, object_mass_max] applied at episode start.
     """
 
@@ -169,7 +172,7 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Robot base is at env-local (0.65, 0.60); table top is at (0.3, 0.0, 1.0).
     viewer: ViewerCfg = ViewerCfg(
         eye=(0.2, 0.15, 2.2),
-        lookat=(-0.2, 0.5, 1.9),
+        lookat=(-0.2, 0.5, 2.0),
         resolution=(1280, 720),
     )
 
@@ -180,10 +183,13 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # DOF counts
     num_hand_dofs: int = 20   # finger_r_joint1-20
     num_arm_r_dofs: int = 7   # arm_r_joint1-7
-    num_lift_dofs: int = 1    # lift_joint
-    action_space: int = 29    # 20 + 7 + 1 + 1(mass)
-    observation_space: int = 280  # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+29+5
+    num_lift_dofs: int = 1    # lift_joint (NOT in action — held at fixed_lift_target via PD ctrl)
+    action_space: int = 28    # 20(fingers) + 7(arm) + 1(mass); lift excluded
+    observation_space: int = 279  # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+28+5  (prev_action=28)
     state_space: int = 0
+    # Lift target (joint position in radians/meters depending on joint type).
+    # 0.0 = URDF upper limit (fully up). Held by PD controller every step.
+    fixed_lift_target: float = 0.0
 
     # Physics
     sim: SimulationCfg = SimulationCfg(
@@ -240,9 +246,10 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     oakink_data_dir: str = _OAKINK_DATA_DIR
     hocap_data_dir: str = _HOCAP_DATA_DIR
     object_id: str = "C11001" # "A01001"  # OakInk object to use (must have pre-converted USD)
-    # Path to per-object mass JSON produced by scripts/process_dataset/estimate_object_mass.py.
-    # If the file exists and object_id is found in it, object_mass_min/max are overridden at init.
-    object_mass_json: str = str(_DATA_DIR / "processed" / "oakink" / "object_mass.json")
+    # Path to per-object mass JSON. If empty, the env resolves it at runtime to
+    # data/processed/<dataset>/object_mass.json (so OakInk and HO-Cap each use
+    # their own per-object mass table). Set explicitly to override.
+    object_mass_json: str = ""
 
     # Trajectory selection: which specific trajectory to train on.
     # task: directory name under data/processed/oakink/mano/right/  (e.g. "A01001-0001-0000")
@@ -266,9 +273,13 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Contact threshold for future_contact precomputation
     contact_dist_threshold: float = 0.05  # m
 
-    # Action smoothing (EMA): smoothed = alpha*prev + (1-alpha)*current
-    # 0.0 = no smoothing; 0.5 = equal mix (GR env default); higher = smoother (less trembling)
-    action_smoothing: float = 0.7
+    # Action smoothing (EMA, TJ/rl_games convention):
+    #     smoothed = alpha * current + (1 - alpha) * prev
+    # alpha is the weight on the new (raw) action; 1-alpha is the weight on the previous
+    # smoothed value. So alpha=1.0 means no smoothing (use raw action as-is); lower alpha
+    # means stronger smoothing (more lag, less trembling).
+    # alpha=0.3 ≡ legacy (alpha-prev convention) value 0.7, same behavior.
+    action_smoothing: float = 0.3
 
     # Reward scales (GR env: 1.5*alive - clamp(4.26*pos + 1.0*rot + 5.2*ft + 1.76*kpts, 1.5) + force + reg)
     rew_alive: float = 1.5
@@ -280,6 +291,14 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     rew_action_reg: float = -0.004    # GR env: action_penalty_scale
     rew_pose_reg: float = -0.001      # GR env: dof_penalty_scale
     rew_action_rate: float = -0.01    # penalize rapid action changes to reduce trembling
+    # Joint-state smoothness penalties (suppress hand/arm jitter).
+    # joint_vel and joint_acc: applied over all 28 controlled joints (incl. lift).
+    # joint_effort: applied over the 27 action joints only — lift is held against gravity
+    # by the PD controller, so its steady-state torque is unavoidable and shouldn't be
+    # penalized.
+    rew_joint_vel: float = -1.0e-4       # ‖q̇‖² — penalize fast joint motion
+    rew_joint_acc: float = -1.0e-4       # ‖q̈‖² — penalize jerky joint motion (same weight as vel; |q̈| can be O(1000))
+    rew_joint_effort: float = -1.0e-5    # ‖τ‖²  — penalize actuator effort (kept small to avoid weakening grasp)
 
     # Termination
     # termination=False disables early termination entirely (only timeout) — use for warm-up.
@@ -293,16 +312,32 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     max_wrist_rot_err: float = 0.75   # wrist rotation tracking error (rad) — matches GR env
     max_ft_mean_err: float = 0.10     # mean fingertip tracking error (m) — GR uses > 0.1 threshold
 
-    # Adaptive rollout sampling (GR env style)
+    # Adaptive rollout sampling (GR/TJ env style)
     adaptive_sampling: bool = True
-    adaptive_alpha: float = 0.001          # EMA coefficient — matches GR env (slow, stable update)
-    adaptive_uniform_ratio: float = 0.1   # uniform mixing ratio — matches GR env
-    adaptive_back_frames: int = 36         # start N frames before sampled failure frame (~1.2s at 30Hz)
+    adaptive_alpha: float = 0.001            # EMA coefficient — matches GR env (slow, stable update)
+    adaptive_uniform_ratio: float = 0.1      # uniform mixing ratio — matches GR env
+    adaptive_back_frames: int = 36           # start N frames before sampled failure frame (~1.2s at 30Hz)
+    # Note: episode chunk length (TJ's ``num_frame_chunk``) is auto-derived at runtime as
+    # ``round(episode_length_s * action_fps)`` — see env __init__. With default
+    # ``episode_length_s = 5.0`` and ``action_fps = 30`` this gives 150 frames (TJ exact).
+    # The chunk length controls (a) the upper clamp on adaptive start_frame and (b) the
+    # actual episode time_out length:
+    #   - traj_len <  num_frame_chunk      : episode = traj_len (no chunking)
+    #   - traj_len >= num_frame_chunk      : adaptive sampling moves start across
+    #                                         [0, traj_len - num_frame_chunk]; each episode
+    #                                         is exactly num_frame_chunk frames.
+    #   - adaptive_sampling = False (rollout): no chunking; full trajectory per episode.
 
-    # State cache quality thresholds (enough_continued tracking — GR env "early_condition" values)
-    enough_ft_threshold: float = 0.10        # max mean fingertip tracking error for "good" step (m)
-    enough_obj_threshold: float = 0.085      # max object position error for "good" step (m)
-    enough_obj_rot_threshold: float = 0.425  # max object rotation error for "good" step (rad)
+    # State cache quality thresholds. Three phases matching GR/TJ env:
+    #   start (frame <= ~20)      : loosest — bootstraps cache early in training
+    #   early (not is_reached_end): early_condition values below
+    #   late (is_reached_end)     : tighter, encourages refinement once full traj is reached
+    # `enough` requires (ft_err < ft_threshold) AND any phase condition.
+    enough_ft_threshold: float = 0.10           # max mean fingertip tracking error (m)
+    enough_obj_threshold: float = 0.085         # early-phase obj pos err (m)
+    enough_obj_rot_threshold: float = 0.425     # early-phase obj rot err (rad)
+    enough_obj_threshold_late: float = 0.05     # late-phase obj pos err (m) — matches GR/TJ
+    enough_obj_rot_threshold_late: float = 0.25 # late-phase obj rot err (rad) — matches GR/TJ
 
     # Debug visualization (requires GUI — do not use with --headless)
     debug_vis: bool = True

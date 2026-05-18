@@ -78,6 +78,9 @@ DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/${DATASET}"
 CHECKPOINT_BASE="${DATA_BASE}/ffw_sh5/right"
 
 FORCE="${FORCE:-0}"
+# Set VIDEO=1 to record an mp4 of env 0's rollout into <OUT_DIR>/videos/
+VIDEO="${VIDEO:-0}"
+VIDEO_LENGTH="${VIDEO_LENGTH:-300}"
 
 # ── Parse sequence key → (object_id, trajectory_task, data_id) ───────────────
 # HO-Cap key format: subject_{N}-{DATE_TIME}-{G_OBJECT_ID}
@@ -123,6 +126,11 @@ for key in "${SEQUENCES[@]}"; do
         continue
     fi
 
+    VIDEO_ARGS=()
+    if [[ "${VIDEO}" -eq 1 ]]; then
+        VIDEO_ARGS=(--video --video_length "${VIDEO_LENGTH}")
+    fi
+
     cd "${PROJECT_DIR}"
     python scripts/skrl/rollout.py \
         --task        "${TASK}" \
@@ -130,6 +138,7 @@ for key in "${SEQUENCES[@]}"; do
         --output_dir  "${OUT_DIR}" \
         --n_rollouts  "${N_ROLLOUTS}" \
         --headless \
+        "${VIDEO_ARGS[@]}" \
         --dataset             "${DATASET}" \
         --object_id           "${OBJECT_ID}" \
         --trajectory_task     "${TRAJECTORY_TASK}" \

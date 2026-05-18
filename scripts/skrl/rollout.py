@@ -31,8 +31,9 @@ parser.add_argument("--output_dir", type=str, required=True, help="Directory to 
 parser.add_argument("--n_rollouts", type=int, default=32, help="Number of parallel rollout episodes.")
 parser.add_argument("--max_steps", type=int, default=5000, help="Hard cap on simulation steps per rollout batch.")
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--deterministic", action="store_true", default=False,
-                    help="Use policy mean actions (no sampling noise).")
+parser.add_argument("--stochastic", action="store_true", default=False,
+                    help="Sample actions from the policy Gaussian (default: deterministic, "
+                    "matches rl_games player.deterministic=True convention used in TJ/GR).")
 # Video recording
 parser.add_argument("--video", action="store_true", default=False,
                     help="Record a video of the rollout into <output_dir>/videos/.")
@@ -198,6 +199,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy = runner.agent.models["policy"]
     policy.eval()
 
+    # IMPORTANT: skrl PPO normalizes observations via _state_preprocessor before
+    # passing them to the policy network (RunningStandardScaler with stats learned
+    # during training). We must apply the same normalization here — otherwise the
+    # policy sees raw observations far outside its training distribution.
+    state_preprocessor = runner.agent._state_preprocessor
+
     device = runner.agent.device
     actual_env = env.unwrapped  # RobotisSh5GraspEnv
 
@@ -224,8 +231,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     for _step in range(args_cli.max_steps):
         with torch.no_grad():
-            actions, _, outputs = policy.act({"states": obs}, "policy")
-            if args_cli.deterministic:
+            obs_norm = state_preprocessor(obs)   # apply training-time normalization stats
+            actions, _, outputs = policy.act({"states": obs_norm}, "policy")
+            # Default: deterministic (use policy mean). Pass --stochastic to sample.
+            if not args_cli.stochastic:
                 actions = outputs.get("mean_actions", actions)
 
         obs, rewards, terminated, truncated, _info = env.step(actions)
