@@ -140,13 +140,19 @@ Some examples of packages that can likely be excluded are:
 
 ### Overview
 
-`Robotis-Sh5-Grasp-Direct-v0` is a dexterous grasping environment for the FFW-SH5 full-body robot.
-The policy controls 27 joints (20 right-hand fingers + 7 right arm) and outputs one additional
-mass parameter (MassDexMimic), totalling a **28-dimensional action space**. The lift joint is
-held at a fixed target (URDF upper limit) by the PD controller every step and is **not part of
-the action**, but remains in the observation for state awareness.
-Reference trajectories come from the [OakInk-Image](https://oakink.net/) dataset or the
-[HO-Cap](https://github.com/NVlabs/HO-Cap) dataset, both stored in SPIDER format.
+The grasp task trains a policy to retarget human hand motion from the
+[OakInk-Image](https://oakink.net/) or [HO-Cap](https://github.com/NVlabs/HO-Cap) dataset
+(both stored in SPIDER format) onto the FFW-SH5 right hand/arm.
+
+Two variants are provided:
+
+| Variant | Task IDs | Algorithm | Action layout |
+|---|---|---|---|
+| **Single-agent** | `Robotis-Sh5-Grasp-{Pretrain-,}Direct-v0` | PPO + MassDexMimic | 28D: fingers(20) + arm(7) + mass(1) |
+| **Multi-agent (HAPPO)** | `Robotis-Sh5-Grasp-Marl-{Pretrain-,}Direct-v0` | HAPPO (Kuba 2022): single shared critic + team reward + sequential actor updates with recursive M + hand→arm forward conditioning | dict: arm(7), hand(20) |
+
+The lift joint is held at a fixed target by the PD controller every step in both variants
+and is **not part of the action**, but remains in the observation for state awareness.
 
 ### Data Preparation
 
@@ -202,7 +208,9 @@ Format: `{"A01001": [min_kg, max_kg], ...}`
 
 This file is loaded automatically at training time to set `object_mass_min` / `object_mass_max`
 per object. If an object is missing from the JSON or has `null` values, the default
-`[0.05, 0.20] kg` is used as fallback.
+`[0.05, 0.20] kg` is used as fallback. In single-agent the mass is sampled per episode
+via MassDexMimic; in MARL the same range is used by the standalone `MassDistribution`
+module (see "Mass-in-the-loop" below).
 
 To regenerate the table using the Claude Vision API (requires `pip install anthropic`):
 
@@ -279,7 +287,7 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
 python scripts/random_agent.py --task=Robotis-Sh5-Grasp-Direct-v0
 ```
 
-#### Train with SKRL (recommended)
+#### Train — single-agent PPO
 
 ```bash
 python scripts/skrl/train.py --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048
@@ -289,7 +297,22 @@ Add `--video --video_length 200 --video_interval 1000` to record an mp4 every 10
 into `logs/skrl/<task>/<run>/videos/train/`. Camera rendering needs significant VRAM —
 typically reduce `--num_envs` to 128–512 when recording video.
 
-#### Train with other RL frameworks
+#### Train — MARL (HAPPO)
+
+```bash
+python scripts/skrl/train_marl.py --task=Robotis-Sh5-Grasp-Marl-Direct-v0 \
+    --num_envs=2048 --headless \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0 \
+    --checkpoint <PRETRAIN_CKPT>
+```
+
+The `--task` argument must contain `"Marl"` — `train_marl.py` exits otherwise.
+Curriculum / sim-to-real workflows can use `--freeze-arm-from <CKPT>` or
+`--freeze-hand-from <CKPT>` to load one sub-agent from an external ckpt and freeze
+its parameters during training of the other.
+
+#### Train with other RL frameworks (single-agent only)
 
 ```bash
 python scripts/rsl_rl/train.py  --task=Robotis-Sh5-Grasp-Direct-v0 --num_envs=2048
@@ -300,7 +323,11 @@ python scripts/sb3/train.py      --task=Robotis-Sh5-Grasp-Direct-v0
 #### Play / inference
 
 ```bash
-python scripts/skrl/play.py --task=Robotis-Sh5-Grasp-Direct-v0 --checkpoint=<CHECKPOINT_PATH>
+# Single-agent
+python scripts/skrl/play.py --task=Robotis-Sh5-Grasp-Direct-v0 --checkpoint=<CKPT>
+
+# MARL
+python scripts/skrl/play_marl.py --task=Robotis-Sh5-Grasp-Marl-Direct-v0 --checkpoint=<CKPT>
 ```
 
 ### Benchmark: Multi-sequence Training & Evaluation
@@ -309,25 +336,33 @@ Scripts under `scripts/benchmark/` provide an end-to-end pipeline for training o
 and evaluating with standardised metrics (E_t, E_r, E_j, E_ft) compatible with the
 [ManipTrans / DexMachina evaluation protocol](https://github.com).
 
+Each dataset has **two parallel pipelines** — single-agent and MARL — that write to
+**separate** model trees (`ffw_sh5/` and `ffw_sh5_marl/`), so both can be trained and
+evaluated side-by-side without clobbering each other.
+
 #### Directory layout produced
 
-Results are stored per dataset so OakInk and HO-Cap outputs never collide.
-The `ffw_sh5/` tree mirrors the `mano/` tree exactly.
+Results are stored per dataset so OakInk and HO-Cap outputs never collide. The
+`ffw_sh5/` and `ffw_sh5_marl/` trees mirror the `mano/` tree exactly.
 
 ```
 source/robotis_sh5/data/processed/<dataset>/   # e.g. oakink/ or hocap/
 ├── mano/right/<trajectory_task>/<data_id>/    ← reference trajectories (source)
 ├── object_mass.json                           ← per-object mass ranges
-├── ffw_sh5/right/<trajectory_task>/<data_id>/
+├── ffw_sh5/right/<trajectory_task>/<data_id>/         ← SINGLE-AGENT outputs
 │   ├── pretrain.pt              ← saved after pretrain
 │   ├── agent.pt                 ← saved after train
-│   ├── task_info.json           ← training metadata (checkpoint path, timesteps, seed, …)
+│   ├── task_info.json           ← training metadata
 │   └── evaluation_ep_le_<N>/
-│       └── metrics.csv          ← 32 rollout rows per sequence
-├── ffw_sh5_method1.csv          ← ManipTrans aggregate (all 4 metrics)
-├── ffw_sh5_method2.csv          ← DexMachina aggregate (E_t + E_r only)
-└── ffw_sh5_method3.csv          ← Mean over all rollouts
+│       └── metrics.csv          ← N_ROLLOUTS rollout rows per sequence
+├── ffw_sh5_marl/right/<trajectory_task>/<data_id>/    ← MARL outputs (same structure)
+├── ffw_sh5_method{1,2,3}.csv          ← single-agent aggregates
+└── ffw_sh5_marl_method{1,2,3}.csv     ← MARL aggregates
 ```
+
+`evaluate.bash` automatically iterates over every `ffw_sh5*/` subdirectory and produces
+per-model aggregate CSVs, so running it once after both pipelines complete yields
+side-by-side method tables.
 
 `task_info.json` is written automatically after each training run and records:
 
@@ -348,15 +383,17 @@ source/robotis_sh5/data/processed/<dataset>/   # e.g. oakink/ or hocap/
 | `trained_at` | ISO-8601 timestamp |
 
 Per-dataset scripts live under `scripts/benchmark/oakink/` and `scripts/benchmark/hocap/`.
-The two trees mirror each other (same flags, same env-var contract).
+The two trees mirror each other (same flags, same env-var contract). Within each dataset,
+the `_marl` variant scripts use the same flag conventions as the single-agent ones.
 
 #### Step 1 — Configure sequences
 
 Each entry in `SEQUENCES` matches the corresponding `mano/right/` folder name:
 `{OBJECT_ID}-{SEQ}-{GESTURE}` (OakInk) or `subject_{N}-{DATE_TIME}-{G_OBJECT_ID}` (HO-Cap).
+The same list is shared between single-agent and MARL variants of a dataset.
 
 ```bash
-# scripts/benchmark/oakink/train_sequences.sh
+# scripts/benchmark/oakink/train_sequences.sh   (and train_sequences_marl.sh)
 SEQUENCES=(
     "C11001-0001-0007"   # → object_id=C11001, task=C11001-0001-0007
     "A01001-0001-0000"
@@ -366,9 +403,13 @@ SEQUENCES=(
 #### Step 2 — Train (dataset → IK → pretrain → train)
 
 ```bash
-# Run the full pipeline for all sequences; skip steps already completed.
+# Single-agent pipeline (default — writes to ffw_sh5/)
 bash scripts/benchmark/oakink/train_sequences.sh
 bash scripts/benchmark/hocap/train_sequences.sh
+
+# MARL pipeline (writes to ffw_sh5_marl/ — runs independently of single-agent)
+bash scripts/benchmark/oakink/train_sequences_marl.sh
+bash scripts/benchmark/hocap/train_sequences_marl.sh
 
 # Force re-running all steps even if outputs already exist.
 FORCE=1 bash scripts/benchmark/oakink/train_sequences.sh
@@ -385,33 +426,33 @@ VIDEO=1 VIDEO_LENGTH=300 VIDEO_INTERVAL=2000 NUM_ENVS=256 \
     bash scripts/benchmark/oakink/train_sequences.sh
 ```
 
-`train_sequences.sh` runs **four steps per sequence** in order:
+Each `train_sequences*.sh` runs **four steps per sequence** in order:
 
 | Step | Action | Skip condition |
 |---|---|---|
 | 1. Data check | Verify `mano/right/<task>/` exists | Error if missing |
 | 2. Frame-0 arm IK | `scripts/process_dataset/compute_frame0_ik.py --dataset <DATASET>` | `frame0_arm_joint_pos.npy` exists |
-| 3. Pretrain | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | `pretrain.pt` exists |
-| 4. Train | `Robotis-Sh5-Grasp-Direct-v0` | `agent.pt` exists |
+| 3. Pretrain | `<TASK_PRETRAIN>` for `PRETRAIN_TIMESTEPS` env steps | `pretrain.pt` exists |
+| 4. Train | `<TASK>` for `TIMESTEPS` env steps, loading pretrain.pt | `agent.pt` exists |
 
-Key settings at the top of the script and supported env-var overrides:
+Key settings at the top of each script and supported env-var overrides:
 
-| Variable | Default | Type | Meaning |
-|---|---|---|---|
-| `DATASET` | `oakink` / `hocap` | fixed | Determined by script subdir |
-| `TASK_PRETRAIN` | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | fixed | Pretrain task name |
-| `TASK` | `Robotis-Sh5-Grasp-Direct-v0` | fixed | Train task name |
-| `PRETRAIN_NUM_ENVS` | `4096` | env-var | Parallel environments for pretrain |
-| `NUM_ENVS` | `2048` | env-var | Parallel environments for train |
-| `PRETRAIN_TIMESTEPS` | `3000` (oakink) / `10000` (hocap) | fixed | Pretrain env steps |
-| `TIMESTEPS` | `10000` (oakink) / `40000` (hocap) | fixed | Train env steps |
-| `FORCE` | `0` | env-var | Re-run even if outputs exist |
-| `VIDEO` | `0` | env-var | Record training videos (`--video`) |
-| `VIDEO_LENGTH` | `200` | env-var | Frames per recording |
-| `VIDEO_INTERVAL` | `1000` | env-var | Env-steps between recordings |
+| Variable | Default (oakink) | Default (hocap) | Type | Meaning |
+|---|---|---|---|---|
+| `DATASET` | `oakink` | `hocap` | fixed | Determined by script subdir |
+| `TASK_PRETRAIN` | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` (single) / `…-Marl-Pretrain-…` (MARL) | same | fixed | Pretrain task name |
+| `TASK` | `Robotis-Sh5-Grasp-Direct-v0` (single) / `…-Marl-…` (MARL) | same | fixed | Train task name |
+| `PRETRAIN_NUM_ENVS` | `4096` | `4096` | env-var | Parallel environments for pretrain |
+| `NUM_ENVS` | `2048` | `2048` | env-var | Parallel environments for train |
+| `PRETRAIN_TIMESTEPS` | `5000` | `10000` | fixed | Pretrain env steps |
+| `TIMESTEPS` | `20000` | `40000` | fixed | Train env steps |
+| `FORCE` | `0` | `0` | env-var | Re-run even if outputs exist |
+| `VIDEO` | `0` | `0` | env-var | Record training videos (`--video`) |
+| `VIDEO_LENGTH` | `200` | `200` | env-var | Frames per recording |
+| `VIDEO_INTERVAL` | `1000` | `1000` | env-var | Env-steps between recordings |
 
 Checkpoints and `task_info.json` are saved to
-`source/robotis_sh5/data/processed/<dataset>/ffw_sh5/right/<trajectory_task>/<data_id>/`.
+`source/robotis_sh5/data/processed/<dataset>/{ffw_sh5,ffw_sh5_marl}/right/<trajectory_task>/<data_id>/`.
 
 You can also run individual steps manually for a single sequence:
 
@@ -424,37 +465,49 @@ python scripts/process_dataset/oakink.py \
 python scripts/process_dataset/compute_frame0_ik.py \
     --dataset oakink --task C11001-0001-0007 --data_id 0
 
-# Step 3: pretrain
+# Step 3: pretrain (single-agent)
 python scripts/skrl/train.py \
     --task Robotis-Sh5-Grasp-Pretrain-Direct-v0 \
-    --num_envs 4096 --timesteps 3000 --headless \
+    --num_envs 4096 --timesteps 5000 --headless \
     --dataset oakink --object_id C11001 \
     --trajectory_task C11001-0001-0007 --trajectory_data_id 0
 
-# Step 4: train (pass pretrain checkpoint via --checkpoint)
+# Step 4: train (single-agent, pass pretrain.pt via --checkpoint)
 python scripts/skrl/train.py \
     --task Robotis-Sh5-Grasp-Direct-v0 \
-    --num_envs 2048 --timesteps 10000 --headless \
+    --num_envs 2048 --timesteps 20000 --headless \
     --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/pretrain.pt \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+
+# MARL pretrain + train (same flags, different scripts/tasks/output tree)
+python scripts/skrl/train_marl.py \
+    --task Robotis-Sh5-Grasp-Marl-Pretrain-Direct-v0 \
+    --num_envs 4096 --timesteps 5000 --headless \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+
+python scripts/skrl/train_marl.py \
+    --task Robotis-Sh5-Grasp-Marl-Direct-v0 \
+    --num_envs 2048 --timesteps 20000 --headless \
+    --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5_marl/right/C11001-0001-0007/0/pretrain.pt \
     --dataset oakink --object_id C11001 \
     --trajectory_task C11001-0001-0007 --trajectory_data_id 0
 
 # With video recording (reduce num_envs to fit GPU VRAM)
-python scripts/skrl/train.py \
-    --task Robotis-Sh5-Grasp-Direct-v0 \
-    --num_envs 256 --timesteps 10000 --headless \
-    --video --video_length 200 --video_interval 1000 \
-    --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/pretrain.pt \
-    --dataset oakink --object_id C11001 \
-    --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+python scripts/skrl/train.py ... --num_envs 256 --video --video_length 200 --video_interval 1000
 ```
 
 #### Step 3 — Evaluate
 
 ```bash
-# Run rollouts + produce aggregate CSVs for all sequences.
+# Single-agent rollouts + aggregate CSVs
 bash scripts/benchmark/oakink/evaluate_sequences.sh
 bash scripts/benchmark/hocap/evaluate_sequences.sh
+
+# MARL rollouts + aggregate CSVs
+bash scripts/benchmark/oakink/evaluate_sequences_marl.sh
+bash scripts/benchmark/hocap/evaluate_sequences_marl.sh
 
 # Force re-running rollouts even if metrics.csv already exists.
 FORCE=1 bash scripts/benchmark/oakink/evaluate_sequences.sh
@@ -462,34 +515,47 @@ FORCE=1 bash scripts/benchmark/oakink/evaluate_sequences.sh
 # Record an mp4 of env 0's rollout into <OUT_DIR>/videos/ for each sequence.
 VIDEO=1 bash scripts/benchmark/oakink/evaluate_sequences.sh
 
+# Stochastic rollouts (sample from policy Gaussian; default = mean / deterministic).
+STOCHASTIC=1 bash scripts/benchmark/oakink/evaluate_sequences.sh
+
 # Custom video length (default 300 steps)
 VIDEO=1 VIDEO_LENGTH=500 bash scripts/benchmark/oakink/evaluate_sequences.sh
 ```
 
-Key settings and supported env-var overrides for `evaluate_sequences.sh`:
+Key settings and supported env-var overrides for `evaluate_sequences*.sh`:
 
 | Variable | Default | Type | Meaning |
 |---|---|---|---|
 | `DATASET` | `oakink` / `hocap` | fixed | Determined by script subdir |
 | `N_ROLLOUTS` | `32` | fixed | Parallel rollout episodes per sequence |
-| `TIMESTEPS` | `10000` | fixed | Used only for output directory naming (must match training) |
+| `TIMESTEPS` | matches train script | fixed | Used only for output directory naming |
 | `FORCE` | `0` | env-var | Re-run rollouts even if `metrics.csv` exists |
 | `VIDEO` | `0` | env-var | Record video of env 0's rollout |
 | `VIDEO_LENGTH` | `300` | env-var | Frames per recording |
+| `STOCHASTIC` | `0` | env-var | Sample stochastic actions instead of mean |
 
 Rollouts are **deterministic by default** (mean action) — matches the rl-games
-`player.deterministic=True` convention used in TJ/GR. Pass `--stochastic` to
-sample from the policy Gaussian instead.
+`player.deterministic=True` convention used in TJ/GR. Pass `--stochastic`
+(or `STOCHASTIC=1` to the benchmark scripts) to sample from the policy Gaussian.
 
 You can also run rollout on a single sequence manually:
 
 ```bash
+# Single-agent
 python scripts/skrl/rollout.py \
     --task Robotis-Sh5-Grasp-Direct-v0 \
     --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/agent.pt \
-    --output_dir  source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/evaluation_ep_le_10000 \
-    --n_rollouts 32 \
-    --headless \
+    --output_dir  source/robotis_sh5/data/processed/oakink/ffw_sh5/right/C11001-0001-0007/0/evaluation_ep_le_20000 \
+    --n_rollouts 32 --headless \
+    --dataset oakink --object_id C11001 \
+    --trajectory_task C11001-0001-0007 --trajectory_data_id 0
+
+# MARL
+python scripts/skrl/rollout_marl.py \
+    --task Robotis-Sh5-Grasp-Marl-Direct-v0 \
+    --checkpoint source/robotis_sh5/data/processed/oakink/ffw_sh5_marl/right/C11001-0001-0007/0/agent.pt \
+    --output_dir  source/robotis_sh5/data/processed/oakink/ffw_sh5_marl/right/C11001-0001-0007/0/evaluation_ep_le_20000 \
+    --n_rollouts 32 --headless \
     --dataset oakink --object_id C11001 \
     --trajectory_task C11001-0001-0007 --trajectory_data_id 0
 
@@ -502,8 +568,9 @@ python scripts/skrl/rollout.py ... --video --video_length 300
 If rollouts are already done and you only want to recompute the CSV summaries:
 
 ```bash
-# Aggregate one dataset
+# Aggregate one dataset — picks up every ffw_sh5*/ subdir automatically.
 bash scripts/benchmark/evaluate.bash source/robotis_sh5/data/processed/oakink
+# → writes ffw_sh5_method{1,2,3}.csv and ffw_sh5_marl_method{1,2,3}.csv
 ```
 
 #### Evaluation metrics
@@ -539,6 +606,8 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
 
 ### Environment Details
 
+#### Single-agent (`Robotis-Sh5-Grasp-Direct-v0`)
+
 | Item | Value |
 |---|---|
 | Action space | 28 (fingers 20 + arm_r 7 + mass 1); lift held fixed at top |
@@ -548,6 +617,7 @@ python scripts/zero_agent.py --task=Robotis-Sh5-Grasp-Direct-v0 --enable_cameras
 | Default num_envs | 2048 |
 | Default object | `C11001` |
 | Supported datasets | `oakink`, `hocap` |
+| Action smoothing α | 0.3 (EMA on new action) |
 
 **Action breakdown (28-dim):**
 
@@ -583,6 +653,77 @@ re-add it to `_action_joint_ids` in `robotis_sh5_grasp_env.py` and bump `action_
 | `future_contact` | 5 | Predicted contact flag per fingertip |
 | `prev_action` | 28 | Previous action (27 joints + 1 mass) |
 | `fingertip_forces` | 5 | Normal contact force per fingertip |
+
+#### MARL (`Robotis-Sh5-Grasp-Marl-Direct-v0`)
+
+| Item | Value |
+|---|---|
+| Action spaces (per-agent dict) | `{"arm": 7, "hand": 20}` (mass is NOT in the action) |
+| Observation spaces (per-agent dict) | `{"arm": 54, "hand": 276}` |
+| Centralised critic state | 279 (explicit, non-redundant — see below) |
+| Control frequency | 30 Hz (decimation=4 @ 120 Hz physics) |
+| Default num_envs | 2048 |
+| Action smoothing α | 0.4 (EMA on new action; raised from 0.3 to reduce smoothing lag) |
+| `rew_arm_action_rate` | -0.01 (weakened from -0.05; wrist joints 5/6/7 weighted ×5) |
+| Mass-in-the-loop | `enable_mass_in_loop=True` (per-episode mass via learned `MassDistribution`) |
+
+**Architecture** (`robotis_sh5_grasp_marl_env.py` + `scripts/skrl/train_marl.py`):
+
+**HAPPO** (Kuba et al. 2022, "Trust Region Policy Optimisation in Multi-Agent RL",
+Algorithm 4) — **single shared centralised critic V(s_global) with critic-specific
+optimizer, sequential actor updates with recursive advantage M, on a shared team
+reward** (identical formula to the single-agent reward). The hand agent decides first
+in the forward pass (its action is injected into the arm's observation slot), and the
+update follows the same order (hand → arm) with recursive M for monotonic improvement.
+Four monkey-patches in `train_marl.py` after Runner construction:
+
+| Patch | Effect |
+|---|---|
+| `_setup_happo_optimizers` | (a) Shares the critic instance across all agents (anchored under `"arm"` for skrl save/load). (b) Creates a dedicated `_critic_optimizer = Adam([V_φ.params])` separate from any actor. (c) Replaces per-agent optimizers with `Adam([policies[uid].params])` — policy only. KLAdaptiveLR per actor; critic LR constant. |
+| `_patch_sequential_act` | Forward: hand acts → its action is `.detach()`'d into arm obs slot `[40:60]` → arm acts. `record_transition` stores the *injected* arm obs (PPO ratio consistency between rollout and training). Also routes env logging directly to `agent.track_data()` so per-group Tensorboard tabs work (see below). |
+| `_patch_happo_update` | Replaces skrl's `_update` with HAPPO Algorithm 4: (1) single GAE compute → M_{1:1} = Â; (2) sequential PPO-clip actor updates in `["hand", "arm"]` order, each using its own M as advantage; (3) after each actor (except last), `M_{1:m+1} = (π^m_new/π^m_old) · M_{1:m}` computed over all stored transitions; (4) separate critic optimization step (`_critic_optimizer`) at end; (5) advantages slot restored to Â for mass-in-loop. |
+| `_setup_mass_in_loop` | Creates `MassDistribution` (μ_mass, log_σ_mass as standalone `nn.Parameter`s). Per-episode samples mass from `N(μ, e^logσ)`, applies via PhysX `set_masses`. After the HAPPO update, runs a mass mini-PPO with PPO-surrogate + ratio clipping using per-step advantages from memory (mirrors single-agent MassDexMimic behaviour, but keeps mass *outside* the action vector). |
+
+**Hand obs (276-dim)** — full single-agent grasping context minus mass + lift:
+21 MANO kpts (63) + wrist quat/lin/ang (4+3+3) + fingertip vel (15) + 27D joint pos/vel
+(no lift) + object pos/quat/lin/ang (3+4+3+3) + delta_kpts_world (63) + delta_ft_obj (15)
++ delta_obj_pos/rot (3+3) + future_contact (5) + 27D prev_action (no mass) +
+fingertip_forces (5).
+
+**Arm obs (60-dim)** — minimal wrist-pose follower:
+jp_arm (7) + jv_arm (7) + wrist pose env-pos + world-quat (3+4) + wrist linvel (3) +
+wrist angvel (3) + delta_wrist_pos (3) + delta_wrist_rot (3) + prev_arm_action (7) +
+**current_hand_action slot at [40:60]** (filled by forward sequential conditioning).
+
+**Shared state (279-dim)** — explicit non-redundant input for the centralised critic
+(`env._get_states()` returns this — `state_space` is set to a positive integer, NOT
+auto-flattened): hand_obs (276) + delta_wrist_rot (3). This avoids duplicating
+jp_arm / wrist_quat / prev_arm_action across the agent obs streams.
+
+**`MassDistribution`** (`agents/mass_distribution.py`):
+- `mu_mass`, `log_std_mass` as standalone `nn.Parameter`s (not part of any policy)
+- Per-env caches `current_mass_action` and `current_log_prob_old` (frozen until next reset)
+- `env._pre_physics_step` snapshots the cached values BEFORE end-of-step `_reset_idx` resamples
+- PPO ratio = `exp(log_prob_live(action; current μ/σ) − log_prob_old)` with the same
+  `ratio_clip` / `learning_epochs` / `mini_batches` as the main PPO config
+- Optimizers: μ_mass at `base_lr × mass_lr_scale` (33.333×, single-agent convention),
+  log_σ_mass at `base_lr`. Mass is excluded from entropy regularisation.
+
+#### Tensorboard tabs (MARL)
+
+The env emits log keys grouped by top-level prefix (separated by ` / `), and
+`train_marl.py` disables skrl trainer's automatic `"Info / "` prefix
+(`agent_cfg["trainer"]["environment_info"] = "__disabled__"`) so each group becomes
+its own Tensorboard tab:
+
+- **`Error /`** — kpts_mean_m, wrist_pos_m, wrist_rot_deg, obj_pos_m, obj_rot_deg, ft_mean_m
+- **`Episode_Reward /`** — alive, kpts, obj_pos, obj_rot, fingertip, fingertip_force,
+  hand/arm action_reg, hand/arm pose_reg, arm_action_rate, team_total
+- **`Mass /`** — mu_action, std_action, mu_kg, std_kg, loss, approx_kl, n_samples
+- **`Curriculum /`** — reached_frame, warmup_ratio, success_rate
+
+skrl's built-in tabs (`Reward / Total reward (...)`, `Reward / Instantaneous reward (...)`,
+`Loss /`, `Policy /`, `Episode / Total timesteps (...)`) appear in addition to the above.
 
 ---
 

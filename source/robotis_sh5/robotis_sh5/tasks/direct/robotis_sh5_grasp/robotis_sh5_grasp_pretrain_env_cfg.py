@@ -146,6 +146,9 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # Table
     table_pos_env: tuple = (0.3, 0.0, 0.0)
     table_size: tuple = (0.6, 0.6, 1.0)
+    # Tabletop overhang: thin top slab extends in +y (toward robot) — see train cfg comments.
+    tabletop_thickness: float = 0.2
+    tabletop_overhang_y_pos: float = 0.25
 
     # Object physics disabled
     object_mass: float = 0.2
@@ -160,26 +163,30 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # TJ/rl_games convention: smoothed = alpha * current + (1 - alpha) * prev
     # alpha = weight on the new (raw) action. alpha=1.0 → no smoothing; lower alpha = smoother.
     # alpha=0.3 ≡ legacy (alpha-prev convention) value 0.7, same behavior.
-    action_smoothing: float = 0.3
+    action_smoothing: float = 0.5   # finger EMA α — higher = more responsive
+    # Arm-only EMA alpha (overrides action_smoothing for arm_r slice [20:27]).
+    # Lower α = stronger smoothing → less wrist tremor; hand keeps action_smoothing.
+    arm_action_smoothing: float = 0.2
 
     # Reward scales (GR pretrain: 1.5*alive - clamp(1.76*kpts + 12.5*ft, 1.5) + reg)
     rew_alive: float = 1.5
     rew_kpts: float = -1.76           # GR pretrain: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
     rew_fingertip: float = -12.5
     rew_fingertip_force: float = 0.0
-    rew_action_reg: float = -0.004    # action_penalty_scale in GR
-    rew_pose_reg: float = -0.001      # dof_penalty_scale in GR
-    rew_action_rate: float = -0.01    # penalize rapid action changes to reduce trembling
-    # Joint-state smoothness (see train env_cfg comments for rationale).
-    rew_joint_vel: float = -1.0e-4
-    rew_joint_acc: float = -1.0e-4
-    rew_joint_effort: float = -1.0e-5
+    # Action/pose regularization split by region (3× stronger on arm than hand).
+    # Action layout (pretrain, no mass): [fingers(20) | arm_r(7)]; pose excludes lift.
+    rew_hand_action_reg: float = -0.004
+    rew_arm_action_reg:  float = -0.004   # matches hand (was 3× = -0.012)
+    rew_hand_pose_reg:   float = -0.001
+    rew_arm_pose_reg:    float = -0.001   # matches hand (was 3× = -0.003)
 
     # Termination (fingertip + wrist only — no object-based termination)
     termination: bool = True
     max_wrist_pos_err: float = 0.15
     max_wrist_rot_err: float = 0.75   # GR pretrain: delta_hand_rot_value > 0.75
     max_ft_mean_err: float = 0.15     # GR uses > 0.1 threshold
+    # Grace period: disable early termination for the first N frames of each episode. 0 = disabled.
+    early_termination_grace_frames: int = 0
 
     # Debug visualization
     debug_vis: bool = True
@@ -194,7 +201,17 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # To restore original behavior (no warm-up logic): set enable_warmup=False
     # and remove the [WARMUP] blocks in robotis_sh5_grasp_pretrain_env.py.
     # ── END WARMUP ────────────────────────────────────────────────────────────
-    enable_warmup: bool = False
+    enable_warmup: bool = False                # disabled — rely on state cache for adaptive_sampling
     warmup_ft_threshold: float = 0.15          # exit warm-up when ft mean err < this (m)
     warmup_wrist_threshold: float = 0.15       # exit warm-up when wrist pos err < this (m)
     warmup_wrist_rot_threshold: float = 0.75   # exit warm-up when wrist rot err < this (rad)
+
+    # ── Adaptive sampling (pretrain — state cache enabled) ─────────────────
+    # _reset_idx samples start_frame from failure-weighted EMA. With
+    # enable_warmup=False, this only works once the state cache has populated
+    # frames (cache miss → robot at frame-0 IK + start_frame > 0 → fast fail).
+    # Initial episodes always start at frame 0 (until _reached_frame > 0).
+    adaptive_sampling: bool = True
+    adaptive_alpha: float = 0.001              # EMA coefficient — matches train env
+    adaptive_uniform_ratio: float = 0.1        # uniform mixing ratio — matches train env
+    adaptive_back_seconds: float = 1.2         # rewind window (s); frames = int(action_fps × this). Matches TJ.

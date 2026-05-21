@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# evaluate_sequences.sh — Run rollouts for each sequence and aggregate metrics.
+# evaluate_sequences_marl.sh — Run MAPPO rollouts and aggregate metrics.
 #
-# For each sequence, this script:
-#   1. Loads the checkpoint from the checkpoints directory.
-#   2. Runs rollout.py to produce metrics.csv.
-#   3. After all rollouts, calls evaluate.bash to produce per-method CSV files.
-#
-# Output structure (evaluate.bash compatible):
-#   data/processed/<dataset>/ffw_sh5/<object_id>/<trajectory_task>/<data_id>/
-#       pretrain.pt / agent.pt          ← checkpoints (written by train_sequences.sh)
-#       evaluation_ep_le_<TIMESTEPS>/metrics.csv
-#
-# Aggregate CSVs are written to:
-#   data/processed/<dataset>/ffw_sh5_method{1,2,3}.csv
+# Multi-agent variant of evaluate_sequences.sh. For each sequence:
+#   1. Loads the MAPPO checkpoint from data/processed/<dataset>/ffw_sh5_marl/right/...
+#   2. Runs rollout_marl.py to produce metrics.csv.
+#   3. After all rollouts, calls evaluate.bash on <DATA_BASE> to produce per-method
+#      CSVs. Both `ffw_sh5` (single-agent) and `ffw_sh5_marl` are picked up
+#      automatically and aggregated into separate `<model>_method{1,2,3}.csv` files.
 #
 # Set FORCE=1 to re-run rollouts even when metrics.csv already exists.
 # =============================================================================
@@ -21,13 +15,12 @@ set -euo pipefail
 
 # ── User configuration ────────────────────────────────────────────────────────
 
-TASK="Robotis-Sh5-Grasp-Direct-v0"
+TASK="Robotis-Sh5-Grasp-Marl-Direct-v0"
 DATASET="oakink"
 N_ROLLOUTS=32
-# Must match the timesteps used during training (used for directory naming only).
 TIMESTEPS=16000
 
-# Sequence keys — format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
+# Sequence keys — must match train_sequences_marl.sh
 SEQUENCES=(
     "A02014-0001-0005"
     "A02021-0001-0005"
@@ -70,18 +63,15 @@ SEQUENCES=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/${DATASET}"
-CHECKPOINT_BASE="${DATA_BASE}/ffw_sh5/right"
+CHECKPOINT_BASE="${DATA_BASE}/ffw_sh5_marl/right"
 
 FORCE="${FORCE:-0}"
-# Set VIDEO=1 to record an mp4 of env 0's rollout into <OUT_DIR>/videos/
 VIDEO="${VIDEO:-0}"
 VIDEO_LENGTH="${VIDEO_LENGTH:-300}"
-# Set STOCHASTIC=1 to sample actions from the policy Gaussian (matches training behavior).
-# Default 0 = deterministic (mean action; matches rl_games player.deterministic=True).
+# Set STOCHASTIC=1 to sample stochastic actions (default: deterministic mean).
 STOCHASTIC="${STOCHASTIC:-0}"
 
 # ── Parse sequence key → (object_id, trajectory_task, data_id) ───────────────
-# Key format matches mano/right folder names: {OBJECT_ID}-{SEQ}-{GESTURE}
 parse_seq() {
     local key="$1"
     IFS='-' read -ra parts <<< "${key}"
@@ -96,7 +86,6 @@ parse_seq() {
 
 TOTAL="${#SEQUENCES[@]}"
 IDX=0
-DATASETS_SEEN="${DATASET}"   # single dataset for now; extend if needed
 
 for key in "${SEQUENCES[@]}"; do
     IDX=$(( IDX + 1 ))
@@ -108,19 +97,19 @@ for key in "${SEQUENCES[@]}"; do
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "[eval ${IDX}/${TOTAL}] ${key}"
+    echo "[eval-marl ${IDX}/${TOTAL}] ${key}"
     echo "  object=${OBJECT_ID}  traj=${TRAJECTORY_TASK}  id=${DATA_ID}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [[ ! -f "${CKPT_FILE}" ]]; then
-        echo "[eval] ERROR: Checkpoint not found — run train_sequences.sh first."
-        echo "       ${CKPT_FILE}"
+        echo "[eval-marl] ERROR: MARL checkpoint not found — run train_sequences_marl.sh first."
+        echo "            ${CKPT_FILE}"
         continue
     fi
 
     if [[ -f "${OUT_DIR}/metrics.csv" && "${FORCE}" -eq 0 ]]; then
-        echo "[eval] metrics.csv already exists — skipping rollout.  (set FORCE=1 to override)"
-        echo "       ${OUT_DIR}/metrics.csv"
+        echo "[eval-marl] metrics.csv already exists — skipping rollout.  (set FORCE=1 to override)"
+        echo "            ${OUT_DIR}/metrics.csv"
         continue
     fi
 
@@ -135,7 +124,7 @@ for key in "${SEQUENCES[@]}"; do
     fi
 
     cd "${PROJECT_DIR}"
-    python scripts/skrl/rollout.py \
+    python scripts/skrl/rollout_marl.py \
         --task        "${TASK}" \
         --checkpoint  "${CKPT_FILE}" \
         --output_dir  "${OUT_DIR}" \
@@ -153,11 +142,12 @@ done
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "[eval] Aggregating metrics for dataset '${DATASET}' ..."
+echo "[eval-marl] Aggregating metrics for dataset '${DATASET}' ..."
 bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "[eval] Done.  Results written to:"
-echo "       ${DATA_BASE}/ffw_sh5_method{1,2,3}.csv"
+echo "[eval-marl] Done.  Results written to:"
+echo "            ${DATA_BASE}/ffw_sh5_marl_method{1,2,3}.csv"
+echo "            (alongside ${DATA_BASE}/ffw_sh5_method{1,2,3}.csv if present)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

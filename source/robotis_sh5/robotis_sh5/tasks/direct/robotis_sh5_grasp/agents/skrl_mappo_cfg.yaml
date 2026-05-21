@@ -1,6 +1,10 @@
 seed: 42
 
 
+# Models (one template per agent; skrl instantiates one set per agent in
+# possible_agents when `separate: True`). Same architecture as single-agent PPO.
+# Policy reads OBSERVATIONS (per-agent dict slice); value reads STATES (the centralized
+# critic input — auto-flattened concat(arm_obs, hand_obs) when state_space = -1).
 models:
   separate: True
   policy:
@@ -9,7 +13,7 @@ models:
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 0.75
-    initial_log_std: -1.5141  # ln(0.22) ≈ -1.514 → σ=0.22 as in MassDexMimic paper
+    initial_log_std: -1.5141  # σ=0.22 (same as single-agent)
     network:
       - name: net
         input: OBSERVATIONS
@@ -21,19 +25,21 @@ models:
     clip_actions: False
     network:
       - name: net
-        input: OBSERVATIONS
+        input: STATES
         layers: [1024, 1024, 512, 512]
         activations: elu
     output: ONE
 
 
+# Rollout memory
 memory:
   class: RandomMemory
   memory_size: -1
 
 
+# MAPPO agent configuration (skrl MAPPO_DEFAULT_CONFIG)
 agent:
-  class: PPO
+  class: MAPPO
   rollouts: 8
   learning_epochs: 5
   mini_batches: 4
@@ -45,6 +51,8 @@ agent:
     kl_threshold: 0.016
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
+  shared_state_preprocessor: RunningStandardScaler
+  shared_state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
   random_timesteps: 0
@@ -59,14 +67,24 @@ agent:
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: False
   experiment:
-    directory: "robotis_sh5_grasp_pretrain"
+    directory: "robotis_sh5_grasp_marl"
     experiment_name: "default"
     write_interval: 100
     checkpoint_interval: 1000
     wandb: False
 
 
+# Sequential trainer
 trainer:
   class: SequentialTrainer
-  timesteps: 5000   # synced with MARL pretrain (was 3000)
+  timesteps: 20000
   environment_info: log
+
+
+# Project-specific overrides applied after Runner construction.
+#   arm_initial_log_std: override initial σ for ARM policy only (hand keeps yaml default).
+#     null = no override, arm uses models.policy.initial_log_std (= -1.5141 → σ=0.22),
+#       matching single-agent.
+#     Set to a numeric value (e.g. -2.303 → σ=0.10) to use a tighter arm Gaussian.
+project_overrides:
+  arm_initial_log_std: null

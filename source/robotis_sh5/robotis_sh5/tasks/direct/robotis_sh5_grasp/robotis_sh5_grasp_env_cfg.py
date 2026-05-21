@@ -42,11 +42,11 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             enabled_self_collisions=True,
             fix_root_link=True,   # full-body robot: base is fixed
             solver_position_iteration_count=8,
-            solver_velocity_iteration_count=2,
+            solver_velocity_iteration_count=4,
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.65, 0.60, 0.0),
+        pos=(0.65, 0.65, 0.0),
         rot=(0.70711, 0.0, 0.0, -0.70711),
         joint_pos={
             # Swerve base
@@ -84,42 +84,42 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             velocity_limit_sim=30.0,
             effort_limit_sim=100000.0,
             stiffness=10000.0,
-            damping=100.0,
+            damping=1000.0, # default: 100.0
         ),
         "lift": ImplicitActuatorCfg(
             joint_names_expr=["lift_joint"],
             velocity_limit_sim=0.2,
             effort_limit_sim=1000000.0,
             stiffness=10000.0,
-            damping=100.0,
+            damping=1000.0, # default: 100.0
         ),
         "DY_80": ImplicitActuatorCfg(
-            joint_names_expr=["arm_l_joint[1-2]", "arm_r_joint[1-2]"],
+            joint_names_expr=["arm_l_joint[1-3]", "arm_r_joint[1-3]"],
             velocity_limit_sim=15.0,
             effort_limit_sim=61.4,
             stiffness=600.0,
-            damping=30.0,
+            damping=90.0  # default: 30.0
         ),
         "DY_70": ImplicitActuatorCfg(
-            joint_names_expr=["arm_l_joint[3-6]", "arm_r_joint[3-6]"],
+            joint_names_expr=["arm_l_joint[4-6]", "arm_r_joint[4-6]"],
             velocity_limit_sim=15.0,
             effort_limit_sim=31.7,
             stiffness=600.0,
-            damping=20.0,
+            damping=60.0  # default: 20.0
         ),
         "DP_42": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint7", "arm_r_joint7"],
             velocity_limit_sim=6.0,
             effort_limit_sim=5.1,
             stiffness=200.0,
-            damping=3.0,
+            damping=20.0  # default: 3.0
         ),
         "hand": ImplicitActuatorCfg(
             joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
             velocity_limit_sim=2.2,
             effort_limit_sim=15.0,
             stiffness=20.0,
-            damping=0.5,
+            damping=0.5,  # default: 0.5
         ),
         "head": ImplicitActuatorCfg(
             joint_names_expr=["head_joint1", "head_joint2"],
@@ -261,11 +261,17 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Table (static cuboid): bottom center at table_pos_env, top surface at z = table_size[2]
     table_pos_env: tuple = (0.3, 0.0, 0.0)   # env-local XYZ of table bottom center
     table_size: tuple = (0.6, 0.6, 1.0)       # X × Y × Z dimensions in meters
+    # Tabletop overhang: thin top slab extends in +y (toward robot) so lift-and-place
+    # trajectories that bring the object toward the robot side stay over the table surface.
+    # Implementation: two cuboids — base body (`table_size` minus thickness) + top slab
+    # (table_size.y + overhang_y_pos by thickness). Robot base sits under the overhang.
+    tabletop_thickness: float = 0.2          # thickness of the overhanging top slab (m)
+    tabletop_overhang_y_pos: float = 0.25    # extra +y extension of the top slab (m); 0 = original single-cuboid behavior
 
     # Object physics
     object_mass: float = 0.2              # default mass (kg) used if mass-as-action is disabled
     object_mass_min: float = 0.04         # minimum object mass for mass-as-action sampling (kg)
-    object_mass_max: float = 0.10         # maximum object mass for mass-as-action sampling (kg)
+    object_mass_max: float = 0.20         # maximum object mass for mass-as-action sampling (kg)
     object_static_friction: float = 0.8
     object_dynamic_friction: float = 0.6
     object_restitution: float = 0.1
@@ -279,7 +285,10 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # smoothed value. So alpha=1.0 means no smoothing (use raw action as-is); lower alpha
     # means stronger smoothing (more lag, less trembling).
     # alpha=0.3 ≡ legacy (alpha-prev convention) value 0.7, same behavior.
-    action_smoothing: float = 0.3
+    action_smoothing: float = 0.5   # finger EMA α — higher = more responsive
+    # Arm-only EMA alpha (overrides action_smoothing for arm_r slice [20:27]).
+    # Lower α = stronger smoothing → less wrist tremor; hand keeps action_smoothing.
+    arm_action_smoothing: float = 0.2
 
     # Reward scales (GR env: 1.5*alive - clamp(4.26*pos + 1.0*rot + 5.2*ft + 1.76*kpts, 1.5) + force + reg)
     rew_alive: float = 1.5
@@ -288,18 +297,12 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     rew_obj_rot: float = -1.0         # GR env: 1.0
     rew_fingertip: float = -5.2       # GR env: 5.2
     rew_fingertip_force: float = 1.0  # GR env: 1.125 (slightly different normalization)
-    rew_action_reg: float = -0.004    # GR env: action_penalty_scale
-    rew_pose_reg: float = -0.001      # GR env: dof_penalty_scale
-    rew_action_rate: float = -0.01    # penalize rapid action changes to reduce trembling
-    # Joint-state smoothness penalties (suppress hand/arm jitter).
-    # joint_vel and joint_acc: applied over all 28 controlled joints (incl. lift).
-    # joint_effort: applied over the 27 action joints only — lift is held against gravity
-    # by the PD controller, so its steady-state torque is unavoidable and shouldn't be
-    # penalized.
-    rew_joint_vel: float = -1.0e-4       # ‖q̇‖² — penalize fast joint motion
-    rew_joint_acc: float = -1.0e-4       # ‖q̈‖² — penalize jerky joint motion (same weight as vel; |q̈| can be O(1000))
-    rew_joint_effort: float = -1.0e-5    # ‖τ‖²  — penalize actuator effort (kept small to avoid weakening grasp)
-
+    # Action/pose regularization split by region (3× stronger on arm than hand).
+    # Action layout: [fingers(20) | arm_r(7) | mass(1)]; pose excludes lift (PD-fixed).
+    rew_hand_action_reg: float = -0.004   # GR baseline kept for fingers
+    rew_arm_action_reg:  float = -0.004   # matches hand (was 3× = -0.012)
+    rew_hand_pose_reg:   float = -0.001
+    rew_arm_pose_reg:    float = -0.001   # matches hand (was 3× = -0.003); lift excluded
     # Termination
     # termination=False disables early termination entirely (only timeout) — use for warm-up.
     # GR env uses this flag to avoid infinite termination loops early in training when the
@@ -310,13 +313,17 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     max_obj_rot_err: float = 0.75     # object rotation tracking error (rad)
     max_wrist_pos_err: float = 0.15   # wrist (arm end-effector) position tracking error (m)
     max_wrist_rot_err: float = 0.75   # wrist rotation tracking error (rad) — matches GR env
-    max_ft_mean_err: float = 0.10     # mean fingertip tracking error (m) — GR uses > 0.1 threshold
+    max_ft_mean_err: float = 0.15     # mean fingertip tracking error (m) — synced with TJ (0.15) to absorb open-vs-curled finger mismatch at frame 0
+    # Grace period: disable early termination for the first N frames of each episode.
+    # Helps absorb the IK-lift offset and open-vs-curled finger mismatch at t=0.
+    # 0 = disabled (no grace; standard TJ behavior).
+    early_termination_grace_frames: int = 0
 
     # Adaptive rollout sampling (GR/TJ env style)
     adaptive_sampling: bool = True
     adaptive_alpha: float = 0.001            # EMA coefficient — matches GR env (slow, stable update)
     adaptive_uniform_ratio: float = 0.1      # uniform mixing ratio — matches GR env
-    adaptive_back_frames: int = 36           # start N frames before sampled failure frame (~1.2s at 30Hz)
+    adaptive_back_seconds: float = 1.2       # rewind window in seconds; frames = int(action_fps × this). Matches TJ `int(fps × 1.2)`.
     # Note: episode chunk length (TJ's ``num_frame_chunk``) is auto-derived at runtime as
     # ``round(episode_length_s * action_fps)`` — see env __init__. With default
     # ``episode_length_s = 5.0`` and ``action_fps = 30`` this gives 150 frames (TJ exact).

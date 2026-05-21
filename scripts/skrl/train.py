@@ -89,6 +89,7 @@ from pathlib import Path
 
 import gymnasium as gym
 import skrl
+import torch
 from packaging import version
 
 # check for minimum supported skrl version
@@ -222,6 +223,29 @@ def _patch_mass_policy(agent, policy_cfg: dict, learning_rate: float) -> None:
 
     print(f"[mass_policy] Patched policy with MassDexMimicPolicy "
           f"(base_lr={learning_rate:.2e}, mass_lr={learning_rate * _MASS_LR_SCALE:.4f})")
+
+
+def _patch_env_info_log(agent) -> None:
+    """Wrap agent.record_transition to manually iterate over `infos["log"]` and call
+    agent.track_data(key, value) for each scalar. Bypasses skrl trainer's hard-coded
+    "Info / " prefix (when `environment_info="__disabled__"`) so env-emitted keys
+    like "Error / X", "Episode_Reward / X", "Curriculum / X" land directly under
+    those Tensorboard tabs. Applies unconditionally — for both train and pretrain.
+    """
+    _orig_record = agent.record_transition
+
+    def _record_with_env_log(states, actions, rewards, next_states, terminated, truncated,
+                             infos, timestep, timesteps):
+        _orig_record(states, actions, rewards, next_states, terminated, truncated,
+                     infos, timestep, timesteps)
+        log_dict = infos.get("log") if isinstance(infos, dict) else None
+        if log_dict:
+            for k, v in log_dict.items():
+                if isinstance(v, torch.Tensor) and v.numel() == 1:
+                    agent.track_data(k, v.item())
+
+    agent.record_transition = _record_with_env_log
+    print(f"[env-info-log] Manual env extras['log'] → agent.track_data (bypasses skrl 'Info / ' prefix).")
 
 
 def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
@@ -405,7 +429,7 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
         agent.track_data("Policy / Standard deviation",
                          agent.policy.distribution(role="policy").stddev.mean().item())
         if agent._learning_rate_scheduler:
-            agent.track_data("Learning / Learning rate", agent.scheduler.get_last_lr()[0])
+            agent.track_data("Policy / Learning rate", agent.scheduler.get_last_lr()[0])
 
     agent._update = _update_with_per_batch_entropy
     print(f"[entropy_flip] GR-faithful: base={base_entropy_scale}, flip={_ENTROPY_FLIP_SCALE}")
@@ -495,6 +519,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.timesteps:
         agent_cfg["trainer"]["timesteps"] = args_cli.timesteps
     agent_cfg["trainer"]["close_environment_at_exit"] = False
+    # Disable skrl trainer's auto "Info / " prefix on env extras['log'] — we'll log
+    # those keys manually via the patched record_transition so they appear under
+    # the env's own group prefixes ("Error /", "Episode_Reward /", "Curriculum /").
+    agent_cfg["trainer"]["environment_info"] = "__disabled__"
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
         skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
@@ -573,9 +601,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # For the grasp train task: replace policy with mass-as-an-action model (Section 3.2).
     _is_grasp_train = "Grasp" in (args_cli.task or "") and "Pretrain" not in (args_cli.task or "")
+    _is_grasp_pretrain = "Grasp" in (args_cli.task or "") and "Pretrain" in (args_cli.task or "")
     if _is_grasp_train:
         _patch_mass_policy(runner.agent, agent_cfg["models"]["policy"], agent_cfg["agent"]["learning_rate"])
         _patch_entropy_flip(runner.agent, env, agent_cfg["agent"]["entropy_loss_scale"])
+
+    # Manual env-info → Tensorboard (applies to BOTH train and pretrain — trainer's
+    # auto-prefix "Info / " is disabled in main(), so this is the sole logging path
+    # for env extras['log'] keys like "Error /", "Episode_Reward /", "Curriculum /").
+    if _is_grasp_train or _is_grasp_pretrain:
+        _patch_env_info_log(runner.agent)
+
+    # For the grasp pretrain task: freeze log_std_parameter at YAML initial value (σ=0.22)
+    # to mirror TJ's `frozen_sigma: True` in rl_games_ppo_cfg_pretrain.yaml. The policy
+    # learns only mu during pretrain; exploration scale stays constant.
+    if _is_grasp_pretrain:
+        _policy = runner.agent.models["policy"]
+        if hasattr(_policy, "log_std_parameter"):
+            _policy.log_std_parameter.requires_grad_(False)
+            _ls = _policy.log_std_parameter.detach()
+            print(f"[INFO] Pretrain: log_std_parameter frozen, mean={_ls.mean().item():.4f} "
+                  f"(σ_mean={_ls.exp().mean().item():.4f}, n={_ls.numel()}).")
 
     # load checkpoint (if specified)
     if resume_path:
@@ -611,7 +657,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         try:
             success_rate = actual_env.extras.get("metrics", {}).get("success_rate", 0.0)
             if success_rate is not None:
-                agent.track_data("Metrics/success_rate", success_rate)
+                agent.track_data("Curriculum / success_rate", success_rate)
         except Exception as e:
             print(f"Error while logging success rate: {e}")
         

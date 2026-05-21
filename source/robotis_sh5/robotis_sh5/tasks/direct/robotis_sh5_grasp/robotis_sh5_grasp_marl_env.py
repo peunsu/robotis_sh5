@@ -1,18 +1,16 @@
-"""OakInk dexterous grasping environment — Isaac Lab Direct RL.
+"""OakInk dexterous grasping environment — Isaac Lab Direct **MARL** (MAPPO).
 
-Robot: FFW-SH5 full-body (fix_root_link=True).
-Policy controls right-hand fingers (20) + right arm (7) = 27 joint DOFs,
-plus 1 mass parameter dim = 28D action total.
-Lift joint is NOT in the action; it is held at `cfg.fixed_lift_target` (0.0 = fully up)
-by the PD controller every step.
+Multi-Agent variant of `RobotisSh5GraspEnv`:
+  - Arm agent (7D action): arm_r_joint1..7, drives global palm transport
+  - Hand agent (20D action): finger_r_joint1..20, drives local manipulation
+  - Lift held at fixed_lift_target via PD (not in action)
+  - Mass-as-action removed entirely (uses cfg.object_mass directly)
+  - Hand observation in palm-local frame (paper convention)
+  - Centralized critic via state_space = -1 (auto-flatten arm + hand obs)
+  - Sequential forward coupling handled by SequentialMAPPO patch in train_marl.py
 
-Incorporates MassDexMimic (NeurIPS 2026) and GR env techniques:
-  - Mass-as-an-action: action's last dim sets object mass per episode
-  - EMA action smoothing: smoothed joint commands sent to the robot
-  - Next-frame look-ahead: delta observations target next reference frame
-  - Wrist tracking reward: keeps wrist on the reference trajectory
-  - Contact-conditioned fingertip reward: targets object center when in contact
-  - Adaptive rollout sampling: resample start frames weighted by failure count
+Inherits the same scene/object/reference-loading/PD-control primitives from the
+single-agent env (largely copy-verbatim with targeted MARL modifications).
 """
 
 from __future__ import annotations
@@ -27,13 +25,13 @@ import trimesh
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
-from isaaclab.envs import DirectRLEnv
+from isaaclab.envs import DirectMARLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_conjugate, quat_mul
 
-from .robotis_sh5_grasp_env_cfg import RobotisSh5GraspEnvCfg
+from .robotis_sh5_grasp_marl_env_cfg import RobotisSh5GraspMarlEnvCfg
 
 # Local-frame offsets from link origin to actual fingertip contact point.
 # Derived from get_virtual_link_poses() in manager_based pick_and_place utils.py.
@@ -62,13 +60,18 @@ _MANO_NON_FT_BODY_NAMES: list[tuple[int, str]] = [
 _MANO_FT_INDICES = [4, 8, 12, 16, 20]  # tip MANO indices → ft_pos[:, 0:5]
 
 
-class RobotisSh5GraspEnv(DirectRLEnv):
-    """Dexterous grasping with FFW-SH5 using OakInk kinematic references."""
+class RobotisSh5GraspMarlEnv(DirectMARLEnv):
+    """Dexterous grasping with FFW-SH5 using OakInk kinematic references — MARL variant.
 
-    cfg: RobotisSh5GraspEnvCfg
+    Two agents: ``arm`` (7D) and ``hand`` (20D). See module docstring for details.
+    """
 
-    def __init__(self, cfg: RobotisSh5GraspEnvCfg, render_mode: str | None = None, **kwargs):
+    cfg: RobotisSh5GraspMarlEnvCfg
+
+    def __init__(self, cfg: RobotisSh5GraspMarlEnvCfg, render_mode: str | None = None, **kwargs):
         self._load_reference_trajectories(cfg)
+        # Mass-as-action removed: still call mass loader to honor JSON-based object_mass
+        # but disable any per-episode sampling (handled via _build_object_cfg only).
         self._apply_object_mass_from_json(cfg)
         self._object_cfg = self._build_object_cfg(cfg)
         # Episode length follows TJ's split (gr_env_cfg.py vs gr_env_cfg_play.py).
@@ -377,11 +380,13 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         print(f"[grasp] Loaded {n_traj} trajectories for '{cfg.object_id}', max_len={max_len}")
 
     @staticmethod
-    def _apply_object_mass_from_json(cfg: RobotisSh5GraspEnvCfg) -> None:
-        """Override cfg.object_mass_min/max from the per-object mass JSON if available."""
-        # Resolve dataset-aware path: each dataset uses its own
-        # data/processed/<dataset>/object_mass.json by default. ``cfg.object_mass_json``
-        # acts as an explicit override when non-empty.
+    def _apply_object_mass_from_json(cfg: RobotisSh5GraspMarlEnvCfg) -> None:
+        """Load [lo, hi] mass range from the per-object JSON if available.
+
+        Always populates `cfg.object_mass` (= midpoint, used as static fallback) AND
+        `cfg.object_mass_min` / `cfg.object_mass_max` (used by mass-in-the-loop sampling
+        when `cfg.enable_mass_in_loop=True`).
+        """
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
         if cfg.object_mass_json:
             json_path = Path(cfg.object_mass_json)
@@ -393,22 +398,23 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             with open(json_path) as f:
                 mass_table: dict = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"[grasp] WARNING: Could not load object_mass_json ({json_path}): {e}")
+            print(f"[grasp-marl] WARNING: Could not load object_mass_json ({json_path}): {e}")
             return
-        _DEFAULT_MIN, _DEFAULT_MAX = 0.05, 0.20
 
         entry = mass_table.get(cfg.object_id)
         if entry is None:
-            lo, hi = _DEFAULT_MIN, _DEFAULT_MAX
-            print(f"[grasp] object_mass: {cfg.object_id} not in JSON → default [{lo:.3f}, {hi:.3f}] kg")
-        elif entry[0] is None or entry[1] is None:
-            lo, hi = _DEFAULT_MIN, _DEFAULT_MAX
-            print(f"[grasp] object_mass: {cfg.object_id} has null in JSON → default [{lo:.3f}, {hi:.3f}] kg")
-        else:
-            lo, hi = float(entry[0]), float(entry[1])
-            print(f"[grasp] object_mass from JSON: {cfg.object_id} → [{lo:.3f}, {hi:.3f}] kg")
+            print(f"[grasp-marl] object_mass: {cfg.object_id} not in JSON → keep cfg default {cfg.object_mass:.3f} kg")
+            return
+        if entry[0] is None or entry[1] is None:
+            print(f"[grasp-marl] object_mass: {cfg.object_id} has null in JSON → keep cfg default {cfg.object_mass:.3f} kg")
+            return
+        lo, hi = float(entry[0]), float(entry[1])
+        cfg.object_mass = 0.5 * (lo + hi)
         cfg.object_mass_min = lo
         cfg.object_mass_max = hi
+        loop_note = " (mass-in-loop sampling range)" if cfg.enable_mass_in_loop else ""
+        print(f"[grasp-marl] object_mass from JSON: {cfg.object_id} → "
+              f"static {cfg.object_mass:.3f} kg / range [{lo:.3f}, {hi:.3f}]{loop_note}")
 
     def _build_object_cfg(self, cfg: RobotisSh5GraspEnvCfg) -> RigidObjectCfg:
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
@@ -454,17 +460,15 @@ class RobotisSh5GraspEnv(DirectRLEnv):
     def _setup_scene(self) -> None:
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # Static table: two stacked cuboids — base body + tabletop slab.
-        # The slab overhangs in +y (toward robot) by `tabletop_overhang_y_pos`, while the
-        # base body keeps the original footprint so the robot's torso can fit under the
-        # overhang without colliding with the table legs/body.
+        # Static table: two stacked cuboids — base body + tabletop slab (overhangs +y
+        # toward robot so lift-and-place trajectories stay over the surface; base body
+        # keeps original footprint so robot torso fits under the overhang).
         table_w, table_d, table_h = self.cfg.table_size
         table_x, table_y, _ = self.cfg.table_pos_env
         thickness = float(self.cfg.tabletop_thickness)
         overhang_y = float(self.cfg.tabletop_overhang_y_pos)
         mat = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.38, 0.18))
 
-        # Base body — original footprint, z ∈ [0, table_h - thickness]
         base_h = table_h - thickness
         base_spawner = sim_utils.CuboidCfg(
             size=(table_w, table_d, base_h),
@@ -477,7 +481,6 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             translation=(table_x, table_y, base_h / 2),
         )
 
-        # Tabletop slab — extends in +y by overhang_y, z ∈ [table_h - thickness, table_h]
         top_d = table_d + overhang_y
         top_y = table_y + overhang_y / 2.0
         top_spawner = sim_utils.CuboidCfg(
@@ -631,7 +634,9 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         B = self.num_envs
         self._traj_idx = torch.zeros(B, dtype=torch.long, device=self.device)
         self._frame_idx = torch.zeros(B, dtype=torch.long, device=self.device)
-        self._prev_action = torch.zeros(B, self.cfg.action_space, device=self.device)
+        # Per-agent previous actions (used in obs + arm action-rate penalty).
+        self._prev_arm_action = torch.zeros(B, self.cfg.num_arm_r_dofs, device=self.device)
+        self._prev_hand_action = torch.zeros(B, self.cfg.num_hand_dofs, device=self.device)
 
         # EMA action smoothing buffer (actioned joints only, 27D); initialize at normalized default pose
         default_ctrl = torch.cat([
@@ -640,13 +645,6 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         ], dim=-1).squeeze(0)
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions = default_normalized.unsqueeze(0).expand(B, -1).clone()
-
-        # Mass-as-an-action: stores the last mass action dim per env
-        # Initialize to mu_m = -0.25 (paper Section 3.2: corresponds to ≈ 0.4 × mmax).
-        self._current_mass_action = torch.full((B,), -0.25, device=self.device)
-        # Envs that reset on the previous step; mass update deferred to next _pre_physics_step
-        # so the NEW episode's mass action (from policy cache) is applied before first physics.
-        self._just_reset_env_ids: torch.Tensor | None = None
 
         # Adaptive rollout sampling: per-frame EMA failure count (start at zero)
         self._failure_count = torch.zeros(self._max_traj_len, device=self.device)
@@ -671,6 +669,16 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
         # Episode-done flag (set in _get_dones, cleared in _reset_idx)
         self._done_env = torch.zeros(B, dtype=torch.bool, device=self.device)
+
+        # Mass-in-the-loop distribution module (registered by train_marl.py if enabled).
+        # When None, env uses static cfg.object_mass loaded into the object spawn.
+        self._mass_dist = None
+        # Per-step snapshots of (mass_action, log_prob_old) — captured at the START
+        # of each step in _pre_physics_step so they reflect the mass USED during
+        # this step (resampling happens at end-of-step in _reset_idx).
+        # Allocated lazily in _pre_physics_step once a mass_dist is registered.
+        self._mass_action_step: torch.Tensor | None = None
+        self._mass_log_prob_old_step: torch.Tensor | None = None
 
         # ── WARMUP ────────────────────────────────────────────────────────────
         # Per-env warm-up flag. True = hand has not yet reached start-frame target.
@@ -845,38 +853,29 @@ class RobotisSh5GraspEnv(DirectRLEnv):
     # Step methods
     # ------------------------------------------------------------------
 
-    def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = actions.clone().clamp(-1.0, 1.0)
+    def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
+        """MARL: actions is a dict {"arm": (B,7), "hand": (B,20)}.
 
-        # Update mass action from the current step's actions first (mirrors GR:
-        # mass_actions = mass_scale(raw_actions[:,0]) at the top of _pre_physics_step).
-        # This ensures reset envs receive the NEW episode's mass (sampled by the policy
-        # for this step), not the previous episode's stale value.
-        self._current_mass_action = self.actions[:, -1].clone()
+        Combines into 27D joint action layout [fingers(20) | arm_r(7)] for EMA smoothing
+        and downstream `_apply_action`. Stores prev_arm/prev_hand for next obs.
+        """
+        # Arm action scaled by cfg.arm_action_scale BEFORE clamp.
+        # With σ≈0.10 the raw rarely exceeds ±1, so the clamp is mostly a safety net;
+        # the practical effect is to halve (or whatever scale) the arm joint range
+        # AND exploration noise in joint space (jitter mitigation).
+        arm_a = (actions["arm"].clone() * self.cfg.arm_action_scale).clamp(-1.0, 1.0)  # (B, 7)
+        hand_a = actions["hand"].clone().clamp(-1.0, 1.0)  # (B, 20) — not scaled
 
-        # Apply mass for envs that reset on the PREVIOUS step, now that the policy has
-        # returned the new episode's mass action (from _cache_action in MassDexMimicPolicy).
-        # This ensures the first physics simulation of each new episode uses the correct mass.
-        if self._just_reset_env_ids is not None and len(self._just_reset_env_ids) > 0:
-            try:
-                all_masses = self.object.root_physx_view.get_masses().clone()
-                cpu_dev = all_masses.device
-                reset_ids = self._just_reset_env_ids
-                t = (self._current_mass_action[reset_ids].clamp(-1.0, 1.0) + 1.0) / 2.0
-                new_masses = self.cfg.object_mass_min + t * (self.cfg.object_mass_max - self.cfg.object_mass_min)
-                all_masses[torch.as_tensor(reset_ids, dtype=torch.long, device=cpu_dev), 0] = new_masses.to(cpu_dev)
-                all_indices = torch.arange(self.num_envs, dtype=torch.long, device=cpu_dev)
-                self.object.root_physx_view.set_masses(all_masses, all_indices)
-            except Exception:
-                pass
-            self._just_reset_env_ids = None
+        # Combine in single-agent layout: fingers first, then arm_r
+        joint_actions = torch.cat([hand_a, arm_a], dim=-1)  # (B, 27)
+
+        # Cache combined 27D action for use by _get_rewards and _get_observations.
+        # NOTE: Do NOT overwrite `self.actions` — DirectMARLEnv initializes it as a
+        # per-agent dict in __init__ (line 643 of direct_marl_env.py) and may rely on
+        # that during reset/first-step observation. Keep the parent's dict intact.
+        self._joint_actions = joint_actions
 
         # ── WARMUP ────────────────────────────────────────────────────────────
-        # Only advance frame for envs that have exited warm-up.
-        # Warming-up envs stay frozen at their start_frame so the target doesn't
-        # move away while the hand is still trying to reach it.
-        # To restore original behavior: replace with the single commented line below.
-        # self._frame_idx = (self._frame_idx + 1).clamp(max=self._max_traj_len - 1)
         new_frame = (self._frame_idx + 1).clamp(max=self._max_traj_len - 1)
         if self.cfg.enable_warmup:
             self._frame_idx = torch.where(self._is_warming_up, self._frame_idx, new_frame)
@@ -884,15 +883,23 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             self._frame_idx = new_frame
         # ── END WARMUP ────────────────────────────────────────────────────────
 
-        # EMA smoothing on joint actions (dims 0–26 = 20 fingers + 7 arm);
-        # mass dim (27) is not smoothed. Lift is NOT in the action.
+        # EMA smoothing on joint actions (27D, lift excluded — held separately).
         # TJ/rl_games convention: alpha = weight on the new (raw) action.
         # Split α: hand uses action_smoothing, arm uses arm_action_smoothing (stronger smoothing → less wrist tremor).
-        joint_actions = self.actions[:, :-1]  # (B, 27)
         a_h = self.cfg.action_smoothing
         a_a = self.cfg.arm_action_smoothing
         self._smoothed_actions[:, :20] = a_h * joint_actions[:, :20] + (1.0 - a_h) * self._smoothed_actions[:, :20]
         self._smoothed_actions[:, 20:] = a_a * joint_actions[:, 20:] + (1.0 - a_a) * self._smoothed_actions[:, 20:]
+        # Per-agent prev actions are updated at the END of _get_observations (matches
+        # single-agent semantics; used in `prev_action` obs slot, not reward).
+
+        # Mass-in-the-loop: snapshot per-env (action, log_prob_old) AT STEP START.
+        # _reset_idx runs at END of step and may resample mass for some envs, so
+        # we cache the values that were ACTUALLY used during this step now.
+        # Read by train_marl's record_transition patch.
+        if self._mass_dist is not None:
+            self._mass_action_step = self._mass_dist.current_mass_action.detach().clone()
+            self._mass_log_prob_old_step = self._mass_dist.current_log_prob_old.detach().clone()
 
     def _apply_action(self) -> None:
         N_f = self.cfg.num_hand_dofs
@@ -910,64 +917,112 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             self._lift_target, self._lift_zero_vel, joint_ids=self._lift_joint_ids,
         )
 
-    def _get_observations(self) -> dict:
+    # ------------------------------------------------------------------
+    # Palm-local frame transform helpers
+    # ------------------------------------------------------------------
+
+    def _to_palm_local_pos(self, p_world: torch.Tensor, palm_pos: torch.Tensor, palm_quat_inv: torch.Tensor) -> torch.Tensor:
+        """Transform (B, N, 3) world positions into palm-local frame.
+
+        p_local = quat_apply_inverse(palm_quat, p_world - palm_pos), but we already
+        have palm_quat_inv (== conjugate of palm_quat for unit quats), so we use quat_apply.
+        """
+        B, N, _ = p_world.shape
+        rel = p_world - palm_pos.unsqueeze(1)
+        q_exp = palm_quat_inv.unsqueeze(1).expand(-1, N, -1).reshape(B * N, 4)
+        return quat_apply(q_exp, rel.reshape(B * N, 3)).reshape(B, N, 3)
+
+    def _to_palm_local_vec(self, v_world: torch.Tensor, palm_quat_inv: torch.Tensor) -> torch.Tensor:
+        """Transform (B, N, 3) world-frame free vectors (velocity, delta) into palm-local frame.
+
+        No translation — pure rotation.
+        """
+        B, N, _ = v_world.shape
+        q_exp = palm_quat_inv.unsqueeze(1).expand(-1, N, -1).reshape(B * N, 4)
+        return quat_apply(q_exp, v_world.reshape(B * N, 3)).reshape(B, N, 3)
+
+    # ------------------------------------------------------------------
+    # MARL observation
+    # ------------------------------------------------------------------
+
+    def _get_observations(self) -> dict[str, torch.Tensor]:
+        """Return per-agent observation dict for canonical MAPPO.
+
+        - "arm" ( 82D): own joints + current palm pose + palm lin/ang vel +
+                        wrist target delta + prev_arm_action +
+                        object pose/velocity/deltas + wrist-to-object offset +
+                        current_hand_action slot (filled by SequentialMAPPO
+                        patch — hand → arm injection at [62:82]).
+        - "hand" (276D): single-agent grasping obs minus mass and lift —
+                         21 MANO kpts world + palm state + fingertip vel +
+                         full 27D joint state (no lift) + object state +
+                         reference deltas + future_contact + prev_action(27)
+                         + fingertip_forces.
+
+        Sequential conditioning: hand acts first; its action is injected into
+        arm's `current_hand_action` slot before arm forwards.
+
+        Also caches `self._shared_state` (279D) for `_get_states()` —
+        explicit non-redundant centralized critic input.
+        """
         frame = self._frame_idx.clamp(max=self._max_traj_len - 1)
         traj = self._traj_idx
         B = self.num_envs
+        N_f = self.cfg.num_hand_dofs
+        N_a = self.cfg.num_arm_r_dofs
 
-        # Robot state: all controlled joints [fingers | arm_r | lift] — 28D (lift in obs for
-        # state awareness even though it is not actioned).
-        joint_pos = torch.cat([
+        # Controlled-action joint state (no lift): [fingers(20) | arm_r(7)] = 27D,
+        # normalized via _unscale (action-joint scales).
+        jp_no_lift_raw = torch.cat([
             self.robot.data.joint_pos[:, self._finger_joint_ids],
             self.robot.data.joint_pos[:, self._arm_r_joint_ids],
-            self.robot.data.joint_pos[:, self._lift_joint_ids],
-        ], dim=-1)  # (B, 28)
-        joint_pos = self._unscale_all(joint_pos)   # normalize to [-1, 1] using 28D scales
-        joint_vel = torch.cat([
+        ], dim=-1)  # (B, 27)
+        full_jp_norm = self._unscale(jp_no_lift_raw)  # (B, 27)
+        full_jv = torch.cat([
             self.robot.data.joint_vel[:, self._finger_joint_ids],
             self.robot.data.joint_vel[:, self._arm_r_joint_ids],
-            self.robot.data.joint_vel[:, self._lift_joint_ids],
-        ], dim=-1)  # (B, 28)
+        ], dim=-1)  # (B, 27)
+        jp_arm = full_jp_norm[:, N_f:N_f+N_a]                # (B, 7)
+        jv_arm = full_jv[:, N_f:N_f+N_a]                     # (B, 7)
 
-        # All 21 MANO keypoints (world frame) + fingertip velocities
-        hand_kpts_pos = self._compute_hand_kpts_pos()                          # (B, 21, 3)
-        ft_pos = hand_kpts_pos[:, self._kpt_ft_mano_indices_t, :]             # (B, 5, 3)
+        # MANO keypoints (world frame) + fingertip velocities
+        hand_kpts_pos = self._compute_hand_kpts_pos()                           # (B, 21, 3) world
+        ft_pos = hand_kpts_pos[:, self._kpt_ft_mano_indices_t, :]              # (B, 5, 3)
         if len(self._ft_body_ids) == 5:
-            ft_vel = self.robot.data.body_lin_vel_w[:, self._ft_body_ids, :]  # (B, 5, 3)
+            ft_vel = self.robot.data.body_lin_vel_w[:, self._ft_body_ids, :]   # (B, 5, 3)
         else:
             ft_vel = torch.zeros(B, 5, 3, device=self.device)
 
-        # Wrist global state: rotation, linear and angular velocity (position in hand_kpts_pos[0])
+        # Wrist (palm) world-frame state
         if self._wrist_body_id is not None:
-            wrist_quat_obs   = self.robot.data.body_quat_w[:, self._wrist_body_id, :]    # (B, 4)
-            wrist_linvel_obs = self.robot.data.body_lin_vel_w[:, self._wrist_body_id, :] # (B, 3)
-            wrist_angvel_obs = self.robot.data.body_ang_vel_w[:, self._wrist_body_id, :] # (B, 3)
+            wrist_pos_w  = self.robot.data.body_pos_w[:, self._wrist_body_id, :]
+            wrist_quat_w = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
+            wrist_linvel = self.robot.data.body_lin_vel_w[:, self._wrist_body_id, :]
+            wrist_angvel = self.robot.data.body_ang_vel_w[:, self._wrist_body_id, :]
         else:
-            wrist_quat_obs   = torch.zeros(B, 4, device=self.device)
-            wrist_linvel_obs = torch.zeros(B, 3, device=self.device)
-            wrist_angvel_obs = torch.zeros(B, 3, device=self.device)
+            wrist_pos_w  = torch.zeros(B, 3, device=self.device)
+            wrist_quat_w = torch.zeros(B, 4, device=self.device); wrist_quat_w[:, 0] = 1.0
+            wrist_linvel = torch.zeros(B, 3, device=self.device)
+            wrist_angvel = torch.zeros(B, 3, device=self.device)
 
-        # Object state
-        obj_pos    = self.object.data.root_pos_w      # (B, 3)
-        obj_quat   = self.object.data.root_quat_w     # (B, 4)
-        obj_linvel = self.object.data.root_lin_vel_w  # (B, 3)
-        obj_angvel = self.object.data.root_ang_vel_w  # (B, 3)
+        # Object state (world)
+        obj_pos    = self.object.data.root_pos_w
+        obj_quat   = self.object.data.root_quat_w
+        obj_linvel = self.object.data.root_lin_vel_w
+        obj_angvel = self.object.data.root_ang_vel_w
 
-        # Reference look-ahead: next-frame reference positions
+        # Reference look-ahead (next frame)
         env_orig = self.scene.env_origins
         next_frame = (frame + 1).clamp(max=self._max_traj_len - 1)
-        ref_ft_pos   = self._ref_ft_pos[traj, next_frame]   + env_orig.unsqueeze(1)  # (B, 5, 3)
-        ref_obj_pos  = self._ref_obj_pos[traj, next_frame]  + env_orig               # (B, 3)
-        ref_obj_quat = self._ref_obj_quat[traj, next_frame]                          # (B, 4)
+        ref_kpts_world_next = self._ref_mano_kpts[traj, next_frame] + env_orig.unsqueeze(1)  # (B, 21, 3)
+        ref_ft_pos_next     = self._ref_ft_pos[traj, next_frame]   + env_orig.unsqueeze(1)   # (B, 5, 3)
+        ref_obj_pos         = self._ref_obj_pos[traj, next_frame]  + env_orig                # (B, 3)
+        ref_obj_quat        = self._ref_obj_quat[traj, next_frame]                           # (B, 4)
+        ref_wrist_quat      = self._ref_wrist_quat[traj, next_frame]                         # (B, 4)
 
-        # Delta keypoints in world frame: all 21 MANO keypoints vs raw next-frame reference
-        ref_kpts_nf = self._ref_mano_kpts[traj, next_frame] + env_orig.unsqueeze(1)  # (B, 21, 3)
-        delta_kpts_world = hand_kpts_pos - ref_kpts_nf                               # (B, 21, 3)
-
-        # Delta fingertip in object local frame (contact-conditioned, paper S4.1)
-        # Contact fingers: target nearest mesh vertex; Non-contact: target ref fingertip
-        ref_vertex_local = self._ref_contact_vertex_local[traj, next_frame]  # (B, 5, 3) obj-local
-        contact_flag_next = self._future_contact[traj, next_frame]            # (B, 5)
+        # delta_ft_obj (contact-conditioned, object-local frame)
+        ref_vertex_local  = self._ref_contact_vertex_local[traj, next_frame]   # (B, 5, 3)
+        contact_flag_next = self._future_contact[traj, next_frame]              # (B, 5)
         obj_quat_exp = obj_quat.unsqueeze(1).expand(-1, 5, -1).reshape(B * 5, 4)
         ft_in_obj = quat_apply_inverse(
             obj_quat_exp,
@@ -975,55 +1030,111 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         ).reshape(B, 5, 3)
         ref_ft_in_obj = quat_apply_inverse(
             obj_quat_exp,
-            (ref_ft_pos - obj_pos.unsqueeze(1)).reshape(B * 5, 3),
+            (ref_ft_pos_next - obj_pos.unsqueeze(1)).reshape(B * 5, 3),
         ).reshape(B, 5, 3)
         target_in_obj = torch.where(contact_flag_next.unsqueeze(-1).bool(), ref_vertex_local, ref_ft_in_obj)
-        delta_ft_obj = ft_in_obj - target_in_obj                              # (B, 5, 3)
+        delta_ft_obj = ft_in_obj - target_in_obj                                # (B, 5, 3)
 
-        # Delta object pose toward next reference frame
+        # Object delta toward next-frame reference
         delta_obj_pos = obj_pos - ref_obj_pos
-        q_err = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))
-        delta_obj_rot = 2.0 * q_err[:, 1:]  # axis-angle approximation
+        q_err_obj = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))
+        delta_obj_rot = 2.0 * q_err_obj[:, 1:]                                  # axis-angle approx
+        # Wrist delta (kpt[0]) and rotation delta — used by arm obs
+        delta_wrist_pos = hand_kpts_pos[:, 0, :] - ref_kpts_world_next[:, 0, :] # (B, 3)
+        q_err_wrist = quat_mul(wrist_quat_w, quat_conjugate(ref_wrist_quat))
+        # Canonicalize quaternion (force w >= 0) → shortest-path representation.
+        # Without this, q and -q encode the same rotation but flip the axis-angle
+        # vector sign → obs discontinuity → policy treats it as a sudden rotation
+        # change and induces wrist tremor.
+        q_err_wrist = torch.where(q_err_wrist[:, 0:1] < 0, -q_err_wrist, q_err_wrist)
+        delta_wrist_rot = 2.0 * q_err_wrist[:, 1:]                              # axis-angle approx
+        # All-21 kpts delta (world frame) — used by hand obs (single-agent style)
+        delta_kpts_world = hand_kpts_pos - ref_kpts_world_next                  # (B, 21, 3)
 
-        future_contact   = self._future_contact[traj, frame]
-        fingertip_forces = self._get_fingertip_forces()
+        future_contact   = self._future_contact[traj, frame]                    # (B, 5)
+        fingertip_forces = self._get_fingertip_forces()                         # (B, 5)
+        wrist_pos_env    = wrist_pos_w - env_orig                               # (B, 3)
 
-        obs = torch.cat([
-            # Hand keypoint positions: all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
-            hand_kpts_pos.reshape(B, 63),   # [63] all 21 keypoints (incl. wrist at idx 0)
-            # Hand global state
-            wrist_quat_obs,                 # [4]  wrist rotation (wxyz)
-            wrist_linvel_obs,               # [3]  wrist linear velocity
-            wrist_angvel_obs,               # [3]  wrist angular velocity
-            # Fingertip velocities
-            ft_vel.reshape(B, 15),          # [15]
-            # Hand DOF
-            joint_pos,                      # [28]
-            joint_vel,                      # [28]
-            # Object state
-            obj_pos,                        # [3]
-            obj_quat,                       # [4]
-            obj_linvel,                     # [3]
-            obj_angvel,                     # [3]
-            # Delta targets (next-frame look-ahead)
-            delta_kpts_world.reshape(B, 63),# [63] world-frame delta for all 21 keypoints
-            delta_ft_obj.reshape(B, 15),    # [15] obj-local contact-conditioned delta
-            delta_obj_pos,                  # [3]
-            delta_obj_rot,                  # [3]
-            # Contact + history + forces
-            future_contact,                 # [5]
-            self._prev_action,              # [29]
-            fingertip_forces,               # [5]
+        # Joint-action history (27D combined: [fingers(20) | arm(7)]).
+        prev_action_27 = torch.cat([self._prev_hand_action, self._prev_arm_action], dim=-1)  # (B, 27)
+
+        # Object signals for arm obs — wrist-to-object distance is the direct
+        # grasp-reach signal; obj pose/vel let arm anticipate object motion.
+        obj_pos_env       = obj_pos - env_orig                                     # (B, 3)
+        delta_wrist_obj   = wrist_pos_env - obj_pos_env                            # (B, 3)
+
+        # current_hand_action placeholder — filled by SequentialMAPPO patch
+        # (hand decides first, action injected into arm obs slot [62:82]).
+        current_hand_placeholder = torch.zeros(B, N_f, device=self.device)
+
+        # ── Arm obs (82D) — wrist-pose follower + object context + hand action ─
+        arm_obs = torch.cat([
+            jp_arm,                       # 7    own arm joints (normalized)
+            jv_arm,                       # 7    joint velocities
+            wrist_pos_env,                # 3    current palm position (env-relative)
+            wrist_quat_w,                 # 4    current palm orientation (world)
+            wrist_linvel,                 # 3    current palm linear velocity (world)
+            wrist_angvel,                 # 3    current palm angular velocity (world)
+            delta_wrist_pos,              # 3    next-frame wrist target delta (world)
+            delta_wrist_rot,              # 3    axis-angle delta
+            self._prev_arm_action,        # 7    own previous action
+            obj_pos_env,                  # 3    object position (env-relative)
+            obj_quat,                     # 4    object orientation (world)
+            obj_linvel,                   # 3    object linear velocity (world)
+            obj_angvel,                   # 3    object angular velocity (world)
+            delta_wrist_obj,              # 3    wrist - object position (env-relative)
+            delta_obj_pos,                # 3    object current - reference (next frame)
+            delta_obj_rot,                # 3    object rotation delta
+            current_hand_placeholder,     # 20   ← SequentialMAPPO overwrite slot [62:82]
         ], dim=-1)
-        # Total: 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+29+5 = 280
+        # = 7+7+3+4+3+3+3+3+7 + 3+4+3+3+3+3+3 + 20 = 82
 
-        self._prev_action = self.actions.clone()
+        # ── Hand obs (276D) — single-agent grasping obs minus mass & lift ────
+        hand_obs = torch.cat([
+            hand_kpts_pos.reshape(B, 63),   # 63  all 21 MANO kpts world
+            wrist_quat_w,                   # 4   wrist rotation
+            wrist_linvel,                   # 3   wrist linear vel (world)
+            wrist_angvel,                   # 3   wrist angular vel (world)
+            ft_vel.reshape(B, 15),          # 15  fingertip velocities (world)
+            full_jp_norm,                   # 27  controlled joints (finger+arm, no lift)
+            full_jv,                        # 27  joint velocities
+            obj_pos,                        # 3
+            obj_quat,                       # 4
+            obj_linvel,                     # 3
+            obj_angvel,                     # 3
+            delta_kpts_world.reshape(B, 63),# 63  world-frame delta for all 21 keypoints
+            delta_ft_obj.reshape(B, 15),    # 15  obj-local contact-conditioned delta
+            delta_obj_pos,                  # 3
+            delta_obj_rot,                  # 3
+            future_contact,                 # 5
+            prev_action_27,                 # 27  combined action history (no mass)
+            fingertip_forces,               # 5
+        ], dim=-1)
+        # = 63+4+3+3+15+27+27+3+4+3+3+63+15+3+3+5+27+5 = 276
+
+        # ── Shared state (279D) — non-redundant centralized critic input ──────
+        # hand_obs already contains 99% of unique info; only delta_wrist_rot is
+        # NOT derivable from hand_obs (requires ref_wrist_quat which isn't there).
+        # Returned via _get_states() when cfg.state_space > 0.
+        self._shared_state = torch.cat([hand_obs, delta_wrist_rot], dim=-1)  # (B, 279)
 
         if self.cfg.debug_vis:
-            ref_wrist_pos = self._ref_wrist_pos[traj, frame] + env_orig   # (B, 3)
-            self._update_debug_vis(ref_ft_pos, ft_pos, ref_wrist_pos)
+            ref_wrist_pos = self._ref_wrist_pos[traj, frame] + env_orig
+            self._update_debug_vis(ref_ft_pos_next, ft_pos, ref_wrist_pos)
 
-        return {"policy": obs}
+        # Update per-agent prev_action AFTER building obs (matches single-agent
+        # semantics; used as `prev_action` obs slot in next step).
+        if hasattr(self, "_joint_actions"):
+            self._prev_arm_action = self._joint_actions[:, N_f:N_f+N_a].clone()
+            self._prev_hand_action = self._joint_actions[:, :N_f].clone()
+
+        return {"arm": arm_obs, "hand": hand_obs}
+
+    def _get_states(self) -> torch.Tensor:
+        """Return the centralized critic input. Non-redundant 279D shared state
+        computed and cached during the most recent `_get_observations()` call.
+        """
+        return self._shared_state
 
     def _get_fingertip_forces(self) -> torch.Tensor:
         """Return per-fingertip normal contact force (N), projected onto fingertip approach direction.
@@ -1050,7 +1161,20 @@ class RobotisSh5GraspEnv(DirectRLEnv):
                 pass
         return forces
 
-    def _get_rewards(self) -> torch.Tensor:
+    def _get_rewards(self) -> dict[str, torch.Tensor]:
+        """Per-agent reward dict.
+
+        Splits the single-agent reward terms into arm-exclusive and hand-exclusive
+        signals (paper convention):
+          - arm gets object tracking + wrist keypoint (world, Z-weighted) +
+            arm regularization terms.
+          - hand gets finger keypoints (palm-local, no Z-weighting since palm-local
+            Z is not the gravity direction) + fingertip + contact force + hand
+            regularization. No object tracking signal — paper Section 3.2.
+
+        Shared "alive" reward goes to both. Termination buf is computed from the
+        same global thresholds and stored in self._early_terminate_buf for _get_dones.
+        """
         frame = self._frame_idx.clamp(max=self._max_traj_len - 1)
         traj = self._traj_idx
         env_orig = self.scene.env_origins
@@ -1062,15 +1186,12 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         ref_obj_quat = self._ref_obj_quat[traj, frame]
 
         # Object tracking errors.
-        # Unweighted error is used for termination checks and state-cache thresholds.
-        # Z-weighted error (paper S4.2: "higher weights to gravity direction") is used for reward.
         delta_obj_pos = obj_pos - ref_obj_pos  # (B, 3)
         obj_pos_err = torch.norm(delta_obj_pos, dim=-1)  # unweighted — termination
         delta_obj_pos_w = delta_obj_pos.clone()
         delta_obj_pos_w[:, 2] *= 1.5
         obj_pos_err_w = torch.norm(delta_obj_pos_w, dim=-1)  # Z-weighted — reward
         q_err = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))
-        # Use |w| for shortest-angle (quaternion double-cover: q and -q are same rotation).
         obj_rot_err = 2.0 * torch.acos(q_err[:, 0].abs().clamp(max=1.0))
 
         # All 21 MANO keypoints (wrist + MCP/PIP/DIP + fingertips).
@@ -1081,85 +1202,83 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         # Object rotation drift offset (shared for keypoints and fingertip adjustment).
         obj_rot_offset = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))  # (B, 4)
 
-        # Reference keypoints adjusted for object drift (same approach as ref_ft_adjusted).
-        # Store keypoints as object-relative offsets and apply current drift rotation.
+        # Reference keypoints adjusted for object drift (single-agent style).
         ref_kpts_local = self._ref_mano_kpts[traj, frame]                 # (B, 21, 3) env-local
-        ref_kpts_obj_offset = ref_kpts_local - self._ref_obj_pos[traj, frame].unsqueeze(1)  # (B, 21, 3)
+        ref_kpts_obj_offset = ref_kpts_local - self._ref_obj_pos[traj, frame].unsqueeze(1)
         obj_rot_offset_21 = obj_rot_offset.unsqueeze(1).expand(-1, 21, -1).reshape(B * 21, 4)
         ref_kpts_world = quat_apply(
             obj_rot_offset_21, ref_kpts_obj_offset.reshape(B * 21, 3)
         ).reshape(B, 21, 3) + obj_pos.unsqueeze(1)                        # (B, 21, 3) world
 
-        # Keypoint tracking error with Z-weighting (paper S4.2: gravity emphasis).
+        # Keypoint tracking error with Z-weighting — matches single-agent r_kpts.
         delta_kpts = hand_kpts_pos - ref_kpts_world                       # (B, 21, 3)
         delta_kpts_w = delta_kpts.clone()
         delta_kpts_w[:, :, 2] *= 1.5
-        kpts_err_w = torch.norm(delta_kpts_w, dim=-1).mean(dim=-1)        # (B,)
-        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1) # (B,) drift-compensated; used for warmup/termination
+        kpts_err_w = torch.norm(delta_kpts_w, dim=-1).mean(dim=-1)        # (B,) Z-weighted, for reward
+        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1)  # drift-compensated, for termination/warmup
 
-        # Raw E_j metric (paper definition): ||j_d - j_h|| against human ref kpts in world frame, no drift compensation.
-        ref_kpts_world_raw = ref_kpts_local + env_orig.unsqueeze(1)       # (B, 21, 3)
-        self._last_kpts_err_raw = torch.norm(hand_kpts_pos - ref_kpts_world_raw, dim=-1).mean(dim=-1)  # (B,)
+        # Raw E_j metric (paper definition).
+        ref_kpts_world_raw = ref_kpts_local + env_orig.unsqueeze(1)
+        self._last_kpts_err_raw = torch.norm(hand_kpts_pos - ref_kpts_world_raw, dim=-1).mean(dim=-1)
 
-        # Wrist error from keypoint 0 (unweighted, for termination check).
-        wrist_err = torch.norm(delta_kpts[:, 0, :], dim=-1)               # (B,)
+        # ── Arm reward signals: wrist (kpt 0) world-frame, Z-weighted ────────
+        delta_wrist_kpt = delta_kpts[:, 0, :].clone()
+        delta_wrist_kpt[:, 2] *= 1.5
+        wrist_pos_err_w = torch.norm(delta_wrist_kpt, dim=-1)             # (B,) for arm reward
+        wrist_err = torch.norm(delta_kpts[:, 0, :], dim=-1)               # unweighted, for termination
 
-        # Wrist rotation (needed for termination; can't derive from positions alone).
+        # Wrist rotation error (used by arm reward + termination).
         wrist_rot_err = torch.zeros(B, device=self.device)
         if self._wrist_body_id is not None:
-            wrist_quat = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
+            wrist_quat_w_cur = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
             ref_wrist_quat = self._ref_wrist_quat[traj, frame]
-            q_err = quat_mul(wrist_quat, quat_conjugate(ref_wrist_quat))
+            q_err = quat_mul(wrist_quat_w_cur, quat_conjugate(ref_wrist_quat))
             wrist_rot_err = 2.0 * torch.asin(torch.clamp(torch.norm(q_err[:, 1:4], dim=-1), max=1.0))
 
-        # Fingertip contact tracking (GR env style).
+        # Fingertip contact tracking (identical to single-agent).
         ref_ft = self._ref_ft_pos[traj, frame] + env_orig.unsqueeze(1)    # (B, 5, 3)
         contact_flag = self._future_contact[traj, frame]                   # (B, 5)
 
-        # Contact vertices on the actual object surface (world frame).
         ref_vertex_local_r = self._ref_contact_vertex_local[traj, frame]  # (B, 5, 3) obj-local
         obj_quat_exp_r = obj_quat.unsqueeze(1).expand(-1, 5, -1).reshape(B * 5, 4)
         ref_vertex_world = quat_apply(
-            obj_quat_exp_r,
-            ref_vertex_local_r.reshape(B * 5, 3),
+            obj_quat_exp_r, ref_vertex_local_r.reshape(B * 5, 3),
         ).reshape(B, 5, 3) + obj_pos.unsqueeze(1)
 
-        # Non-contact target: reference fingertip adjusted for object rotation drift.
-        ref_ft_offset = ref_ft - ref_obj_pos.unsqueeze(1)                 # (B, 5, 3)
+        ref_ft_offset = ref_ft - ref_obj_pos.unsqueeze(1)
         obj_rot_offset_5 = obj_rot_offset.unsqueeze(1).expand(-1, 5, -1).reshape(B * 5, 4)
         ref_ft_adjusted = quat_apply(
             obj_rot_offset_5, ref_ft_offset.reshape(B * 5, 3)
-        ).reshape(B, 5, 3) + obj_pos.unsqueeze(1)                         # (B, 5, 3)
+        ).reshape(B, 5, 3) + obj_pos.unsqueeze(1)
 
-        # Gate contact flag by runtime object-tracking quality (GR env: delta_condition).
-        delta_condition = (obj_pos_err < 0.2) & (obj_rot_err < 0.75)      # (B,)
-        contact_flag_gated = contact_flag * delta_condition.unsqueeze(-1).float()  # (B, 5)
+        delta_condition = (obj_pos_err < 0.2) & (obj_rot_err < 0.75)
+        contact_flag_gated = contact_flag * delta_condition.unsqueeze(-1).float()
 
         ft_target = torch.where(contact_flag_gated.unsqueeze(-1).bool(), ref_vertex_world, ref_ft_adjusted)
-        ft_err_per_finger = torch.norm(ft_pos - ft_target, dim=-1)        # (B, 5)
-        ft_err = ft_err_per_finger.mean(dim=-1)                            # (B,)
+        ft_err_per_finger = torch.norm(ft_pos - ft_target, dim=-1)
+        ft_err = ft_err_per_finger.mean(dim=-1)
 
-        # Raw E_ft metric (paper definition): ||t_d - t_h|| against human ref fingertips, no drift/contact adjustment.
-        self._last_ft_raw_err = torch.norm(ft_pos - ref_ft, dim=-1).mean(dim=-1)  # (B,)
+        self._last_ft_raw_err = torch.norm(ft_pos - ref_ft, dim=-1).mean(dim=-1)
 
-        # Contact force reward (mirrors GR train env).
-        raw_forces = self._get_fingertip_forces()                              # (B, 5)
-        contact_condition = (ft_err_per_finger < 0.03).float()                # (B, 5)
-        fforce_contact = raw_forces * contact_flag_gated * contact_condition   # (B, 5)
-        n_contacts = contact_flag_gated.sum(dim=-1, keepdim=True)             # (B, 1)
+        # Contact force reward.
+        raw_forces = self._get_fingertip_forces()
+        contact_condition = (ft_err_per_finger < 0.03).float()
+        fforce_contact = raw_forces * contact_flag_gated * contact_condition
+        n_contacts = contact_flag_gated.sum(dim=-1, keepdim=True)
         clamped = torch.clamp(fforce_contact, 0.0, 0.5) / (n_contacts + 1e-6) / 1.5
-        force_rew = 1.125 * clamped.sum(dim=-1)                               # (B,)
+        force_rew = 1.125 * clamped.sum(dim=-1)
 
-        # Regularization split by region. Action layout: [fingers(20) | arm_r(7) | mass(1)].
-        # Pose excludes lift (PD-held → contributes noise only).
-        hand_action_reg = (self.actions[:, :20] ** 2).sum(dim=-1)
-        arm_action_reg  = (self.actions[:, 20:27] ** 2).sum(dim=-1)
+        # Regularization. Action layout (MARL, no mass): [fingers(20) | arm_r(7)].
+        N_f = self.cfg.num_hand_dofs
+        N_a = self.cfg.num_arm_r_dofs
+        hand_action_reg = (self._joint_actions[:, :N_f] ** 2).sum(dim=-1)
+        arm_action_reg  = (self._joint_actions[:, N_f:N_f+N_a] ** 2).sum(dim=-1)
         jp = self.robot.data.joint_pos
         dp = self.robot.data.default_joint_pos
         hand_pose_reg = ((jp[:, self._finger_joint_ids] - dp[:, self._finger_joint_ids]) ** 2).sum(dim=-1)
         arm_pose_reg  = ((jp[:, self._arm_r_joint_ids]  - dp[:, self._arm_r_joint_ids])  ** 2).sum(dim=-1)
-        # Compute alive signal: 0 on terminated steps, 1 otherwise (GR env pattern).
-        # All termination thresholds use unweighted errors (GR env: raw L2 distances).
+
+        # Termination (shared across agents).
         obj_fell = obj_pos[:, 2] < self.cfg.obj_fall_z
         pos_err_large = obj_pos_err > self.cfg.max_obj_pos_err
         rot_err_large = obj_rot_err > self.cfg.max_obj_rot_err
@@ -1172,8 +1291,6 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         if self.cfg.enable_warmup:
             early_terminate = early_terminate & ~self._is_warming_up
         # Grace period: suppress early termination for the first N steps of each episode.
-        # Absorbs the IK-lift offset and open-vs-curled finger mismatch at t=0 — same window
-        # as the loose `start_condition` in `_save_state_cache`.
         if self.cfg.early_termination_grace_frames > 0:
             in_grace = self.episode_length_buf < self.cfg.early_termination_grace_frames
             early_terminate = early_terminate & ~in_grace
@@ -1186,14 +1303,16 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
         alive = (~early_terminate).float()
 
+        # ── Single team reward (canonical MAPPO) ─────────────────────────────
+        # Identical formula to single-agent reward. Both agents receive the
+        # same scalar; the shared centralized critic V(s) is trained on this.
         tracking_penalty = (
-            self.cfg.rew_kpts * kpts_err_w         # Z-weighted mean over all 21 keypoints
-            + self.cfg.rew_obj_pos * obj_pos_err_w # Z-weighted (paper S4.2: gravity emphasis)
+            self.cfg.rew_kpts * kpts_err_w               # mean over 21 kpts, Z-weighted
+            + self.cfg.rew_obj_pos * obj_pos_err_w       # object position, Z-weighted
             + self.cfg.rew_obj_rot * obj_rot_err
-            + self.cfg.rew_fingertip * ft_err      # contact-conditioned fingertip tracking
+            + self.cfg.rew_fingertip * ft_err            # contact-conditioned fingertip
         ).clamp(min=-self.cfg.rew_alive)
-
-        reward = (
+        team_reward = (
             self.cfg.rew_alive * alive
             + tracking_penalty
             + self.cfg.rew_fingertip_force * force_rew
@@ -1201,54 +1320,54 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             + self.cfg.rew_arm_action_reg  * arm_action_reg
             + self.cfg.rew_hand_pose_reg   * hand_pose_reg
             + self.cfg.rew_arm_pose_reg    * arm_pose_reg
-        )
-        reward = reward.clamp(min=0.0)
+        ).clamp(min=0.0)
 
-        self._save_state_cache(reward, ft_err, obj_pos_err, obj_rot_err)
+        # State cache uses the team reward (same as single-agent env).
+        self._save_state_cache(team_reward, ft_err, obj_pos_err, obj_rot_err)
 
-        # skrl SequentialTrainer only logs values that are torch.Tensor with numel()==1.
-        # Python floats/ints are silently ignored. Use .mean() (0-dim tensor) not .mean().item().
+        # Logging grouped by top-level tab. Keys use ` / ` (space-slash-space) so
+        # they form proper Tensorboard groups when `train_marl.py` strips skrl's
+        # automatic "Info / " prefix and calls agent.track_data() directly.
         self.extras["log"] = {
-            # Tracking errors (unweighted, for monitoring)
-            "Error / kpts_mean_m":     torch.norm(delta_kpts, dim=-1).mean(),
-            "Error / wrist_pos_m":     wrist_err.mean(),
-            "Error / wrist_rot_deg":   torch.rad2deg(wrist_rot_err).mean(),
-            "Error / obj_pos_m":       obj_pos_err.mean(),
-            "Error / obj_rot_deg":     torch.rad2deg(obj_rot_err).mean(),
-            "Error / ft_mean_m":       ft_err.mean(),
-            # Per-component rewards (weighted values match what the optimizer sees)
-            "Episode_Reward / alive":             (self.cfg.rew_alive * alive).mean(),
-            "Episode_Reward / kpts":              (self.cfg.rew_kpts * kpts_err_w).mean(),
-            "Episode_Reward / obj_pos":           (self.cfg.rew_obj_pos * obj_pos_err_w).mean(),
-            "Episode_Reward / obj_rot":           (self.cfg.rew_obj_rot * obj_rot_err).mean(),
-            "Episode_Reward / fingertip":         (self.cfg.rew_fingertip * ft_err).mean(),
-            "Episode_Reward / fingertip_force":   (self.cfg.rew_fingertip_force * force_rew).mean(),
-            "Episode_Reward / hand_action_reg":   (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
-            "Episode_Reward / arm_action_reg":    (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
-            "Episode_Reward / hand_pose_reg":     (self.cfg.rew_hand_pose_reg   * hand_pose_reg).mean(),
-            "Episode_Reward / arm_pose_reg":      (self.cfg.rew_arm_pose_reg    * arm_pose_reg).mean(),
-            "Episode_Reward / total":             reward.mean(),
-            # Curriculum state
-            "Curriculum / reached_frame":  torch.tensor(float(self._reached_frame), device=self.device),
-            "Curriculum / warmup_ratio":   self._is_warming_up.float().mean(),
-            # Mass-as-action: actual object mass in kg (unnormalized from cached mass action)
-            "mass/mean":  self._current_mass_action.mean(),
-            "mass/std":   self._current_mass_action.std(),
-            "mass/kg_mean": (
-                self.cfg.object_mass_min
-                + (self._current_mass_action.clamp(-1.0, 1.0) + 1.0) / 2.0
-                * (self.cfg.object_mass_max - self.cfg.object_mass_min)
-            ).mean(),
+            # Tracking errors
+            "Error / kpts_mean_m":      torch.norm(delta_kpts, dim=-1).mean(),
+            "Error / wrist_pos_m":      wrist_err.mean(),
+            "Error / wrist_rot_deg":    torch.rad2deg(wrist_rot_err).mean(),
+            "Error / obj_pos_m":        obj_pos_err.mean(),
+            "Error / obj_rot_deg":      torch.rad2deg(obj_rot_err).mean(),
+            "Error / ft_mean_m":        ft_err.mean(),
+            # Team reward decomposed components
+            "Episode_Reward / alive":            (self.cfg.rew_alive * alive).mean(),
+            "Episode_Reward / kpts":             (self.cfg.rew_kpts * kpts_err_w).mean(),
+            "Episode_Reward / obj_pos":          (self.cfg.rew_obj_pos * obj_pos_err_w).mean(),
+            "Episode_Reward / obj_rot":          (self.cfg.rew_obj_rot * obj_rot_err).mean(),
+            "Episode_Reward / fingertip":        (self.cfg.rew_fingertip * ft_err).mean(),
+            "Episode_Reward / fingertip_force":  (self.cfg.rew_fingertip_force * force_rew).mean(),
+            "Episode_Reward / hand_action_reg":  (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
+            "Episode_Reward / arm_action_reg":   (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
+            "Episode_Reward / hand_pose_reg":    (self.cfg.rew_hand_pose_reg   * hand_pose_reg).mean(),
+            "Episode_Reward / arm_pose_reg":     (self.cfg.rew_arm_pose_reg    * arm_pose_reg).mean(),
+            "Episode_Reward / team_total":       team_reward.mean(),
+            # Curriculum
+            "Curriculum / reached_frame": torch.tensor(float(self._reached_frame), device=self.device),
+            "Curriculum / warmup_ratio":  self._is_warming_up.float().mean(),
         }
-        return reward
 
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # Reuse early_terminate precomputed in _get_rewards() (errors already stored).
+        # Both agents receive the same team reward (canonical MAPPO).
+        return {"arm": team_reward, "hand": team_reward}
+
+    def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Per-agent (terminated, time_out) dicts. Both agents see identical signals —
+        one agent's failure ends the episode for both (cooperative coupling).
+
+        IMPORTANT: DirectMARLEnv computes reset_buf as math.prod(terminated_dict.values()) |
+        math.prod(time_out_dict.values()), which uses tensor PRODUCT — for bool tensors
+        this is logical AND. Broadcasting the same signal ensures the product equals
+        the broadcast signal (i.e. episode resets when the signal is True).
+        """
         terminated = self._early_terminate_buf
 
         # ── WARMUP ────────────────────────────────────────────────────────────
-        # Update warm-up exit state using errors cached from _get_rewards().
-        # early_terminate already has the warmup mask applied, so just update the flag.
         if self.cfg.enable_warmup and self._is_warming_up.any():
             warmup_done = (
                 (self._last_ft_mean_err < self.cfg.warmup_ft_threshold)
@@ -1258,16 +1377,19 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             self._is_warming_up = self._is_warming_up & ~warmup_done
         # ── END WARMUP ────────────────────────────────────────────────────────
 
-        traj_end = self._traj_lengths[self._traj_idx]  # (B,) per-env trajectory length
+        traj_end = self._traj_lengths[self._traj_idx]
         time_out = self._frame_idx >= traj_end - 1
 
-        self.extras.setdefault("log", {})["success_rate"] = (
+        self.extras.setdefault("log", {})["Curriculum / success_rate"] = (
             (~terminated & ~time_out & (self._last_obj_pos_err < 0.03))
             .float().mean()
         )
 
         self._done_env = terminated | time_out
-        return terminated, time_out
+        return (
+            {"arm": terminated, "hand": terminated},
+            {"arm": time_out, "hand": time_out},
+        )
 
     def _reset_idx(self, env_ids: Sequence[int] | None) -> None:
         if env_ids is None:
@@ -1278,12 +1400,35 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
         env_ids_t = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
+        # --- Mass-in-the-loop: resample mass per-env at episode start. ---
+        # Caches new action and (sampling-time) log_prob_old in mass_dist for PPO ratio.
+        # The mass currently in use during this step's transition (about to be
+        # recorded by train_marl) was already snapshotted at _pre_physics_step.
+        if self._mass_dist is not None and self.cfg.enable_mass_in_loop:
+            new_masses_kg = self._mass_dist.sample_for_envs(env_ids_t)
+            # PhysX mass write — set_masses() expects (num_envs, num_rigid_bodies);
+            # we update only env_ids' slice.
+            try:
+                all_masses = self.object.root_physx_view.get_masses().clone()
+                cpu_dev = all_masses.device
+                all_masses[env_ids_t.to(cpu_dev), 0] = new_masses_kg.to(cpu_dev)
+                all_indices = torch.arange(self.num_envs, dtype=torch.long, device=cpu_dev)
+                self.object.root_physx_view.set_masses(all_masses, all_indices)
+            except Exception as e:
+                if not hasattr(self, "_mass_set_warned"):
+                    print(f"[grasp-marl] WARNING: object mass set_masses failed ({e!r}); "
+                          f"continuing with previous mass.")
+                    self._mass_set_warned = True
+
         # --- Adaptive sampling: EMA failure count update using _enough_idx ---
         # Mirrors GR env: bincount the failure frames, then EMA-update the full count vector.
-        # This correctly (a) weights by how many envs failed at each frame and
-        # (b) decays frames that had no failures this batch (count = 0).
-        if self.cfg.adaptive_sampling and hasattr(self, "reset_terminated"):
-            is_terminated = self.reset_terminated[env_ids]
+        # NOTE: DirectMARLEnv does NOT populate `self.reset_terminated` (that is a
+        # DirectRLEnv-only attribute). We must derive the early-termination mask from
+        # the per-agent terminated_dict instead (both agents share the same signal
+        # via broadcast in _get_dones, so reading "arm" is sufficient).
+        if self.cfg.adaptive_sampling and hasattr(self, "terminated_dict") and self.terminated_dict:
+            term_full = next(iter(self.terminated_dict.values()))  # (B,) bool
+            is_terminated = term_full[env_ids]
             if is_terminated.any():
                 term_env_ids = env_ids_t[is_terminated]
                 failure_frames = self._enough_idx[term_env_ids].clamp(0, self._max_traj_len - 1)
@@ -1319,7 +1464,8 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             start_frames = torch.zeros(n, dtype=torch.long, device=self.device)
 
         self._frame_idx[env_ids] = start_frames
-        self._prev_action[env_ids] = 0.0
+        self._prev_arm_action[env_ids] = 0.0
+        self._prev_hand_action[env_ids] = 0.0
         self._done_env[env_ids] = False
 
         # Reset per-episode tracking quality
@@ -1409,8 +1555,8 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self.object.write_root_pose_to_sim(torch.cat([obj_pos_reset, obj_quat_reset], dim=-1), env_ids)
         self.object.write_root_velocity_to_sim(obj_vel_reset, env_ids)
 
-        # --- TJ-style init save: on the very first reset, force-write frame 0 cache so
-        # subsequent resets at frame 0 reuse the IK-lifted pose instead of re-applying IK. ---
+        # --- TJ-style init save: force-write frame 0 cache once so subsequent resets at
+        # frame 0 reuse the IK-lifted pose instead of re-applying IK. ---
         if not self._init_save_done:
             init_state = torch.cat([
                 torch.zeros(1, 1, device=self.device),                       # reward placeholder
@@ -1425,16 +1571,6 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             self._state_cache[0] = init_state
             self._init_flg[0] = False
             self._init_save_done = True
-
-        # --- Mass-as-an-action: deferred to next _pre_physics_step ---
-        # We store the reset env ids here. By the time _pre_physics_step is called next,
-        # the policy (MassDexMimicPolicy) will have sampled the new episode's mass and
-        # stored it as the action's last dim. Applying mass there ensures the first physics
-        # step of the new episode uses the correct mass (matches rl_games GR env timing).
-        if isinstance(env_ids, torch.Tensor):
-            self._just_reset_env_ids = env_ids.to(self.device)
-        else:
-            self._just_reset_env_ids = torch.tensor(list(env_ids), device=self.device, dtype=torch.long)
 
     def _save_state_cache(
         self,

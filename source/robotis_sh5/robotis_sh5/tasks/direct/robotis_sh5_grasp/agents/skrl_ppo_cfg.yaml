@@ -79,5 +79,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 10000
+  timesteps: 20000   # synced with MARL train (was 10000)
   environment_info: log

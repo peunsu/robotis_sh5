@@ -22,6 +22,10 @@ parser.add_argument("--task", type=str, default="", help="Specific task director
 parser.add_argument("--data_id", type=int, default=-1, help="Specific data ID (-1 = all).")
 parser.add_argument("--num_iter", type=int, default=300, help="IK iteration count.")
 parser.add_argument("--overwrite", action="store_true", help="Re-run even if output file already exists.")
+parser.add_argument("--max_lift_iter", type=int, default=10,
+                    help="Max outer iterations to lift wrist target z so all 21 hand keypoints have z >= table_top.")
+parser.add_argument("--lift_margin", type=float, default=0.005,
+                    help="Safety margin (m) added to wrist lift each outer iter.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.headless = True
@@ -38,11 +42,14 @@ from isaaclab.assets import Articulation
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.sim import SimulationCfg, SimulationContext
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_conjugate, quat_mul
+from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
 
 _SCRIPT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_SCRIPT_DIR / "source" / "robotis_sh5"))
 from robotis_sh5.tasks.direct.robotis_sh5_grasp.robotis_sh5_grasp_env_cfg import FFW_SH5_DEX_CFG
+from robotis_sh5.tasks.direct.robotis_sh5_grasp.robotis_sh5_grasp_env import (
+    _FINGERTIP_OFFSETS, _MANO_NON_FT_BODY_NAMES,
+)
 
 _DATA_DIR = _SCRIPT_DIR / "source" / "robotis_sh5" / "data"
 _OAKINK_DIR = _DATA_DIR / "processed" / "oakink"
@@ -51,7 +58,7 @@ _HOCAP_DIR = _DATA_DIR / "processed" / "hocap"
 # Must match RobotisSh5GraspPretrainEnvCfg defaults
 _TABLE_POS = (0.3, 0.0, 0.0)
 _TABLE_SIZE = (0.6, 0.6, 1.0)
-_ROBOT_POS = (0.65, 0.55, 0.0)
+_ROBOT_POS = (0.65, 0.65, 0.0)   # must match FFW_SH5_DEX_CFG.init_state.pos in env_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +72,37 @@ def _canonicalize_frame0(traj_path: Path, dataset_dir: Path) -> tuple[np.ndarray
     wq = data["qpos_wrist_right"][:, 3:].astype(np.float32)   # wxyz
     op = data["qpos_obj_right"][:, :3].astype(np.float32)
 
-    # Infer object_id from directory structure: .../mano/right/<task>/<id>/...
-    object_id = traj_path.parent.parent.name.split("-")[0]
+    # Resolve mesh path. Prefer task_info.json's `right_object_mesh_dir` (HO-Cap stores
+    # the actual object id there; e.g. "hocap/assets/objects/G09_4" — splitting the task
+    # name on '-' gives wrong "subject_2"). Fall back to dash-split heuristic for OakInk
+    # (task naming convention: "<object_id>-XXXX-XXXX").
+    task_dir = traj_path.parent.parent   # .../mano/right/<task>/
+    info_path = task_dir / "task_info.json"
+    object_id = None
+    if info_path.exists():
+        try:
+            import json
+            info = json.loads(info_path.read_text())
+            mesh_dir_rel = info.get("right_object_mesh_dir", "")
+            if mesh_dir_rel:
+                object_id = Path(mesh_dir_rel).name   # last path component
+        except Exception:
+            object_id = None
+    if object_id is None:
+        object_id = task_dir.name.split("-")[0]
+
+    oq0 = data["qpos_obj_right"][0, 3:].astype(np.float32)   # wxyz
     mesh_path = dataset_dir / "assets" / "objects" / object_id / "visual.obj"
     if mesh_path.exists():
         mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
-        mesh_z_min = float(mesh.vertices[:, 2].min())
+        verts = np.array(mesh.vertices, dtype=np.float32)
+        w, x, y, z = float(oq0[0]), float(oq0[1]), float(oq0[2]), float(oq0[3])
+        R = np.array([
+            [1-2*(y*y+z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1-2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1-2*(x*x + y*y)],
+        ], dtype=np.float32)
+        mesh_z_min = float((verts @ R.T)[:, 2].min())
     else:
         mesh_z_min = 0.0
         print(f"[warn] mesh not found at {mesh_path}; using mesh_z_min=0")
@@ -175,8 +207,79 @@ def _run_ik(
         robot.update(sim.get_physics_dt())
 
     final = robot.data.joint_pos[:, arm_ids_t].squeeze(0)      # (7,)
-    err = torch.norm(robot.data.body_pos_w[:, wrist_body_id, :] - target_pos)
-    return final, float(err.item())
+    ee_pos = robot.data.body_pos_w[:, wrist_body_id, :]
+    ee_quat = robot.data.body_quat_w[:, wrist_body_id, :]
+    pos_err = torch.norm(ee_pos - target_pos)
+    # Rotation error: geodesic angle (rad) between current and target unit quats
+    qa = ee_quat / ee_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    qb = target_quat / target_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    dot = (qa * qb).sum(dim=-1).abs().clamp(0.0, 1.0)
+    rot_err = 2.0 * torch.acos(dot)
+    return final, float(pos_err.item()), float(rot_err.item())
+
+
+def _compute_kpts_min_z(
+    robot: Articulation,
+    kpt_body_ids_t: torch.Tensor,      # (16,) non-fingertip body ids
+    ft_body_ids_t: torch.Tensor,       # (5,)  fingertip body ids
+    ft_offsets_t: torch.Tensor,        # (5, 3) local-frame offsets
+) -> float:
+    """Compute min z over all 21 MANO keypoints — mirrors `_compute_hand_kpts_pos` in env."""
+    # Non-fingertip: link origins (16,)
+    non_ft_z = robot.data.body_pos_w[:, kpt_body_ids_t, 2]            # (1, 16)
+    # Fingertip: link origin + quat_apply(link_quat, local_offset)
+    link_pos = robot.data.body_pos_w[:, ft_body_ids_t, :]             # (1, 5, 3)
+    link_quat = robot.data.body_quat_w[:, ft_body_ids_t, :]           # (1, 5, 4)
+    offsets = ft_offsets_t.unsqueeze(0).expand(1, -1, -1)             # (1, 5, 3)
+    rotated = quat_apply(link_quat.reshape(-1, 4), offsets.reshape(-1, 3)).reshape(1, 5, 3)
+    ft_pos = link_pos + rotated                                       # (1, 5, 3)
+    ft_z = ft_pos[..., 2]                                             # (1, 5)
+    all_z = torch.cat([non_ft_z, ft_z], dim=-1)                       # (1, 21)
+    return float(all_z.min().item())
+
+
+def _run_ik_with_kpt_constraint(
+    robot: Articulation,
+    ik_ctrl: DifferentialIKController,
+    arm_joint_ids: list[int],
+    arm_ids_t: torch.Tensor,
+    jac_body_idx: int,
+    wrist_body_id: int,
+    target_pos: torch.Tensor,
+    target_quat: torch.Tensor,
+    num_iter: int,
+    sim: SimulationContext,
+    table_height: float,
+    kpt_body_ids_t: torch.Tensor,
+    ft_body_ids_t: torch.Tensor,
+    ft_offsets_t: torch.Tensor,
+    max_lift_iter: int,
+    lift_margin: float,
+) -> tuple[torch.Tensor, float, float, float]:
+    """DLS IK + outer loop: lift wrist target z until all 21 hand keypoints have z >= table_height.
+
+    Returns (arm_joint_angles, pos_err, rot_err, total_lift_amount).
+    """
+    target_pos = target_pos.clone()
+    orig_z = float(target_pos[0, 2].item())
+
+    arm_jp = None
+    pos_err = float("nan")
+    rot_err = float("nan")
+    for outer in range(max_lift_iter):
+        arm_jp, pos_err, rot_err = _run_ik(
+            robot, ik_ctrl, arm_joint_ids, arm_ids_t, jac_body_idx,
+            wrist_body_id, target_pos, target_quat, num_iter, sim,
+        )
+        min_z = _compute_kpts_min_z(robot, kpt_body_ids_t, ft_body_ids_t, ft_offsets_t)
+        if min_z >= table_height - 1e-4:
+            break
+        deficit = table_height - min_z + lift_margin
+        target_pos = target_pos.clone()
+        target_pos[0, 2] += deficit
+
+    lift = float(target_pos[0, 2].item()) - orig_z
+    return arm_jp, pos_err, rot_err, lift
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +312,31 @@ def main():
     print(f"Arm joint IDs : {arm_joint_ids}")
     print(f"Wrist body ID : {wrist_body_id}  →  Jacobian row {jac_body_idx}")
 
+    # ── Resolve fingertip + non-fingertip MANO keypoint body IDs (mirrors env code) ──
+    fingertip_names = ["finger_r_link4", "finger_r_link8", "finger_r_link12",
+                       "finger_r_link16", "finger_r_link20"]
+    ft_body_ids = []
+    for name in fingertip_names:
+        found, _ = robot.find_bodies(name)
+        if not found:
+            raise RuntimeError(f"Fingertip body '{name}' not found in robot.")
+        ft_body_ids.append(found[0])
+    ft_body_ids_t = torch.tensor(ft_body_ids, dtype=torch.long, device=device)
+    ft_offsets_t = torch.tensor(
+        [_FINGERTIP_OFFSETS[n] for n in fingertip_names],
+        dtype=torch.float32, device=device,
+    )  # (5, 3)
+
+    kpt_body_ids = []
+    for _, body_name in _MANO_NON_FT_BODY_NAMES:
+        found, _ = robot.find_bodies(body_name)
+        if not found:
+            raise RuntimeError(f"MANO body '{body_name}' not found in robot.")
+        kpt_body_ids.append(found[0])
+    kpt_body_ids_t = torch.tensor(kpt_body_ids, dtype=torch.long, device=device)
+
+    table_height = float(_TABLE_SIZE[2])
+
     ik_cfg = DifferentialIKControllerCfg(
         command_type="pose",
         use_relative_mode=False,
@@ -228,42 +356,56 @@ def main():
             if d.is_dir() and (not args_cli.object_id or args_cli.object_id in d.name)
         )
 
-    processed = skipped = errors = 0
+    # Collect all (data_dir, traj_path) pairs upfront so we can show [i/N] progress.
+    targets: list[tuple[Path, Path]] = []
     for task_dir in task_dirs:
         if args_cli.data_id >= 0:
             data_dirs = [task_dir / str(args_cli.data_id)]
         else:
             data_dirs = sorted(d for d in task_dir.iterdir() if d.is_dir())
-
         for data_dir in data_dirs:
             traj_path = data_dir / "trajectory_keypoints.npz"
-            if not traj_path.exists():
-                continue
+            if traj_path.exists():
+                targets.append((data_dir, traj_path))
+    total = len(targets)
+    print(f"\nProcessing {total} trajectory directories...\n")
 
-            out_path = data_dir / "frame0_arm_joint_pos.npy"
-            if out_path.exists() and not args_cli.overwrite:
-                print(f"[skip] {out_path.relative_to(_dataset_dir)} already exists")
-                skipped += 1
-                continue
+    processed = skipped = errors = 0
+    for i, (data_dir, traj_path) in enumerate(targets, start=1):
+        prefix = f"[{i}/{total}]"
 
-            result = _canonicalize_frame0(traj_path, _dataset_dir)
-            if result is None:
-                errors += 1
-                continue
-            wrist_pos_np, wrist_quat_np = result
+        out_path = data_dir / "frame0_arm_joint_pos.npy"
+        if out_path.exists() and not args_cli.overwrite:
+            print(f"{prefix} skip — {out_path.relative_to(_dataset_dir)} already exists")
+            skipped += 1
+            continue
 
-            target_pos = torch.tensor(wrist_pos_np, dtype=torch.float32, device=device).unsqueeze(0)
-            target_quat = torch.tensor(wrist_quat_np, dtype=torch.float32, device=device).unsqueeze(0)
+        result = _canonicalize_frame0(traj_path, _dataset_dir)
+        if result is None:
+            print(f"{prefix} error — canonicalize failed for {traj_path.relative_to(_dataset_dir)}")
+            errors += 1
+            continue
+        wrist_pos_np, wrist_quat_np = result
 
-            arm_jp, pos_err = _run_ik(
-                robot, ik_ctrl, arm_joint_ids, arm_ids_t, jac_body_idx,
-                wrist_body_id, target_pos, target_quat, args_cli.num_iter, sim,
-            )
+        target_pos = torch.tensor(wrist_pos_np, dtype=torch.float32, device=device).unsqueeze(0)
+        target_quat = torch.tensor(wrist_quat_np, dtype=torch.float32, device=device).unsqueeze(0)
 
-            np.save(str(out_path), arm_jp.cpu().numpy())
-            rel = traj_path.parent.relative_to(_OAKINK_DIR)
-            print(f"[ok] {rel}  pos_err={pos_err:.4f}m  → {out_path.name}")
-            processed += 1
+        arm_jp, pos_err, rot_err, lift = _run_ik_with_kpt_constraint(
+            robot, ik_ctrl, arm_joint_ids, arm_ids_t, jac_body_idx,
+            wrist_body_id, target_pos, target_quat, args_cli.num_iter, sim,
+            table_height=table_height,
+            kpt_body_ids_t=kpt_body_ids_t,
+            ft_body_ids_t=ft_body_ids_t,
+            ft_offsets_t=ft_offsets_t,
+            max_lift_iter=args_cli.max_lift_iter,
+            lift_margin=args_cli.lift_margin,
+        )
+
+        np.save(str(out_path), arm_jp.cpu().numpy())
+        rel = traj_path.parent.relative_to(_dataset_dir)
+        print(f"{prefix} {rel}  pos_err={pos_err:.4f}m  rot_err={np.degrees(rot_err):.2f}°  "
+              f"lift={lift*100:.2f}cm  → {out_path.name}")
+        processed += 1
 
     print(f"\nDone: {processed} processed, {skipped} skipped, {errors} errors.")
     import os; os._exit(0)
