@@ -96,30 +96,30 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         "DY_80": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[1-3]", "arm_r_joint[1-3]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=61.4,
+            effort_limit_sim=1e6,  # 61.4,
             stiffness=600.0,
             damping=90.0  # default: 30.0
         ),
         "DY_70": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[4-6]", "arm_r_joint[4-6]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=31.7,
+            effort_limit_sim=1e6,  # 31.7,
             stiffness=600.0,
             damping=60.0  # default: 20.0
         ),
         "DP_42": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint7", "arm_r_joint7"],
             velocity_limit_sim=6.0,
-            effort_limit_sim=5.1,
+            effort_limit_sim=1e6,  # 5.1,
             stiffness=200.0,
-            damping=20.0  # default: 3.0
+            damping=25.0  # default: 3.0
         ),
         "hand": ImplicitActuatorCfg(
             joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
             velocity_limit_sim=2.2,
-            effort_limit_sim=15.0,
+            effort_limit_sim=1e6,  # 2.0,
             stiffness=20.0,
-            damping=0.5,  # default: 0.5
+            damping=1.0,  # default: 1.0
         ),
         "head": ImplicitActuatorCfg(
             joint_names_expr=["head_joint1", "head_joint2"],
@@ -185,8 +185,9 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     num_arm_r_dofs: int = 7   # arm_r_joint1-7
     num_lift_dofs: int = 1    # lift_joint (NOT in action — held at fixed_lift_target via PD ctrl)
     action_space: int = 28    # 20(fingers) + 7(arm) + 1(mass); lift excluded
-    observation_space: int = 279  # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+28+5  (prev_action=28)
+    observation_space: int = 285  # 63+6+3+3+15+28+28+3+6+3+3+63+15+3+6+5+27+5  (6D rot, prev_action=27 joint-only; matches pretrain for ckpt transfer)
     state_space: int = 0
+    vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
     # Lift target (joint position in radians/meters depending on joint type).
     # 0.0 = URDF upper limit (fully up). Held by PD controller every step.
     fixed_lift_target: float = 0.0
@@ -195,7 +196,11 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
         render_interval=decimation,
-        gravity=(0.0, 0.0, -9.81),
+        gravity=(0.0, 0.0, -9.80665),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
         physx=sim_utils.PhysxCfg(
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=1024 * 1024,
@@ -272,8 +277,8 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     object_mass: float = 0.2              # default mass (kg) used if mass-as-action is disabled
     object_mass_min: float = 0.04         # minimum object mass for mass-as-action sampling (kg)
     object_mass_max: float = 0.20         # maximum object mass for mass-as-action sampling (kg)
-    object_static_friction: float = 0.8
-    object_dynamic_friction: float = 0.6
+    object_static_friction: float = 1.0
+    object_dynamic_friction: float = 1.0
     object_restitution: float = 0.1
 
     # Contact threshold for future_contact precomputation
@@ -296,13 +301,14 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     rew_obj_pos: float = -4.26        # GR env: 4.26
     rew_obj_rot: float = -1.0         # GR env: 1.0
     rew_fingertip: float = -5.2       # GR env: 5.2
+    rew_wrist_pos: float = -1.04      # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 1.0  # GR env: 1.125 (slightly different normalization)
     # Action/pose regularization split by region (3× stronger on arm than hand).
     # Action layout: [fingers(20) | arm_r(7) | mass(1)]; pose excludes lift (PD-fixed).
     rew_hand_action_reg: float = -0.004   # GR baseline kept for fingers
-    rew_arm_action_reg:  float = -0.004   # matches hand (was 3× = -0.012)
+    rew_arm_action_reg:  float = -0.004   # 1× hand
     rew_hand_pose_reg:   float = -0.001
-    rew_arm_pose_reg:    float = -0.001   # matches hand (was 3× = -0.003); lift excluded
+    rew_arm_pose_reg:    float = -0.001   # 1× hand; lift excluded
     # Termination
     # termination=False disables early termination entirely (only timeout) — use for warm-up.
     # GR env uses this flag to avoid infinite termination loops early in training when the
@@ -318,6 +324,10 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Helps absorb the IK-lift offset and open-vs-curled finger mismatch at t=0.
     # 0 = disabled (no grace; standard TJ behavior).
     early_termination_grace_frames: int = 0
+
+    # Diagnostic: log joints that saturate at effort_limit. Prints to stdout periodically.
+    log_effort_saturation: bool = False             # set True to enable
+    effort_saturation_log_interval: int = 500       # steps between summary prints
 
     # Adaptive rollout sampling (GR/TJ env style)
     adaptive_sampling: bool = True
@@ -348,7 +358,7 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
 
     # Debug visualization (requires GUI — do not use with --headless)
     debug_vis: bool = True
-    debug_vis_num_envs: int = 16            # show markers for first N environments only
+    debug_vis_num_envs: int = 2048            # show markers for first N environments only
 
     # ── WARMUP ────────────────────────────────────────────────────────────────
     # Warm-up mechanism: freeze the target at start_frame and disable early

@@ -32,8 +32,9 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     # ── Agent / space definitions (same shapes as train for ckpt transfer) ───
     possible_agents: list = ["arm", "hand"]
     action_spaces: dict = {"arm": 7, "hand": 20}
-    observation_spaces: dict = {"arm": 82, "hand": 276}
-    state_space: int = 279   # explicit non-redundant shared state via _get_states()
+    observation_spaces: dict = {"arm": 89, "hand": 283}
+    state_space: int = 286   # explicit non-redundant shared state via _get_states()
+    vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
 
     # ── Viewer ───────────────────────────────────────────────────────────────
     viewer: ViewerCfg = ViewerCfg(
@@ -56,7 +57,11 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
         render_interval=decimation,
-        gravity=(0.0, 0.0, -9.81),
+        gravity=(0.0, 0.0, -9.80665),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
         physx=sim_utils.PhysxCfg(
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=1024 * 1024,
@@ -126,19 +131,24 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     rew_obj_pos: float = 0.0              # disabled — no object in pretrain
     rew_obj_rot: float = 0.0
     rew_fingertip: float = -12.5          # single-agent pretrain weight
+    rew_wrist_pos: float = -2.5           # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 0.0      # no contact in pretrain
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg: float = -0.004   # matches hand (was 3× = -0.012)
+    rew_arm_action_reg: float = -0.004   # 1× hand
     rew_hand_pose_reg: float = -0.001
-    rew_arm_pose_reg: float = -0.001     # matches hand (was 3× = -0.003)
+    rew_arm_pose_reg: float = -0.001     # 1× hand
 
     # ── Termination ──────────────────────────────────────────────────────────
     termination: bool = True
     max_wrist_pos_err: float = 0.15
     max_wrist_rot_err: float = 0.75
-    max_ft_mean_err: float = 0.15
+    max_ft_mean_err: float = 0.1      # matches TJ pretrain: delta_fingertip_pos_value_mean > 0.1
     # Grace period: disable early termination for the first N frames of each episode. 0 = disabled.
     early_termination_grace_frames: int = 0
+
+    # Diagnostic: log joints that saturate at effort_limit.
+    log_effort_saturation: bool = False
+    effort_saturation_log_interval: int = 500
 
     # ── Debug visualization ──────────────────────────────────────────────────
     debug_vis: bool = True

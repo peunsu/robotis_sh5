@@ -44,7 +44,7 @@ agent:
   class: PPO
   rollouts: 8           # horizon length (MassDexMimic: 8 steps)
   learning_epochs: 5    # mini_epochs (MassDexMimic: 5)
-  mini_batches: 4
+  mini_batches: 8       # TJ: minibatch_size=2048 with num_envs*rollouts=16384 → 8 mini-batches
   discount_factor: 0.96  # gamma (MassDexMimic: 0.96)
   lambda: 0.95
   learning_rate: 3.0e-04  # MassDexMimic: 3e-4
@@ -64,7 +64,7 @@ agent:
   entropy_loss_scale: 0.004
   value_loss_scale: 2.0
   kl_threshold: 0.0
-  rewards_shaper_scale: 1.0
+  rewards_shaper_scale: 0.1  # matches TJ reward_shaper.scale_value=0.1
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:

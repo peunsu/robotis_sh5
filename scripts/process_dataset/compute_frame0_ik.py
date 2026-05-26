@@ -20,7 +20,7 @@ parser.add_argument("--dataset", type=str, default="oakink", choices=["oakink", 
 parser.add_argument("--object_id", type=str, default="", help="Object ID to process (empty = all objects).")
 parser.add_argument("--task", type=str, default="", help="Specific task directory (empty = all tasks).")
 parser.add_argument("--data_id", type=int, default=-1, help="Specific data ID (-1 = all).")
-parser.add_argument("--num_iter", type=int, default=300, help="IK iteration count.")
+parser.add_argument("--num_iter", type=int, default=200, help="IK iteration count.")
 parser.add_argument("--overwrite", action="store_true", help="Re-run even if output file already exists.")
 parser.add_argument("--max_lift_iter", type=int, default=10,
                     help="Max outer iterations to lift wrist target z so all 21 hand keypoints have z >= table_top.")
@@ -57,7 +57,7 @@ _HOCAP_DIR = _DATA_DIR / "processed" / "hocap"
 
 # Must match RobotisSh5GraspPretrainEnvCfg defaults
 _TABLE_POS = (0.3, 0.0, 0.0)
-_TABLE_SIZE = (0.6, 0.6, 1.0)
+_TABLE_SIZE = (0.6, 0.6, 1.0)   # must match cfg.table_size in env_cfg
 _ROBOT_POS = (0.65, 0.65, 0.0)   # must match FFW_SH5_DEX_CFG.init_state.pos in env_cfg
 
 
@@ -178,11 +178,24 @@ def _run_ik(
     num_iter: int,
     sim: SimulationContext,
 ) -> torch.Tensor:
-    """Run DLS IK and return converged arm joint angles (7,)."""
-    # Reset robot to default joint positions
+    """Run DLS IK and return converged arm joint angles (7,).
+
+    Called once per outer lift iteration in `_run_ik_with_kpt_constraint`.
+    Performs a hard reset to the default joint pose at the start so each retry
+    after a lift increase starts from the same clean baseline (no warm-start
+    carryover from the previous IK convergence):
+      1. write_joint_state_to_sim → directly set joints/velocities to default
+      2. set_joint_position_target → also reset PD target so PD won't pull toward
+         the previous IK's last commanded target during settle steps
+      3. several sim.step() to settle actuators at the default pose
+      4. robot.update() to refresh data buffers
+    """
     default_jp = robot.data.default_joint_pos.clone()
-    robot.write_joint_state_to_sim(default_jp, torch.zeros_like(default_jp))
-    sim.step()
+    default_jv = torch.zeros_like(default_jp)
+    robot.write_joint_state_to_sim(default_jp, default_jv)
+    robot.set_joint_position_target(default_jp)
+    for _ in range(3):
+        sim.step()
     robot.update(sim.get_physics_dt())
 
     ik_ctrl.reset()
@@ -341,7 +354,7 @@ def main():
         command_type="pose",
         use_relative_mode=False,
         ik_method="dls",
-        ik_params={"lambda_val": 0.05},
+        ik_params={"lambda_val": 0.1},
     )
     ik_ctrl = DifferentialIKController(ik_cfg, num_envs=1, device=device)
 

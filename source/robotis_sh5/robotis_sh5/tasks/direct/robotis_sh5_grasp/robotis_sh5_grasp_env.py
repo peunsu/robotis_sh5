@@ -35,16 +35,56 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_conjugate, 
 
 from .robotis_sh5_grasp_env_cfg import RobotisSh5GraspEnvCfg
 
+
+def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
+    """Convert wxyz quaternion to orthonormalized 6D continuous rotation rep (Zhou et al. 2019).
+
+    Mirrors TJ's `quat_to_6d` (Gram-Schmidt on first two rows of R), but with wxyz input order
+    to match isaaclab convention. Returns shape (..., 6).
+    """
+    q = torch.nn.functional.normalize(quat, dim=-1)
+    w, x, y, z = q.unbind(-1)
+    # First two rows of rotation matrix (wxyz convention)
+    r0 = torch.stack([
+        1 - 2 * (y * y + z * z),
+        2 * (x * y - w * z),
+        2 * (x * z + w * y),
+    ], dim=-1)
+    r1 = torch.stack([
+        2 * (x * y + w * z),
+        1 - 2 * (x * x + z * z),
+        2 * (y * z - w * x),
+    ], dim=-1)
+    a1 = torch.nn.functional.normalize(r0, dim=-1)
+    a2 = r1 - (a1 * r1).sum(-1, keepdim=True) * a1
+    a2 = torch.nn.functional.normalize(a2, dim=-1)
+    return torch.cat([a1, a2], dim=-1)
+
+
 # Local-frame offsets from link origin to actual fingertip contact point.
 # Derived from get_virtual_link_poses() in manager_based pick_and_place utils.py.
 # finger_r_link4  (thumb):                +Y offset
 # finger_r_link8/12/16/20 (index~little): +Z offset
 _FINGERTIP_OFFSETS: dict[str, list[float]] = {
-    "finger_r_link4":  [0.0,  0.03975, 0.0],
-    "finger_r_link8":  [0.0,  0.0,     0.02425],
-    "finger_r_link12": [0.0,  0.0,     0.02425],
-    "finger_r_link16": [0.0,  0.0,     0.02425],
-    "finger_r_link20": [0.0,  0.0,     0.02425],
+    "finger_r_link4":  [0.0,    0.03975, 0.012],
+    "finger_r_link8":  [0.012,  0.0,     0.02425],
+    "finger_r_link12": [0.012,  0.0,     0.02425],
+    "finger_r_link16": [0.012,  0.0,     0.02425],
+    "finger_r_link20": [0.012,  0.0,     0.02425],
+}
+
+# Pad-outward normals in each fingertip link's LOCAL frame (unit vectors).
+# Used for contact-force projection (mirrors TJ's `fingertip_normal`):
+#   force_along_pad = (force_w * -pad_normal_w).sum(-1).clamp_min(0)
+# Identified visually via scripts/process_dataset/visualize_fingertip_normals.py.
+# finger_r_link4  (thumb):                pad outward = +Z local
+# finger_r_link8/12/16/20 (index~little): pad outward = +X local
+_FINGERTIP_PAD_NORMALS: dict[str, list[float]] = {
+    "finger_r_link4":  [0.0, 0.0, 1.0],   # thumb
+    "finger_r_link8":  [1.0, 0.0, 0.0],   # index
+    "finger_r_link12": [1.0, 0.0, 0.0],   # middle
+    "finger_r_link16": [1.0, 0.0, 0.0],   # ring
+    "finger_r_link20": [1.0, 0.0, 0.0],   # little
 }
 
 # MANO keypoint index → SH5 body name mapping for non-fingertip joints.
@@ -142,12 +182,14 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             obj_linvel = np.concatenate(
                 [(op[1:] - op[:-1]) * action_fps, np.zeros((1, 3), dtype=np.float32)], axis=0
             )  # (N, 3)
-            obj_angvel_ref = np.concatenate(
-                [(oq[1:] - oq[:-1]) * action_fps, np.zeros((1, 4), dtype=np.float32)], axis=0
-            )  # crude finite-diff of quaternion components as a proxy for angular speed
-            obj_speed = np.linalg.norm(obj_linvel, axis=-1)           # (N,)
-            obj_angspeed = np.linalg.norm(obj_angvel_ref, axis=-1)    # (N,) proxy for angvel
-            # GR env: contact if (linvel > 0.05 OR angvel > 0.25) AND fingertip near object
+            obj_speed = np.linalg.norm(obj_linvel, axis=-1)           # (N,) m/s
+            # Actual angular velocity magnitude (rad/s) via quaternion geodesic angle.
+            # Matches TJ's `obj_angvel_seq` semantics (precomputed actual angvel).
+            _dot_q = np.abs((oq[:-1] * oq[1:]).sum(axis=-1)).clip(0.0, 1.0)
+            obj_angspeed = np.concatenate(
+                [2.0 * np.arccos(_dot_q) * action_fps, np.array([0.0], dtype=np.float32)]
+            )  # (N,) rad/s
+            # GR env: contact if (linvel > 0.05 m/s OR angvel > 0.25 rad/s) AND fingertip near object
             velocity_condition = (obj_speed > 0.05) | (obj_angspeed > 0.25)  # (N,)
             dist = np.linalg.norm(fp - op[:, None, :], axis=-1)       # (N, 5)
             near_object = dist < cfg.contact_dist_threshold            # (N, 5)
@@ -315,14 +357,17 @@ class RobotisSh5GraspEnv(DirectRLEnv):
                     cv_local[t] = _verts[idxs]                          # (5, 3)
                     cv_dist[t]  = dists[idxs, np.arange(5)]            # (5,)
                 # Recompute future_contact using relative vertex distance (GR method):
-                #   contact iff (linvel>0.05 OR angvel>0.25) AND (cv_dist - min_cv_dist < 0.015)
+                #   contact iff (linvel>0.05 m/s OR angvel>0.25 rad/s) AND (cv_dist - min_cv_dist < 0.015)
                 op_arr = obj_pos_list[i]
                 oq_arr = obj_quat_list[i]
                 _lv = np.concatenate([(op_arr[1:]-op_arr[:-1])*_action_fps_cv,
                                       np.zeros((1,3),dtype=np.float32)], axis=0)
-                _av = np.concatenate([(oq_arr[1:]-oq_arr[:-1])*_action_fps_cv,
-                                      np.zeros((1,4),dtype=np.float32)], axis=0)
-                vel_cond = (np.linalg.norm(_lv,axis=-1)>0.05) | (np.linalg.norm(_av,axis=-1)>0.25)
+                # Actual angular velocity magnitude (rad/s) via quaternion geodesic angle.
+                _dot_q = np.abs((oq_arr[:-1] * oq_arr[1:]).sum(axis=-1)).clip(0.0, 1.0)
+                _angspeed = np.concatenate(
+                    [2.0 * np.arccos(_dot_q) * _action_fps_cv, np.array([0.0], dtype=np.float32)]
+                )
+                vel_cond = (np.linalg.norm(_lv, axis=-1) > 0.05) | (_angspeed > 0.25)
                 cv_min   = cv_dist.min(axis=-1, keepdims=True)            # (N, 1)
                 near_vtx = (cv_dist - cv_min) < 0.015                    # (N, 5)
                 future_contact_list[i] = (vel_cond[:, None] & near_vtx).astype(np.float32)
@@ -424,7 +469,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             spawn=sim_utils.UsdFileCfg(
                 usd_path=str(usd_path),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    solver_position_iteration_count=4,
+                    solver_position_iteration_count=8,
                     solver_velocity_iteration_count=0,
                     max_angular_velocity=1000.0,
                     max_linear_velocity=1000.0,
@@ -568,11 +613,13 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
         # Pre-build per-fingertip local-frame offset tensors (shape: [5, 3])
         # Order matches cfg.fingertip_body_names.
-        offsets = []
+        offsets, pad_normals = [], []
         for name in self.cfg.fingertip_body_names:
-            off = _FINGERTIP_OFFSETS.get(name, [0.0, 0.0, 0.0])
-            offsets.append(off)
-        self._ft_offsets = torch.tensor(offsets, dtype=torch.float32, device=self.device)  # (5, 3)
+            offsets.append(_FINGERTIP_OFFSETS.get(name, [0.0, 0.0, 0.0]))
+            pad_normals.append(_FINGERTIP_PAD_NORMALS.get(name, [0.0, 0.0, 1.0]))
+        # (5, 3) tip-position offset and pad-outward unit normal, both in link local frame
+        self._ft_offsets = torch.tensor(offsets, dtype=torch.float32, device=self.device)
+        self._ft_pad_normals = torch.tensor(pad_normals, dtype=torch.float32, device=self.device)
 
         # Wrist body index (needed for rotation tracking)
         wrist_ids, _ = self.robot.find_bodies(self.cfg.wrist_body_name)
@@ -691,6 +738,36 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         self._last_kpts_err_raw = torch.zeros(B, device=self.device)  # raw ref vs robot kpts (m); for evaluation E_j metric
         self._last_ft_raw_err = torch.zeros(B, device=self.device)  # raw ref vs robot fingertips (m); for evaluation E_ft metric
 
+        # Effort-saturation diagnostic buffers (cfg-gated).
+        self._sat_acc = torch.zeros(self.robot.num_joints, device=self.device)
+        self._sat_step_count: int = 0
+
+    def _log_effort_saturation(self) -> None:
+        """Diagnostic: print joints whose applied torque hits ≥99 % of effort_limit.
+
+        Called every step but only emits a summary every `effort_saturation_log_interval`
+        steps. Toggle via `cfg.log_effort_saturation = True`.
+        """
+        if not self.cfg.log_effort_saturation:
+            return
+        applied = self.robot.data.applied_torque                       # (B, N_joints)
+        limits = self.robot.data.joint_effort_limits                   # (B, N_joints)
+        sat_mask = applied.abs() >= 0.99 * limits.clamp(min=1e-6)
+        self._sat_acc += sat_mask.float().mean(dim=0)                  # accumulate per-joint env mean
+        self._sat_step_count += 1
+        if self._sat_step_count >= self.cfg.effort_saturation_log_interval:
+            avg_ratio = self._sat_acc / self._sat_step_count
+            high_idx = (avg_ratio > 0.01).nonzero(as_tuple=True)[0]
+            if len(high_idx) > 0:
+                print(f"\n[effort_saturation] over last {self._sat_step_count} steps "
+                      f"(joints with >1% env-avg saturation):")
+                names = self.robot.joint_names
+                for idx in high_idx.tolist():
+                    print(f"  {names[idx]:30s}  {avg_ratio[idx].item()*100:5.1f}%  "
+                          f"(effort_limit={limits[0, idx].item():6.2f} N·m)")
+            self._sat_acc.zero_()
+            self._sat_step_count = 0
+
     def _resolve_fingertip_ids(self) -> torch.Tensor:
         ids = []
         for name in self.cfg.fingertip_body_names:
@@ -739,29 +816,30 @@ class RobotisSh5GraspEnv(DirectRLEnv):
 
         return link_pos + rotated
 
-    def _compute_fingertip_normals(self) -> torch.Tensor:
-        """Compute world-space unit normal vectors at each fingertip.
+    def _compute_fingertip_pad_normals_w(self) -> torch.Tensor:
+        """Compute world-space pad-outward unit normals for each fingertip link.
 
-        The normal is defined as the approach direction of the fingertip — i.e.,
-        the direction from the link origin toward the virtual tip, expressed in
-        world frame. Used to project contact forces onto the contact normal.
+        Local-frame pad normals are stored in `self._ft_pad_normals` (5, 3) —
+        identified via `scripts/process_dataset/visualize_fingertip_normals.py`:
+            thumb (link4)        : +Z local
+            others (link8/12/16/20): +X local
+
+        Used for contact-force projection (mirrors TJ):
+            force_along_pad = (force_w * -pad_normal_w).sum(-1).clamp_min(0)
 
         Returns:
-            normals: (B, 5, 3) unit vectors in world frame.
+            pad_normals_w: (B, 5, 3) unit vectors in world frame.
         """
         B = self.num_envs
         if len(self._ft_body_ids) != 5:
             return torch.zeros(B, 5, 3, device=self.device)
 
-        link_quat = self.robot.data.body_quat_w[:, self._ft_body_ids, :]  # (B, 5, 4)
-        offsets = self._ft_offsets.unsqueeze(0).expand(B, -1, -1)         # (B, 5, 3)
-
-        normals = quat_apply(
+        link_quat = self.robot.data.body_quat_w[:, self._ft_body_ids, :]      # (B, 5, 4)
+        pad_local = self._ft_pad_normals.unsqueeze(0).expand(B, -1, -1)       # (B, 5, 3)
+        return quat_apply(
             link_quat.reshape(B * 5, 4),
-            offsets.reshape(B * 5, 3),
-        ).reshape(B, 5, 3)  # world-frame offset vectors (not yet unit)
-
-        return normals / normals.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            pad_local.reshape(B * 5, 3),
+        ).reshape(B, 5, 3)
 
     def _compute_hand_kpts_pos(self) -> torch.Tensor:
         """Compute world-space positions for all 21 MANO keypoints from robot state.
@@ -983,39 +1061,42 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         # Delta object pose toward next reference frame
         delta_obj_pos = obj_pos - ref_obj_pos
         q_err = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))
-        delta_obj_rot = 2.0 * q_err[:, 1:]  # axis-angle approximation
+        delta_obj_rot_6d = quat_to_6d(q_err)  # TJ uses 6D rotation representation
 
         future_contact   = self._future_contact[traj, frame]
         fingertip_forces = self._get_fingertip_forces()
 
+        # TJ-style scaling on angular and joint velocities
+        vs = self.cfg.vel_obs_scale
+
         obs = torch.cat([
             # Hand keypoint positions: all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
-            hand_kpts_pos.reshape(B, 63),   # [63] all 21 keypoints (incl. wrist at idx 0)
-            # Hand global state
-            wrist_quat_obs,                 # [4]  wrist rotation (wxyz)
-            wrist_linvel_obs,               # [3]  wrist linear velocity
-            wrist_angvel_obs,               # [3]  wrist angular velocity
+            hand_kpts_pos.reshape(B, 63),   # [63]
+            # Hand global state (TJ: 6D rotation rep + vel_obs_scale on angvel)
+            quat_to_6d(wrist_quat_obs),     # [6]
+            wrist_linvel_obs,               # [3]
+            vs * wrist_angvel_obs,          # [3]
             # Fingertip velocities
             ft_vel.reshape(B, 15),          # [15]
-            # Hand DOF
+            # Hand DOF (TJ: vel_obs_scale on joint vel)
             joint_pos,                      # [28]
-            joint_vel,                      # [28]
-            # Object state
+            vs * joint_vel,                 # [28]
+            # Object state (TJ: 6D rot + vel_obs_scale on angvel)
             obj_pos,                        # [3]
-            obj_quat,                       # [4]
+            quat_to_6d(obj_quat),           # [6]
             obj_linvel,                     # [3]
-            obj_angvel,                     # [3]
-            # Delta targets (next-frame look-ahead)
-            delta_kpts_world.reshape(B, 63),# [63] world-frame delta for all 21 keypoints
-            delta_ft_obj.reshape(B, 15),    # [15] obj-local contact-conditioned delta
+            vs * obj_angvel,                # [3]
+            # Delta targets (next-frame look-ahead, TJ: 6D for delta_obj_rot)
+            delta_kpts_world.reshape(B, 63),# [63]
+            delta_ft_obj.reshape(B, 15),    # [15]
             delta_obj_pos,                  # [3]
-            delta_obj_rot,                  # [3]
-            # Contact + history + forces
+            delta_obj_rot_6d,               # [6]
+            # Contact + history + forces (TJ: mass excluded from obs)
             future_contact,                 # [5]
-            self._prev_action,              # [29]
+            self._prev_action[:, :-1],      # [27] joint prev-action only; mass excluded
             fingertip_forces,               # [5]
         ], dim=-1)
-        # Total: 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+29+5 = 280
+        # Total: 63+6+3+3+15+28+28+3+6+3+3+63+15+3+6+5+27+5 = 285 (same as pretrain → ckpt-compatible)
 
         self._prev_action = self.actions.clone()
 
@@ -1026,26 +1107,28 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_fingertip_forces(self) -> torch.Tensor:
-        """Return per-fingertip normal contact force (N), projected onto fingertip approach direction.
+        """Return per-fingertip compressive contact force (N), projected onto pad-inward direction.
 
-        The contact force vector from each sensor is projected onto the fingertip's
-        world-frame normal (approach direction). Only positive (compressive) components
-        are kept, i.e., force pushing in the direction the finger is pointing.
+        Uses `force_matrix_w` (per-filter-object contact force) — only counts contact
+        with the Object (filter target), NOT self-collision or table contacts.
+        Mirrors TJ's projection:
+            force_along_pad = (force_w * -pad_normal_w).sum(-1).clamp_min(0)
+        where `pad_normal_w` is the pad-OUTWARD unit normal in world frame.
         """
         B = self.num_envs
         forces = torch.zeros(B, 5, device=self.device)
-        normals = self._compute_fingertip_normals()  # (B, 5, 3)
+        pad_normals_w = self._compute_fingertip_pad_normals_w()   # (B, 5, 3) pad-OUTWARD
 
         for i, name in enumerate(self.cfg.fingertip_body_names):
             sensor = self._contact_sensors.get(name)
             if sensor is None:
                 continue
             try:
-                net_f = sensor.data.net_forces_w    # (B, 1, 3)
-                force_vec = net_f[:, 0, :]           # (B, 3)
-                normal = normals[:, i, :]            # (B, 3)
-                # Scalar projection onto fingertip approach normal; clamp to ≥ 0
-                forces[:, i] = (force_vec * normal).sum(dim=-1).clamp(min=0.0)
+                # force_matrix_w: (B, num_bodies=1, num_filter=1, 3) — contact force with Object only.
+                fmat = sensor.data.force_matrix_w
+                force_vec = fmat[:, 0, 0, :]          # (B, 3) force on fingertip from object
+                inward = -pad_normals_w[:, i, :]      # (B, 3) pad-inward (into finger body)
+                forces[:, i] = (force_vec * inward).sum(dim=-1).clamp(min=0.0)
             except Exception:
                 pass
         return forces
@@ -1070,36 +1153,25 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         delta_obj_pos_w[:, 2] *= 1.5
         obj_pos_err_w = torch.norm(delta_obj_pos_w, dim=-1)  # Z-weighted — reward
         q_err = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))
-        # Use |w| for shortest-angle (quaternion double-cover: q and -q are same rotation).
-        obj_rot_err = 2.0 * torch.acos(q_err[:, 0].abs().clamp(max=1.0))
+        # arcsin(||vec||) form for numerical precision (matches TJ wrist_rot_err / hand_rot_value).
+        obj_rot_err = 2.0 * torch.asin(torch.norm(q_err[:, 1:4], dim=-1).clamp(max=1.0))
 
         # All 21 MANO keypoints (wrist + MCP/PIP/DIP + fingertips).
         B = self.num_envs
         hand_kpts_pos = self._compute_hand_kpts_pos()                      # (B, 21, 3)
         ft_pos = hand_kpts_pos[:, self._kpt_ft_mano_indices_t, :]         # (B, 5, 3)
 
-        # Object rotation drift offset (shared for keypoints and fingertip adjustment).
-        obj_rot_offset = quat_mul(obj_quat, quat_conjugate(ref_obj_quat))  # (B, 4)
-
-        # Reference keypoints adjusted for object drift (same approach as ref_ft_adjusted).
-        # Store keypoints as object-relative offsets and apply current drift rotation.
+        # Reference keypoints in world frame (TJ-style: NO drift compensation — track original human motion).
         ref_kpts_local = self._ref_mano_kpts[traj, frame]                 # (B, 21, 3) env-local
-        ref_kpts_obj_offset = ref_kpts_local - self._ref_obj_pos[traj, frame].unsqueeze(1)  # (B, 21, 3)
-        obj_rot_offset_21 = obj_rot_offset.unsqueeze(1).expand(-1, 21, -1).reshape(B * 21, 4)
-        ref_kpts_world = quat_apply(
-            obj_rot_offset_21, ref_kpts_obj_offset.reshape(B * 21, 3)
-        ).reshape(B, 21, 3) + obj_pos.unsqueeze(1)                        # (B, 21, 3) world
+        ref_kpts_world = ref_kpts_local + env_orig.unsqueeze(1)            # (B, 21, 3) world
 
         # Keypoint tracking error with Z-weighting (paper S4.2: gravity emphasis).
         delta_kpts = hand_kpts_pos - ref_kpts_world                       # (B, 21, 3)
         delta_kpts_w = delta_kpts.clone()
         delta_kpts_w[:, :, 2] *= 1.5
         kpts_err_w = torch.norm(delta_kpts_w, dim=-1).mean(dim=-1)        # (B,)
-        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1) # (B,) drift-compensated; used for warmup/termination
-
-        # Raw E_j metric (paper definition): ||j_d - j_h|| against human ref kpts in world frame, no drift compensation.
-        ref_kpts_world_raw = ref_kpts_local + env_orig.unsqueeze(1)       # (B, 21, 3)
-        self._last_kpts_err_raw = torch.norm(hand_kpts_pos - ref_kpts_world_raw, dim=-1).mean(dim=-1)  # (B,)
+        self._last_kpts_err = torch.norm(delta_kpts, dim=-1).mean(dim=-1) # (B,) for warmup/termination
+        self._last_kpts_err_raw = self._last_kpts_err                      # alias — no longer differs (no drift comp)
 
         # Wrist error from keypoint 0 (unweighted, for termination check).
         wrist_err = torch.norm(delta_kpts[:, 0, :], dim=-1)               # (B,)
@@ -1112,11 +1184,11 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             q_err = quat_mul(wrist_quat, quat_conjugate(ref_wrist_quat))
             wrist_rot_err = 2.0 * torch.asin(torch.clamp(torch.norm(q_err[:, 1:4], dim=-1), max=1.0))
 
-        # Fingertip contact tracking (GR env style).
-        ref_ft = self._ref_ft_pos[traj, frame] + env_orig.unsqueeze(1)    # (B, 5, 3)
+        # Fingertip contact tracking (GR env style — drift-compensated `_rel` targets).
+        ref_ft = self._ref_ft_pos[traj, frame] + env_orig.unsqueeze(1)    # (B, 5, 3) raw world
         contact_flag = self._future_contact[traj, frame]                   # (B, 5)
 
-        # Contact vertices on the actual object surface (world frame).
+        # Contact vertices on the actual object surface (world frame, drift-comp via current obj pose).
         ref_vertex_local_r = self._ref_contact_vertex_local[traj, frame]  # (B, 5, 3) obj-local
         obj_quat_exp_r = obj_quat.unsqueeze(1).expand(-1, 5, -1).reshape(B * 5, 4)
         ref_vertex_world = quat_apply(
@@ -1124,23 +1196,28 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             ref_vertex_local_r.reshape(B * 5, 3),
         ).reshape(B, 5, 3) + obj_pos.unsqueeze(1)
 
-        # Non-contact target: reference fingertip adjusted for object rotation drift.
-        ref_ft_offset = ref_ft - ref_obj_pos.unsqueeze(1)                 # (B, 5, 3)
-        obj_rot_offset_5 = obj_rot_offset.unsqueeze(1).expand(-1, 5, -1).reshape(B * 5, 4)
-        ref_ft_adjusted = quat_apply(
-            obj_rot_offset_5, ref_ft_offset.reshape(B * 5, 3)
-        ).reshape(B, 5, 3) + obj_pos.unsqueeze(1)                         # (B, 5, 3)
+        # Non-contact target: drift-compensated ref fingertip (TJ `fingertip_pos_ref_rel`).
+        # Place ref ft relative to current obj pose: q_offset * (ref_ft - ref_obj_pos) + obj_pos
+        # where q_offset = q_curr * q_ref^-1 (un-rotate by ref obj quat, then rotate by current).
+        ref_obj_pos_world_r = self._ref_obj_pos[traj, frame] + env_orig          # (B, 3)
+        ref_obj_quat_r = self._ref_obj_quat[traj, frame]                          # (B, 4)
+        ref_ft_local_to_ref_obj = ref_ft - ref_obj_pos_world_r.unsqueeze(1)       # (B, 5, 3)
+        ref_obj_quat_exp = ref_obj_quat_r.unsqueeze(1).expand(-1, 5, -1).reshape(B * 5, 4)
+        ref_ft_in_obj_canon = quat_apply_inverse(
+            ref_obj_quat_exp, ref_ft_local_to_ref_obj.reshape(B * 5, 3)
+        )
+        ref_ft_drift = quat_apply(obj_quat_exp_r, ref_ft_in_obj_canon).reshape(B, 5, 3) + obj_pos.unsqueeze(1)
 
-        # Gate contact flag by runtime object-tracking quality (GR env: delta_condition).
-        delta_condition = (obj_pos_err < 0.2) & (obj_rot_err < 0.75)      # (B,)
-        contact_flag_gated = contact_flag * delta_condition.unsqueeze(-1).float()  # (B, 5)
-
-        ft_target = torch.where(contact_flag_gated.unsqueeze(-1).bool(), ref_vertex_world, ref_ft_adjusted)
+        contact_flag_gated = contact_flag                                  # (B, 5)
+        # REWARD target: drift-compensated, contact-conditioned (TJ delta_fingertip_pos_rel_new).
+        ft_target = torch.where(contact_flag_gated.unsqueeze(-1).bool(), ref_vertex_world, ref_ft_drift)
         ft_err_per_finger = torch.norm(ft_pos - ft_target, dim=-1)        # (B, 5)
-        ft_err = ft_err_per_finger.mean(dim=-1)                            # (B,)
+        ft_err = ft_err_per_finger.mean(dim=-1)                            # (B,) — used for reward
 
-        # Raw E_ft metric (paper definition): ||t_d - t_h|| against human ref fingertips, no drift/contact adjustment.
-        self._last_ft_raw_err = torch.norm(ft_pos - ref_ft, dim=-1).mean(dim=-1)  # (B,)
+        # TERMINATION + raw E_ft metric: RAW ref ft (TJ delta_fingertip_pos, no drift comp).
+        ft_err_raw_per_finger = torch.norm(ft_pos - ref_ft, dim=-1)       # (B, 5)
+        ft_err_raw = ft_err_raw_per_finger.mean(dim=-1)                    # (B,) — used for termination
+        self._last_ft_raw_err = ft_err_raw
 
         # Contact force reward (mirrors GR train env).
         raw_forces = self._get_fingertip_forces()                              # (B, 5)
@@ -1160,13 +1237,12 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         arm_pose_reg  = ((jp[:, self._arm_r_joint_ids]  - dp[:, self._arm_r_joint_ids])  ** 2).sum(dim=-1)
         # Compute alive signal: 0 on terminated steps, 1 otherwise (GR env pattern).
         # All termination thresholds use unweighted errors (GR env: raw L2 distances).
-        obj_fell = obj_pos[:, 2] < self.cfg.obj_fall_z
         pos_err_large = obj_pos_err > self.cfg.max_obj_pos_err
         rot_err_large = obj_rot_err > self.cfg.max_obj_rot_err
-        ft_err_large = ft_err > self.cfg.max_ft_mean_err
+        ft_err_large = ft_err_raw > self.cfg.max_ft_mean_err  # termination uses RAW (TJ-style)
         wrist_err_large = wrist_err > self.cfg.max_wrist_pos_err
         wrist_rot_err_large = wrist_rot_err > self.cfg.max_wrist_rot_err
-        early_terminate = obj_fell | pos_err_large | rot_err_large | ft_err_large | wrist_err_large | wrist_rot_err_large
+        early_terminate = pos_err_large | rot_err_large | ft_err_large | wrist_err_large | wrist_rot_err_large
         if not self.cfg.termination:
             early_terminate = torch.zeros_like(early_terminate)
         if self.cfg.enable_warmup:
@@ -1191,6 +1267,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             + self.cfg.rew_obj_pos * obj_pos_err_w # Z-weighted (paper S4.2: gravity emphasis)
             + self.cfg.rew_obj_rot * obj_rot_err
             + self.cfg.rew_fingertip * ft_err      # contact-conditioned fingertip tracking
+            + self.cfg.rew_wrist_pos * wrist_err   # raw wrist position tracking
         ).clamp(min=-self.cfg.rew_alive)
 
         reward = (
@@ -1205,6 +1282,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         reward = reward.clamp(min=0.0)
 
         self._save_state_cache(reward, ft_err, obj_pos_err, obj_rot_err)
+        self._log_effort_saturation()
 
         # skrl SequentialTrainer only logs values that are torch.Tensor with numel()==1.
         # Python floats/ints are silently ignored. Use .mean() (0-dim tensor) not .mean().item().
@@ -1222,6 +1300,7 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             "Episode_Reward / obj_pos":           (self.cfg.rew_obj_pos * obj_pos_err_w).mean(),
             "Episode_Reward / obj_rot":           (self.cfg.rew_obj_rot * obj_rot_err).mean(),
             "Episode_Reward / fingertip":         (self.cfg.rew_fingertip * ft_err).mean(),
+            "Episode_Reward / wrist_pos":         (self.cfg.rew_wrist_pos * wrist_err).mean(),
             "Episode_Reward / fingertip_force":   (self.cfg.rew_fingertip_force * force_rew).mean(),
             "Episode_Reward / hand_action_reg":   (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
             "Episode_Reward / arm_action_reg":    (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
@@ -1302,8 +1381,9 @@ class RobotisSh5GraspEnv(DirectRLEnv):
             valid_len = min(self._reached_frame + 1, self._max_traj_len)
             valid_counts = self._failure_count[:valid_len]
             ur = self.cfg.adaptive_uniform_ratio
+            # TJ formula: p = (fail_probs + ur/N) / (1 + ur) — add uniform then renormalize.
             fail_probs = valid_counts / (valid_counts.sum() + 1e-8)
-            probs = (1.0 - ur) * fail_probs + ur / valid_len          # (valid_len,)
+            probs = (fail_probs + ur / valid_len) / (1.0 + ur)         # (valid_len,)
             sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
             start_frames = (sampled - self._adaptive_back_frames).clamp(min=0)
             # TJ upper bound: keep at least `num_frame_chunk` frames after start. Mirrors

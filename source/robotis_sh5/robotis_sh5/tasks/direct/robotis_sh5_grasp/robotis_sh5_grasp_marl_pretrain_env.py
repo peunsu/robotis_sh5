@@ -30,6 +30,18 @@ from .robotis_sh5_grasp_marl_env import RobotisSh5GraspMarlEnv
 from .robotis_sh5_grasp_marl_pretrain_env_cfg import RobotisSh5GraspMarlPretrainEnvCfg
 
 
+def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
+    """Convert wxyz quaternion to orthonormalized 6D rotation rep (TJ Zhou et al. 2019 style)."""
+    q = torch.nn.functional.normalize(quat, dim=-1)
+    w, x, y, z = q.unbind(-1)
+    r0 = torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], dim=-1)
+    r1 = torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], dim=-1)
+    a1 = torch.nn.functional.normalize(r0, dim=-1)
+    a2 = r1 - (a1 * r1).sum(-1, keepdim=True) * a1
+    a2 = torch.nn.functional.normalize(a2, dim=-1)
+    return torch.cat([a1, a2], dim=-1)
+
+
 class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
     """Multi-agent pretrain env — kinematic-only reference tracking, no object."""
 
@@ -201,7 +213,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         ref_obj_quat_next  = self._ref_obj_quat[traj, next_frame]                    # (B, 4)
         delta_obj_pos = obj_pos - ref_obj_pos_next_w                                  # (B, 3)
         q_err_obj = quat_mul(obj_quat, quat_conjugate(ref_obj_quat_next))            # (B, 4)
-        delta_obj_rot = 2.0 * q_err_obj[:, 1:]                                        # (B, 3)
+        delta_obj_rot_6d = quat_to_6d(q_err_obj)                                      # (B, 6)
         # Wrist delta (kpt[0]) and rotation delta — used by arm obs
         delta_wrist_pos = hand_kpts_pos[:, 0, :] - ref_kpts_world_next[:, 0, :]
         q_err_wrist = quat_mul(wrist_quat_w, quat_conjugate(ref_wrist_quat))
@@ -222,52 +234,54 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         obj_pos_env     = obj_pos - env_orig                           # (B, 3) — ref-derived
         delta_wrist_obj = wrist_pos_env - obj_pos_env                  # (B, 3)
 
-        # ── Arm obs (82D) — wrist-pose follower + object context + hand action ─
+        vs = self.cfg.vel_obs_scale
+
+        # ── Arm obs (89D) — wrist-pose follower + object context + hand action ─
         arm_obs = torch.cat([
             jp_arm,                       # 7
-            jv_arm,                       # 7
+            vs * jv_arm,                  # 7  (TJ scaled)
             wrist_pos_env,                # 3
-            wrist_quat_w,                 # 4
+            quat_to_6d(wrist_quat_w),     # 6  wrist rotation (6D)
             wrist_linvel,                 # 3
-            wrist_angvel,                 # 3
+            vs * wrist_angvel,            # 3  (TJ scaled)
             delta_wrist_pos,              # 3
             delta_wrist_rot,              # 3
             self._prev_arm_action,        # 7
             obj_pos_env,                  # 3   reference object pos (env-relative)
-            obj_quat,                     # 4   reference object orientation
+            quat_to_6d(obj_quat),         # 6   reference object orientation (6D)
             obj_linvel,                   # 3   zeros (no physics)
-            obj_angvel,                   # 3   zeros (no physics)
-            delta_wrist_obj,              # 3   wrist - object position
-            delta_obj_pos,                # 3   ref current - ref next (trajectory dynamics)
-            delta_obj_rot,                # 3   ref rotation delta
-            current_hand_placeholder,     # 20  ← SequentialMAPPO slot [62:82]
+            vs * obj_angvel,              # 3   zeros (no physics)
+            delta_wrist_obj,              # 3
+            delta_obj_pos,                # 3
+            delta_obj_rot_6d,             # 6   (6D)
+            current_hand_placeholder,     # 20  ← SequentialMAPPO slot [69:89]
         ], dim=-1)
-        # = 82
+        # = 89
 
-        # ── Hand obs (276D) — single-agent style (no mass, no lift) ──────────
+        # ── Hand obs (283D) — single-agent style (no mass, no lift) ──────────
         hand_obs = torch.cat([
             hand_kpts_pos.reshape(B, 63),   # 63
-            wrist_quat_w,                   # 4
+            quat_to_6d(wrist_quat_w),       # 6   (6D)
             wrist_linvel,                   # 3
-            wrist_angvel,                   # 3
+            vs * wrist_angvel,              # 3   (TJ scaled)
             ft_vel.reshape(B, 15),          # 15
-            full_jp_norm,                   # 27 (finger+arm, no lift)
-            full_jv,                        # 27
-            obj_pos,                        # 3 (reference)
-            obj_quat,                       # 4 (reference)
-            obj_linvel,                     # 3 (zeros)
-            obj_angvel,                     # 3 (zeros)
+            full_jp_norm,                   # 27
+            vs * full_jv,                   # 27  (TJ scaled)
+            obj_pos,                        # 3
+            quat_to_6d(obj_quat),           # 6   (6D)
+            obj_linvel,                     # 3
+            vs * obj_angvel,                # 3
             delta_kpts_world.reshape(B, 63),# 63
-            delta_ft_obj.reshape(B, 15),    # 15 (ref-based)
-            delta_obj_pos,                  # 3 (ref current - ref next)
-            delta_obj_rot,                  # 3 (ref rotation delta current vs next)
+            delta_ft_obj.reshape(B, 15),    # 15
+            delta_obj_pos,                  # 3
+            delta_obj_rot_6d,               # 6   (6D)
             future_contact,                 # 5
             prev_action_27,                 # 27
-            fingertip_forces,               # 5 (zeros)
+            fingertip_forces,               # 5
         ], dim=-1)
-        # = 276
+        # = 283
 
-        # ── Shared state (279D) — non-redundant ──────────────────────────────
+        # ── Shared state (286D) — non-redundant ──────────────────────────────
         self._shared_state = torch.cat([hand_obs, delta_wrist_rot], dim=-1)
 
         if self.cfg.debug_vis:
@@ -328,12 +342,8 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         # the reference object pose + per-frame contact vertices are available from the
         # MANO trajectory data.
         #
-        # IMPORTANT: contact target is GATED by wrist tracking quality (delta_condition,
-        # mirroring single-agent pretrain). Until the wrist is close enough to the
-        # reference, the contact vertex (which lives in the reference-object frame, far
-        # from the robot wrist) would push fingers to physically impossible targets and
-        # cause finger curling. With the gate, fingers only chase the contact vertex
-        # AFTER the wrist has converged to the reference.
+        # Use precomputed contact mask directly (TJ-style); `_future_contact` already encodes
+        # (obj velocity moving) AND (fingertip near object) from preprocessing.
         ref_ft = self._ref_ft_pos[traj, frame] + env_orig.unsqueeze(1)              # (B, 5, 3)
         ref_obj_pos_w = self._ref_obj_pos[traj, frame] + env_orig                   # (B, 3)
         ref_obj_quat = self._ref_obj_quat[traj, frame]                              # (B, 4)
@@ -344,9 +354,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             ref_vertex_local.reshape(B * 5, 3),
         ).reshape(B, 5, 3) + ref_obj_pos_w.unsqueeze(1)
         contact_flag = self._future_contact[traj, frame]                            # (B, 5)
-        # Gate by wrist-tracking quality (no object → use wrist_err, matches single-agent pretrain).
-        delta_condition = (wrist_err < 0.2) & (wrist_rot_err < 0.75)                # (B,)
-        contact_flag_gated = contact_flag * delta_condition.unsqueeze(-1).float()   # (B, 5)
+        contact_flag_gated = contact_flag                                            # (B, 5)
 
         # Two separate ft errors (matches SA pretrain L780-786):
         #   ft_err_raw  : unweighted, NO contact conditioning — used for TERMINATION
@@ -402,6 +410,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         tracking_penalty = (
             self.cfg.rew_kpts * kpts_err_w
             + self.cfg.rew_fingertip * ft_err
+            + self.cfg.rew_wrist_pos * wrist_err
         ).clamp(min=-self.cfg.rew_alive)
         team_reward = (
             self.cfg.rew_alive * alive
@@ -415,6 +424,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         # ── State cache update + adaptive sampling tracking ─────────────────
         if self.cfg.adaptive_sampling:
             self._save_state_cache(team_reward, ft_err_raw, wrist_err, wrist_rot_err)
+        self._log_effort_saturation()
 
         self.extras["log"] = {
             "Error / kpts_mean_m":       torch.norm(delta_kpts, dim=-1).mean(),
@@ -424,6 +434,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             "Episode_Reward / alive":            (self.cfg.rew_alive * alive).mean(),
             "Episode_Reward / kpts":             (self.cfg.rew_kpts * kpts_err_w).mean(),
             "Episode_Reward / fingertip":        (self.cfg.rew_fingertip * ft_err).mean(),
+            "Episode_Reward / wrist_pos":        (self.cfg.rew_wrist_pos * wrist_err).mean(),
             "Episode_Reward / hand_action_reg":  (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
             "Episode_Reward / arm_action_reg":   (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
             "Episode_Reward / hand_pose_reg":    (self.cfg.rew_hand_pose_reg   * hand_pose_reg).mean(),
@@ -521,7 +532,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             valid_counts = self._failure_count[:valid_len]
             ur = self.cfg.adaptive_uniform_ratio
             fail_probs = valid_counts / (valid_counts.sum() + 1e-8)
-            probs = (1.0 - ur) * fail_probs + ur / valid_len
+            probs = (fail_probs + ur / valid_len) / (1.0 + ur)  # TJ: add uniform then renormalize
             sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
             start_frames = (sampled - self._adaptive_back_frames).clamp(min=0)
             upper_a = max(0, self._max_traj_len - self._num_frame_chunk)

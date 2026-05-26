@@ -116,13 +116,13 @@ import robotis_sh5.tasks  # noqa: F401
 agent_cfg_entry_point = "skrl_mappo_cfg_entry_point"
 
 # Arm obs layout (see RobotisSh5GraspMarlEnv._get_observations):
-#   jp_arm(7) + jv_arm(7) + wrist_pos_env(3) + wrist_quat_w(4)
+#   jp_arm(7) + jv_arm(7) + wrist_pos_env(3) + wrist_quat_6d(6)
 #   + wrist_linvel(3) + wrist_angvel(3) + delta_wrist_pos(3) + delta_wrist_rot(3)
-#   + prev_arm_action(7)                                                         = 40
-#   + obj_pos_env(3) + obj_quat(4) + obj_linvel(3) + obj_angvel(3)
-#   + delta_wrist_obj(3) + delta_obj_pos(3) + delta_obj_rot(3)                   = 22
-#   = 62, then current_hand_action slot of length 20 at [62:82]
-ARM_HAND_SLOT_START = 62
+#   + prev_arm_action(7)                                                         = 42
+#   + obj_pos_env(3) + obj_quat_6d(6) + obj_linvel(3) + obj_angvel(3)
+#   + delta_wrist_obj(3) + delta_obj_pos(3) + delta_obj_rot_6d(6)                = 27
+#   = 69, then current_hand_action slot of length 20 at [69:89]
+ARM_HAND_SLOT_START = 69
 ARM_HAND_SLOT_LEN = 20
 
 

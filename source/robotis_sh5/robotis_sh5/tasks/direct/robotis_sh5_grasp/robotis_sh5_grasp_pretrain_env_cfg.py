@@ -81,8 +81,9 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     num_arm_r_dofs: int = 7
     num_lift_dofs: int = 1            # lift_joint (NOT in action — held at fixed_lift_target)
     action_space: int = 27           # fingers(20) + arm_r(7); lift excluded
-    observation_space: int = 278     # 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+27+5  (prev_action=27)
+    observation_space: int = 285     # 63+6+3+3+15+28+28+3+6+3+3+63+15+3+6+5+27+5  (6D rot, prev_action=27)
     state_space: int = 0
+    vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
     # Lift target (joint position). 0.0 = URDF upper limit (fully up).
     fixed_lift_target: float = 0.0
 
@@ -90,7 +91,11 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
         render_interval=decimation,
-        gravity=(0.0, 0.0, -9.81),
+        gravity=(0.0, 0.0, -9.80665),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
         physx=sim_utils.PhysxCfg(
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=1024 * 1024,
@@ -152,8 +157,8 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
 
     # Object physics disabled
     object_mass: float = 0.2
-    object_static_friction: float = 0.8
-    object_dynamic_friction: float = 0.6
+    object_static_friction: float = 1.0
+    object_dynamic_friction: float = 1.0
     object_restitution: float = 0.1
 
     # Contact threshold for future_contact precomputation
@@ -172,25 +177,30 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     rew_alive: float = 1.5
     rew_kpts: float = -1.76           # GR pretrain: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
     rew_fingertip: float = -12.5
+    rew_wrist_pos: float = -2.5       # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 0.0
     # Action/pose regularization split by region (3× stronger on arm than hand).
     # Action layout (pretrain, no mass): [fingers(20) | arm_r(7)]; pose excludes lift.
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg:  float = -0.004   # matches hand (was 3× = -0.012)
+    rew_arm_action_reg:  float = -0.004   # 1× hand
     rew_hand_pose_reg:   float = -0.001
-    rew_arm_pose_reg:    float = -0.001   # matches hand (was 3× = -0.003)
+    rew_arm_pose_reg:    float = -0.001   # 1× hand
 
     # Termination (fingertip + wrist only — no object-based termination)
     termination: bool = True
     max_wrist_pos_err: float = 0.15
     max_wrist_rot_err: float = 0.75   # GR pretrain: delta_hand_rot_value > 0.75
-    max_ft_mean_err: float = 0.15     # GR uses > 0.1 threshold
+    max_ft_mean_err: float = 0.1      # matches TJ pretrain: delta_fingertip_pos_value_mean > 0.1
     # Grace period: disable early termination for the first N frames of each episode. 0 = disabled.
     early_termination_grace_frames: int = 0
 
+    # Diagnostic: log joints that saturate at effort_limit.
+    log_effort_saturation: bool = False
+    effort_saturation_log_interval: int = 500
+
     # Debug visualization
     debug_vis: bool = True
-    debug_vis_num_envs: int = 16
+    debug_vis_num_envs: int = 4096
 
     # ── WARMUP ────────────────────────────────────────────────────────────────
     # Warm-up mechanism: freeze the target at frame 0 and disable early

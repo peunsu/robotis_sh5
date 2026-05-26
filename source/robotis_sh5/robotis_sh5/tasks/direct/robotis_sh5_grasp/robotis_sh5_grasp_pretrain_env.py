@@ -28,6 +28,30 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_conjugate, 
 
 from .robotis_sh5_grasp_pretrain_env_cfg import RobotisSh5GraspPretrainEnvCfg
 
+
+def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
+    """Convert wxyz quaternion to orthonormalized 6D continuous rotation rep (Zhou et al. 2019).
+
+    Mirrors TJ's `quat_to_6d` (Gram-Schmidt on first two rows of R), but with wxyz input order.
+    Returns shape (..., 6).
+    """
+    q = torch.nn.functional.normalize(quat, dim=-1)
+    w, x, y, z = q.unbind(-1)
+    r0 = torch.stack([
+        1 - 2 * (y * y + z * z),
+        2 * (x * y - w * z),
+        2 * (x * z + w * y),
+    ], dim=-1)
+    r1 = torch.stack([
+        2 * (x * y + w * z),
+        1 - 2 * (x * x + z * z),
+        2 * (y * z - w * x),
+    ], dim=-1)
+    a1 = torch.nn.functional.normalize(r0, dim=-1)
+    a2 = r1 - (a1 * r1).sum(-1, keepdim=True) * a1
+    a2 = torch.nn.functional.normalize(a2, dim=-1)
+    return torch.cat([a1, a2], dim=-1)
+
 # Pretrain state cache dim (no object; 1 reward + 28 jp + 28 jv + 27 smoothed_act = 84).
 _STATE_DIM_PRETRAIN = 84
 
@@ -39,6 +63,16 @@ _FINGERTIP_OFFSETS: dict[str, list[float]] = {
     "finger_r_link12": [0.012,  0.0,     0.02425],
     "finger_r_link16": [0.012,  0.0,     0.02425],
     "finger_r_link20": [0.012,  0.0,     0.02425],
+}
+
+# Pad-outward normals in each fingertip link's LOCAL frame (mirrors train env;
+# identified via scripts/process_dataset/visualize_fingertip_normals.py).
+_FINGERTIP_PAD_NORMALS: dict[str, list[float]] = {
+    "finger_r_link4":  [0.0, 0.0, 1.0],   # thumb: +Z
+    "finger_r_link8":  [1.0, 0.0, 0.0],   # index: +X
+    "finger_r_link12": [1.0, 0.0, 0.0],
+    "finger_r_link16": [1.0, 0.0, 0.0],
+    "finger_r_link20": [1.0, 0.0, 0.0],
 }
 
 
@@ -114,12 +148,13 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             obj_linvel = np.concatenate(
                 [(op[1:] - op[:-1]) * action_fps, np.zeros((1, 3), dtype=np.float32)], axis=0
             )  # (N, 3)
-            obj_angvel_ref = np.concatenate(
-                [(oq[1:] - oq[:-1]) * action_fps, np.zeros((1, 4), dtype=np.float32)], axis=0
-            )  # crude finite-diff of quaternion components as a proxy for angular speed
-            obj_speed = np.linalg.norm(obj_linvel, axis=-1)           # (N,)
-            obj_angspeed = np.linalg.norm(obj_angvel_ref, axis=-1)    # (N,) proxy for angvel
-            # GR env: contact if (linvel > 0.05 OR angvel > 0.25) AND fingertip near object
+            obj_speed = np.linalg.norm(obj_linvel, axis=-1)           # (N,) m/s
+            # Actual angular velocity magnitude (rad/s) via quaternion geodesic angle.
+            _dot_q = np.abs((oq[:-1] * oq[1:]).sum(axis=-1)).clip(0.0, 1.0)
+            obj_angspeed = np.concatenate(
+                [2.0 * np.arccos(_dot_q) * action_fps, np.array([0.0], dtype=np.float32)]
+            )  # (N,) rad/s
+            # GR env: contact if (linvel > 0.05 m/s OR angvel > 0.25 rad/s) AND fingertip near object
             velocity_condition = (obj_speed > 0.05) | (obj_angspeed > 0.25)  # (N,)
             dist = np.linalg.norm(fp - op[:, None, :], axis=-1)       # (N, 5)
             near_object = dist < cfg.contact_dist_threshold            # (N, 5)
@@ -267,14 +302,17 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
                     cv_local[t] = _verts[idxs]                          # (5, 3)
                     cv_dist[t]  = dists[idxs, np.arange(5)]            # (5,)
                 # Recompute future_contact using relative vertex distance (GR method):
-                #   contact iff (linvel>0.05 OR angvel>0.25) AND (cv_dist - min_cv_dist < 0.015)
+                #   contact iff (linvel>0.05 m/s OR angvel>0.25 rad/s) AND (cv_dist - min_cv_dist < 0.015)
                 op_arr = obj_pos_list[i]
                 oq_arr = obj_quat_list[i]
                 _lv = np.concatenate([(op_arr[1:]-op_arr[:-1])*_action_fps_cv,
                                       np.zeros((1,3),dtype=np.float32)], axis=0)
-                _av = np.concatenate([(oq_arr[1:]-oq_arr[:-1])*_action_fps_cv,
-                                      np.zeros((1,4),dtype=np.float32)], axis=0)
-                vel_cond = (np.linalg.norm(_lv,axis=-1)>0.05) | (np.linalg.norm(_av,axis=-1)>0.25)
+                # Actual angular velocity magnitude (rad/s) via quaternion geodesic angle.
+                _dot_q = np.abs((oq_arr[:-1] * oq_arr[1:]).sum(axis=-1)).clip(0.0, 1.0)
+                _angspeed = np.concatenate(
+                    [2.0 * np.arccos(_dot_q) * _action_fps_cv, np.array([0.0], dtype=np.float32)]
+                )
+                vel_cond = (np.linalg.norm(_lv, axis=-1) > 0.05) | (_angspeed > 0.25)
                 cv_min   = cv_dist.min(axis=-1, keepdims=True)            # (N, 1)
                 near_vtx = (cv_dist - cv_min) < 0.015                    # (N, 5)
                 future_contact_list[i] = (vel_cond[:, None] & near_vtx).astype(np.float32)
@@ -404,11 +442,13 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
 
         self._ft_body_ids = self._resolve_fingertip_ids()
 
-        offsets = []
+        offsets, pad_normals = [], []
         for name in self.cfg.fingertip_body_names:
-            off = _FINGERTIP_OFFSETS.get(name, [0.0, 0.0, 0.0])
-            offsets.append(off)
+            offsets.append(_FINGERTIP_OFFSETS.get(name, [0.0, 0.0, 0.0]))
+            pad_normals.append(_FINGERTIP_PAD_NORMALS.get(name, [0.0, 0.0, 1.0]))
+        # (5, 3) tip-position offset and pad-outward unit normal, both in link local frame
         self._ft_offsets = torch.tensor(offsets, dtype=torch.float32, device=self.device)
+        self._ft_pad_normals = torch.tensor(pad_normals, dtype=torch.float32, device=self.device)
 
         wrist_ids, _ = self.robot.find_bodies(self.cfg.wrist_body_name)
         self._wrist_body_id: int | None = wrist_ids[0] if wrist_ids else None
@@ -453,6 +493,8 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             (self.num_envs, len(self._lift_joint_ids)), float(self.cfg.fixed_lift_target),
             device=self.device,
         )
+        # Zero velocity for lift (used by write_joint_state_to_sim to kill residual motion).
+        self._lift_zero_vel = torch.zeros_like(self._lift_target)
 
         B = self.num_envs
         self._traj_idx = torch.zeros(B, dtype=torch.long, device=self.device)
@@ -505,6 +547,32 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # TJ-style: force-save frame 0 cache once on first reset so subsequent resets reuse the IK-lifted pose.
         self._init_save_done: bool = False
 
+        # Effort-saturation diagnostic buffers (cfg-gated).
+        self._sat_acc = torch.zeros(self.robot.num_joints, device=self.device)
+        self._sat_step_count: int = 0
+
+    def _log_effort_saturation(self) -> None:
+        """Diagnostic: print joints whose applied torque hits ≥99 % of effort_limit."""
+        if not self.cfg.log_effort_saturation:
+            return
+        applied = self.robot.data.applied_torque
+        limits = self.robot.data.joint_effort_limits
+        sat_mask = applied.abs() >= 0.99 * limits.clamp(min=1e-6)
+        self._sat_acc += sat_mask.float().mean(dim=0)
+        self._sat_step_count += 1
+        if self._sat_step_count >= self.cfg.effort_saturation_log_interval:
+            avg_ratio = self._sat_acc / self._sat_step_count
+            high_idx = (avg_ratio > 0.01).nonzero(as_tuple=True)[0]
+            if len(high_idx) > 0:
+                print(f"\n[effort_saturation] over last {self._sat_step_count} steps "
+                      f"(joints with >1% env-avg saturation):")
+                names = self.robot.joint_names
+                for idx in high_idx.tolist():
+                    print(f"  {names[idx]:30s}  {avg_ratio[idx].item()*100:5.1f}%  "
+                          f"(effort_limit={limits[0, idx].item():6.2f} N·m)")
+            self._sat_acc.zero_()
+            self._sat_step_count = 0
+
     def _scale(self, x: torch.Tensor) -> torch.Tensor:
         """Map normalized actions [-1, 1] → action-joint positions [lower, upper] (27D)."""
         return 0.5 * (x + 1.0) * (self._ctrl_upper - self._ctrl_lower) + self._ctrl_lower
@@ -539,18 +607,18 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         ).reshape(B, 5, 3)
         return link_pos + rotated
 
-    def _compute_fingertip_normals(self) -> torch.Tensor:
+    def _compute_fingertip_pad_normals_w(self) -> torch.Tensor:
+        """World-frame pad-outward unit normals; mirrors train env. See `_FINGERTIP_PAD_NORMALS`."""
         B = self.num_envs
         if len(self._ft_body_ids) != 5:
             return torch.zeros(B, 5, 3, device=self.device)
 
         link_quat = self.robot.data.body_quat_w[:, self._ft_body_ids, :]
-        offsets = self._ft_offsets.unsqueeze(0).expand(B, -1, -1)
-        normals = quat_apply(
+        pad_local = self._ft_pad_normals.unsqueeze(0).expand(B, -1, -1)
+        return quat_apply(
             link_quat.reshape(B * 5, 4),
-            offsets.reshape(B * 5, 3),
+            pad_local.reshape(B * 5, 3),
         ).reshape(B, 5, 3)
-        return normals / normals.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
     def _compute_hand_kpts_pos(self) -> torch.Tensor:
         """Compute world-space positions for all 21 MANO keypoints from robot state."""
@@ -639,8 +707,14 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
 
         self.robot.set_joint_position_target(targets[:, :N_f],         joint_ids=self._finger_joint_ids)
         self.robot.set_joint_position_target(targets[:, N_f:N_f+N_a],  joint_ids=self._arm_r_joint_ids)
-        # Lift held at fixed target every step (NOT in action).
+        # Lift held at fixed target every step (NOT in action). PD target alone leaves
+        # residual trembling under reaction forces from arm/hand motion, so we ALSO
+        # forcibly write joint state every physics sub-step → lift effectively kinematic
+        # (pos=fixed_target, vel=0). Matches SA train / MARL train behavior.
         self.robot.set_joint_position_target(self._lift_target, joint_ids=self._lift_joint_ids)
+        self.robot.write_joint_state_to_sim(
+            self._lift_target, self._lift_zero_vel, joint_ids=self._lift_joint_ids,
+        )
 
 
     def _get_observations(self) -> dict:
@@ -721,39 +795,34 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         ref_obj_quat_next  = self._ref_obj_quat[traj, next_frame]             # (B, 4)
         delta_obj_pos = ref_obj_pos_world - ref_obj_pos_next_w
         q_err_obj = quat_mul(ref_obj_quat, quat_conjugate(ref_obj_quat_next))
-        delta_obj_rot = 2.0 * q_err_obj[:, 1:]
+        delta_obj_rot_6d = quat_to_6d(q_err_obj)  # TJ: 6D rotation representation
 
         future_contact   = self._future_contact[traj, frame]  # (B, 5)
         fingertip_forces = self._get_fingertip_forces()         # (B, 5)
 
+        vs = self.cfg.vel_obs_scale
+
         obs = torch.cat([
-            # Hand keypoint positions: all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
-            hand_kpts_pos.reshape(B, 63),    # [63] all 21 keypoints (incl. wrist at idx 0)
-            # Hand global state
-            wrist_quat,                      # [4]  wrist rotation (wxyz)
-            wrist_linvel,                    # [3]  wrist linear velocity
-            wrist_angvel,                    # [3]  wrist angular velocity
-            # Fingertip velocities
+            hand_kpts_pos.reshape(B, 63),    # [63]
+            quat_to_6d(wrist_quat),          # [6]  wrist rotation (6D, TJ)
+            wrist_linvel,                    # [3]
+            vs * wrist_angvel,               # [3]  (TJ scaled)
             ft_vel.reshape(B, 15),           # [15]
-            # Hand DOF
             joint_pos,                       # [28]
-            joint_vel,                       # [28]
-            # Object state (reference position since object is teleported)
-            ref_obj_pos_world,               # [3]  world-frame object position (matches train env)
-            ref_obj_quat,                    # [4]  object rotation
+            vs * joint_vel,                  # [28] (TJ scaled)
+            ref_obj_pos_world,               # [3]
+            quat_to_6d(ref_obj_quat),        # [6]  object rotation (6D)
             obj_linvel,                      # [3]  zeros (teleported)
-            obj_angvel,                      # [3]  zeros (teleported)
-            # Delta targets (next-frame look-ahead)
-            delta_kpts_world.reshape(B, 63), # [63] world-frame delta for all 21 keypoints
-            delta_ft_obj.reshape(B, 15),     # [15] obj-local contact-conditioned delta
+            vs * obj_angvel,                 # [3]  zeros
+            delta_kpts_world.reshape(B, 63), # [63]
+            delta_ft_obj.reshape(B, 15),     # [15]
             delta_obj_pos,                   # [3]
-            delta_obj_rot,                   # [3]
-            # Contact + history + forces
+            delta_obj_rot_6d,                # [6]  (6D)
             future_contact,                  # [5]
-            self._prev_action,               # [28]
+            self._prev_action,               # [27]
             fingertip_forces,                # [5]
         ], dim=-1)
-        # Total: 63+4+3+3+15+28+28+3+4+3+3+63+15+3+3+5+28+5 = 279
+        # Total: 63+6+3+3+15+28+28+3+6+3+3+63+15+3+6+5+27+5 = 285
 
         self._prev_action = self.actions.clone()
 
@@ -764,19 +833,21 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_fingertip_forces(self) -> torch.Tensor:
+        """Per-fingertip compressive contact force (N); mirrors TJ projection in train env.
+        Uses `force_matrix_w` so only contact with the Object filter counts."""
         B = self.num_envs
         forces = torch.zeros(B, 5, device=self.device)
-        normals = self._compute_fingertip_normals()
+        pad_normals_w = self._compute_fingertip_pad_normals_w()   # (B, 5, 3) pad-OUTWARD
 
         for i, name in enumerate(self.cfg.fingertip_body_names):
             sensor = self._contact_sensors.get(name)
             if sensor is None:
                 continue
             try:
-                net_f = sensor.data.net_forces_w
-                force_vec = net_f[:, 0, :]
-                normal = normals[:, i, :]
-                forces[:, i] = (force_vec * normal).sum(dim=-1).clamp(min=0.0)
+                fmat = sensor.data.force_matrix_w     # (B, 1, 1, 3) — Object-only force
+                force_vec = fmat[:, 0, 0, :]
+                inward = -pad_normals_w[:, i, :]
+                forces[:, i] = (force_vec * inward).sum(dim=-1).clamp(min=0.0)
             except Exception:
                 pass
         return forces
@@ -804,7 +875,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # Wrist error from keypoint 0 (unweighted, for termination check).
         wrist_err = torch.norm(delta_kpts[:, 0, :], dim=-1)             # (B,)
 
-        # Wrist rotation (needed for termination and delta_condition gating).
+        # Wrist rotation (needed for termination check).
         wrist_rot_err = torch.zeros(B, device=self.device)
         if self._wrist_body_id is not None:
             wrist_quat = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
@@ -812,11 +883,10 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             q_err = quat_mul(wrist_quat, quat_conjugate(ref_wrist_quat))
             wrist_rot_err = 2.0 * torch.asin(torch.clamp(torch.norm(q_err[:, 1:4], dim=-1), max=1.0))
 
-        # delta_condition: gate contact-conditioned targets by wrist tracking quality
-        # (GR pretrain: delta_condition = (hand_pos_err < 0.2) & (hand_rot_err < 0.75))
-        delta_condition = (wrist_err < 0.2) & (wrist_rot_err < 0.75)
+        # Use precomputed contact mask directly (TJ-style); `_future_contact` already encodes
+        # (obj velocity moving) AND (fingertip near object) from preprocessing.
         contact_flag = self._future_contact[traj, frame]
-        contact_flag_gated = contact_flag * delta_condition.unsqueeze(-1).float()
+        contact_flag_gated = contact_flag
 
         # Fingertip contact tracking (object is teleported; ref_obj_pos == ref position).
         ref_ft = self._ref_ft_pos[traj, frame] + env_orig.unsqueeze(1)
@@ -872,7 +942,9 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # GR pretrain formula: 1.5*alive - clamp(1.76*kpts + 12.5*ft, 1.5) + reg
         # Fingertip term NOT Z-weighted (GR pretrain); keypoints include Z-weighted wrist
         tracking_penalty = (
-            self.cfg.rew_kpts * kpts_err_w + self.cfg.rew_fingertip * ft_err
+            self.cfg.rew_kpts * kpts_err_w
+            + self.cfg.rew_fingertip * ft_err
+            + self.cfg.rew_wrist_pos * wrist_err
         ).clamp(min=-self.cfg.rew_alive)
 
         reward = (
@@ -889,6 +961,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # ── State cache update + adaptive sampling tracking ─────────────────
         if self.cfg.adaptive_sampling:
             self._save_state_cache(reward, ft_err_raw, wrist_err, wrist_rot_err)
+        self._log_effort_saturation()
 
         # skrl SequentialTrainer only logs values that are torch.Tensor with numel()==1.
         # Python floats/ints are silently ignored. Use .mean() (0-dim tensor) not .mean().item().
@@ -902,6 +975,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             "Episode_Reward / alive":             (self.cfg.rew_alive * alive).mean(),
             "Episode_Reward / kpts":              (self.cfg.rew_kpts * kpts_err_w).mean(),
             "Episode_Reward / fingertip":         (self.cfg.rew_fingertip * ft_err).mean(),
+            "Episode_Reward / wrist_pos":         (self.cfg.rew_wrist_pos * wrist_err).mean(),
             "Episode_Reward / hand_action_reg":   (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
             "Episode_Reward / arm_action_reg":    (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
             "Episode_Reward / hand_pose_reg":     (self.cfg.rew_hand_pose_reg   * hand_pose_reg).mean(),
@@ -1026,7 +1100,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             valid_counts = self._failure_count[:valid_len]
             ur = self.cfg.adaptive_uniform_ratio
             fail_probs = valid_counts / (valid_counts.sum() + 1e-8)
-            probs = (1.0 - ur) * fail_probs + ur / valid_len
+            probs = (fail_probs + ur / valid_len) / (1.0 + ur)  # TJ: add uniform then renormalize
             sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
             start_frames = (sampled - self._adaptive_back_frames).clamp(min=0)
             upper_a = max(0, self._max_traj_len - self._num_frame_chunk)

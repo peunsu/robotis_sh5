@@ -89,7 +89,13 @@ HO-Cap mirrors OakInk: `scripts/benchmark/hocap/train_sequences{,_marl}.sh`, etc
 python scripts/process_dataset/oakink.py
 python scripts/process_dataset/hocap.py
 isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap]   # requires Isaac Lab env
-python scripts/process_dataset/compute_frame0_ik.py --dataset oakink   # or hocap
+
+# Frame-0 arm IK — TWO implementations:
+#   (A) compute_frame0_ik.py      — Isaac Lab DLS controller, robot-in-sim. Slower startup.
+#   (B) compute_frame0_ik_pink.py — pink (QP) on pinocchio. PREFERRED: pos_err≈0 vs ~2cm DLS.
+#       Uses URDF at data/robots/FFW/urdf/ (no Isaac sim spawn). Joint limits as inequality
+#       constraints; PostureTask regularizes 7-DOF arm null-space toward default.
+python scripts/process_dataset/compute_frame0_ik_pink.py --dataset oakink --overwrite
 ```
 
 **Code formatting:**
@@ -101,9 +107,9 @@ pre-commit run --all-files
 
 | Task ID | Action | Obs | Description |
 |---|---|---|---|
-| `Robotis-Sh5-Grasp-Direct-v0` | 28D | 279D | Full single-agent grasping (fingers+arm+mass) |
-| `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | 28D | 279D | Kinematic-only pretrain (no physics object) |
-| `Robotis-Sh5-Grasp-Marl-Direct-v0` | dict{arm:7, hand:20} | dict{arm:60, hand:276}, state:279 | HAPPO (single shared critic + team reward + sequential actor updates with recursive M + hand→arm forward conditioning) |
+| `Robotis-Sh5-Grasp-Direct-v0` | 28D | 285D | Full single-agent grasping (fingers+arm+mass) — 6D rot rep + vel_obs_scale (TJ); mass excluded from obs for pretrain ckpt compat |
+| `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | 27D | 285D | Kinematic-only pretrain (no physics object) |
+| `Robotis-Sh5-Grasp-Marl-Direct-v0` | dict{arm:7, hand:20} | dict{arm:89, hand:283}, state:286 | HAPPO (single shared critic + team reward + sequential actor updates with recursive M + hand→arm forward conditioning) |
 | `Robotis-Sh5-Grasp-Marl-Pretrain-Direct-v0` | same shapes | same shapes | MARL pretrain (no object) — ckpt shape-compatible with train |
 | `Template-Robotis-Sh5-Direct-v0` | — | — | Single-agent direct RL template |
 | `Template-Robotis-Sh5-Marl-Direct-v0` | — | — | Multi-agent variant |
@@ -172,8 +178,21 @@ Key design patterns:
   envs restore from the saved state, cache-miss envs use default pose + frame-0 IK.
 - **Frame-0 arm IK**: precomputed wrist pose for frame 0 loaded from `frame0_arm_joint_pos.npy`.
 - **EMA action smoothing** (TJ/rl_games convention, `alpha = new action weight`):
-  `smoothed = alpha * raw + (1 - alpha) * prev_smoothed`. Default `0.3` for single-agent,
-  `0.4` for MARL.
+  `smoothed = alpha * raw + (1 - alpha) * prev_smoothed`. Split α: fingers use
+  `action_smoothing=0.5` (responsive grasping); arm slice [20:27] uses `arm_action_smoothing=0.17`
+  (stronger smoothing → wrist tremor suppression). Applied in `_pre_physics_step`.
+- **Contact force projection** (`_get_fingertip_forces`, all 3 train envs): uses
+  `sensor.data.force_matrix_w[:, 0, 0, :]` (per-filter-object: Object only — excludes
+  self-collision / table contacts) projected onto `-pad_normal_w` (mirrors TJ). Local-frame
+  pad-outward unit normals defined in `_FINGERTIP_PAD_NORMALS`:
+  thumb (link4) `+Z`, other fingers (link8/12/16/20) `+X`. Distinct from `_FINGERTIP_OFFSETS`
+  (tip-position offset for FK / contact target computation). The two are independent and must
+  NOT be conflated — earlier bug projected force onto tip-position vector, zeroing out almost
+  all compressive contact. See `scripts/process_dataset/visualize_fingertip_normals.py` to
+  re-verify visually for either FFW-SH5 or Shadow Hand (TJ reference: thumb `-X`, others `-Y`).
+- **Wrist position reward** (`rew_wrist_pos = -1.04` train / `-2.5` pretrain): raw
+  `‖wrist_pos − ref_wrist_pos‖`, no Z-weighting, no drift comp. Weight = `rew_fingertip / 5`
+  so per-keypoint wrist tracking weight equals per-fingertip weight (5 fingertips → mean).
 
 ### train.py (single-agent) Patches
 
@@ -195,15 +214,15 @@ make the PPO ratio non-trivial for mass (clipping restrains σ growth).
 HAPPO (Kuba et al. 2022, "Trust Region Policy Optimisation in Multi-Agent RL", Algorithm 4)
 implemented as a layer on top of skrl's MAPPO class via monkey-patches:
 
-- **Hand agent** sees full single-agent grasping context (276D obs minus mass+lift):
+- **Hand agent** sees full single-agent grasping context (283D obs minus mass+lift):
   21 MANO kpts (world) + palm state + fingertip vel + full 27D joint state + object state +
   reference deltas + `future_contact` + 27D combined prev_action + fingertip forces.
 - **Arm agent** sees a minimal "wrist-pose follower" obs (60D):
   jp_arm + jv_arm + wrist pose (env-pos + world-quat) + wrist linvel + wrist angvel +
   delta_wrist_pos + delta_wrist_rot + prev_arm_action +
   **current_hand_action slot at [40:60]** (filled by forward sequential conditioning).
-- **Single shared centralized critic** V(s_global) with explicit non-redundant 279D state
-  from `_get_states()` = hand_obs (276D) + delta_wrist_rot (3D). State is NOT auto-flattened
+- **Single shared centralized critic** V(s_global) with explicit non-redundant 286D state
+  from `_get_states()` = hand_obs (283D) + delta_wrist_rot (3D). State is NOT auto-flattened
   from the obs dict — avoids duplication of jp_arm / wrist_quat / prev_arm_action across agents.
 
 Four monkey-patches are applied in train_marl.py after Runner construction (in this order):
@@ -274,8 +293,9 @@ no-object pretrain distribution. `log_std_parameter` is also skipped (TJ-style �
 | `discount_factor` | 0.96 | 0.96 | |
 | `learning_rate` | 3e-4 | 3e-4 | KLAdaptiveLR, kl_threshold=0.016 |
 | `entropy_loss_scale` | 0.004 (modified by entropy_flip) | 0.004 | |
-| `action_smoothing` (env cfg) | 0.3 | **0.4** | higher = more responsive (less wrist tremor) |
-| `rew_arm_action_rate` (env cfg) | -0.05 | **-0.01** | weakened to reduce overcorrection |
+| `action_smoothing` (env cfg, finger EMA α) | 0.5 | 0.5 | finger: prev 50% + raw 50% |
+| `arm_action_smoothing` (env cfg, arm EMA α) | 0.2 | 0.2 | arm: prev 80% + raw 20% (stronger smoothing → less wrist tremor) |
+| `rew_arm_action_reg` / `rew_arm_pose_reg` | -0.012 / -0.003 | -0.012 / -0.003 | 3× hand — penalize arm null-space wandering |
 
 Epoch relationship: `10000 timesteps / 8 rollouts = 1250 PPO updates`.
 
