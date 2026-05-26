@@ -301,14 +301,13 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     rew_obj_pos: float = -4.26        # GR env: 4.26
     rew_obj_rot: float = -1.0         # GR env: 1.0
     rew_fingertip: float = -5.2       # GR env: 5.2
-    rew_wrist_pos: float = -1.04      # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 1.0  # GR env: 1.125 (slightly different normalization)
     # Action/pose regularization split by region (3× stronger on arm than hand).
     # Action layout: [fingers(20) | arm_r(7) | mass(1)]; pose excludes lift (PD-fixed).
     rew_hand_action_reg: float = -0.004   # GR baseline kept for fingers
-    rew_arm_action_reg:  float = -0.004   # 1× hand
+    rew_arm_action_reg:  float = -0.008   # 2× hand — penalize arm null-space wandering
     rew_hand_pose_reg:   float = -0.001
-    rew_arm_pose_reg:    float = -0.001   # 1× hand; lift excluded
+    rew_arm_pose_reg:    float = -0.002   # 2× hand — pull arm toward default pose; lift excluded
     # Termination
     # termination=False disables early termination entirely (only timeout) — use for warm-up.
     # GR env uses this flag to avoid infinite termination loops early in training when the

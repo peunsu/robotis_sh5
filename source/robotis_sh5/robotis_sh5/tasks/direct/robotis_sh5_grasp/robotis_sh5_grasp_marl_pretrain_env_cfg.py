@@ -131,12 +131,11 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     rew_obj_pos: float = 0.0              # disabled — no object in pretrain
     rew_obj_rot: float = 0.0
     rew_fingertip: float = -12.5          # single-agent pretrain weight
-    rew_wrist_pos: float = -2.5           # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 0.0      # no contact in pretrain
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg: float = -0.004   # 1× hand
+    rew_arm_action_reg: float = -0.008   # 2× hand — penalize arm null-space wandering
     rew_hand_pose_reg: float = -0.001
-    rew_arm_pose_reg: float = -0.001     # 1× hand
+    rew_arm_pose_reg: float = -0.002     # 2× hand — pull arm toward default pose
 
     # ── Termination ──────────────────────────────────────────────────────────
     termination: bool = True

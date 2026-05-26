@@ -177,14 +177,13 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     rew_alive: float = 1.5
     rew_kpts: float = -1.76           # GR pretrain: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
     rew_fingertip: float = -12.5
-    rew_wrist_pos: float = -2.5       # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 0.0
     # Action/pose regularization split by region (3× stronger on arm than hand).
     # Action layout (pretrain, no mass): [fingers(20) | arm_r(7)]; pose excludes lift.
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg:  float = -0.004   # 1× hand
+    rew_arm_action_reg:  float = -0.008   # 2× hand — penalize arm null-space wandering
     rew_hand_pose_reg:   float = -0.001
-    rew_arm_pose_reg:    float = -0.001   # 1× hand
+    rew_arm_pose_reg:    float = -0.002   # 2× hand — pull arm toward default pose
 
     # Termination (fingertip + wrist only — no object-based termination)
     termination: bool = True

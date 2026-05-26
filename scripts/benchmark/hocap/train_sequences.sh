@@ -145,7 +145,7 @@ for key in "${SEQUENCES[@]}"; do
     # ── Step 2: Frame-0 arm IK ────────────────────────────────────────────────
     echo ""
     echo "[train] Step 2/4 — Frame-0 IK: ${TRAJECTORY_TASK} / ${DATA_ID}"
-    python scripts/process_dataset/compute_frame0_ik.py \
+    python scripts/process_dataset/compute_frame0_ik_pink.py \
         --dataset "${DATASET}" \
         --task    "${TRAJECTORY_TASK}" \
         --data_id "${DATA_ID}"

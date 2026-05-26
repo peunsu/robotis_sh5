@@ -1379,7 +1379,6 @@ class RobotisSh5GraspMarlEnv(DirectMARLEnv):
             + self.cfg.rew_obj_pos * obj_pos_err_w       # object position, Z-weighted
             + self.cfg.rew_obj_rot * obj_rot_err
             + self.cfg.rew_fingertip * ft_err            # contact-conditioned fingertip
-            + self.cfg.rew_wrist_pos * wrist_err         # raw wrist position tracking
         ).clamp(min=-self.cfg.rew_alive)
         team_reward = (
             self.cfg.rew_alive * alive
@@ -1412,7 +1411,6 @@ class RobotisSh5GraspMarlEnv(DirectMARLEnv):
             "Episode_Reward / obj_pos":          (self.cfg.rew_obj_pos * obj_pos_err_w).mean(),
             "Episode_Reward / obj_rot":          (self.cfg.rew_obj_rot * obj_rot_err).mean(),
             "Episode_Reward / fingertip":        (self.cfg.rew_fingertip * ft_err).mean(),
-            "Episode_Reward / wrist_pos":        (self.cfg.rew_wrist_pos * wrist_err).mean(),
             "Episode_Reward / fingertip_force":  (self.cfg.rew_fingertip_force * force_rew).mean(),
             "Episode_Reward / hand_action_reg":  (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
             "Episode_Reward / arm_action_reg":   (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),

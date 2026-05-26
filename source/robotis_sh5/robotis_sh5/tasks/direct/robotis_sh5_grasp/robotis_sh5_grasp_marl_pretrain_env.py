@@ -410,7 +410,6 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         tracking_penalty = (
             self.cfg.rew_kpts * kpts_err_w
             + self.cfg.rew_fingertip * ft_err
-            + self.cfg.rew_wrist_pos * wrist_err
         ).clamp(min=-self.cfg.rew_alive)
         team_reward = (
             self.cfg.rew_alive * alive
@@ -434,7 +433,6 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             "Episode_Reward / alive":            (self.cfg.rew_alive * alive).mean(),
             "Episode_Reward / kpts":             (self.cfg.rew_kpts * kpts_err_w).mean(),
             "Episode_Reward / fingertip":        (self.cfg.rew_fingertip * ft_err).mean(),
-            "Episode_Reward / wrist_pos":        (self.cfg.rew_wrist_pos * wrist_err).mean(),
             "Episode_Reward / hand_action_reg":  (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
             "Episode_Reward / arm_action_reg":   (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
             "Episode_Reward / hand_pose_reg":    (self.cfg.rew_hand_pose_reg   * hand_pose_reg).mean(),

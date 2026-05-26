@@ -200,12 +200,11 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     rew_obj_pos: float = -4.26            # object position tracking (Z-weighted)
     rew_obj_rot: float = -1.0             # object rotation tracking (rad)
     rew_fingertip: float = -5.2           # contact-conditioned fingertip tracking
-    rew_wrist_pos: float = -1.04          # = rew_fingertip / 5 → per-keypoint weight equal to fingertip
     rew_fingertip_force: float = 1.0
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg: float = -0.004   # 1× hand
+    rew_arm_action_reg: float = -0.008   # 2× hand — penalize arm null-space wandering
     rew_hand_pose_reg: float = -0.001
-    rew_arm_pose_reg: float = -0.001     # 1× hand
+    rew_arm_pose_reg: float = -0.002     # 2× hand — pull arm toward default pose
 
     # ── Termination (shared between agents) ──────────────────────────────────
     termination: bool = True
