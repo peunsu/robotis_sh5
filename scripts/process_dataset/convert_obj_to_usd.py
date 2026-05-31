@@ -12,6 +12,12 @@ from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "source" / "robotis_sh5" / "data"
 
+# Per-object collision approximation overrides. Default is ConvexHull.
+# Add object IDs that benefit from a simpler / more stable collider here.
+_CUBE_COLLISION_OBJECTS: set[str] = {
+    "G09_1",   # thin object with bumpy face → toppling; cube gives a stable flat base
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -19,7 +25,7 @@ def parse_args():
                         help="Dataset directory under data/processed/.")
     parser.add_argument("--object-id", type=str, default="", help="Single object ID to convert.")
     parser.add_argument("--mass", type=float, default=0.2, help="Object mass in kg.")
-    parser.add_argument("--friction", type=float, default=0.8, help="Friction coefficient.")
+    parser.add_argument("--friction", type=float, default=1.0, help="Friction coefficient.")
     parser.add_argument("--overwrite", action="store_true", help="Re-convert existing USD files.")
     return parser.parse_args()
 
@@ -42,7 +48,16 @@ def convert_object(assets_dir: Path, obj_id: str, mass: float, friction: float) 
         print(f"[skip] USD already exists: {usd_path}")
         return True
 
-    print(f"[conv] {obj_path} → {usd_path}")
+    # Per-object collider override: cube approximation for objects with unstable
+    # mesh-derived collision (thin / bumpy faces that prevent stable resting).
+    if obj_id in _CUBE_COLLISION_OBJECTS:
+        mesh_collider = schemas_cfg.BoundingCubePropertiesCfg()
+        collider_label = "BoundingCube"
+    else:
+        mesh_collider = schemas_cfg.ConvexHullPropertiesCfg()
+        collider_label = "ConvexHull"
+
+    print(f"[conv] {obj_path} → {usd_path}  (collider: {collider_label})")
 
     cfg = MeshConverterCfg(
         asset_path=str(obj_path),
@@ -57,8 +72,10 @@ def convert_object(assets_dir: Path, obj_id: str, mass: float, friction: float) 
             max_depenetration_velocity=1.0,
             disable_gravity=False,
         ),
-        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-        mesh_collision_props=schemas_cfg.ConvexHullPropertiesCfg(),
+        collision_props=sim_utils.CollisionPropertiesCfg(
+            collision_enabled=True
+        ),
+        mesh_collision_props=mesh_collider,
     )
 
     MeshConverter(cfg)  # conversion happens automatically in AssetConverterBase.__init__
@@ -70,7 +87,7 @@ def convert_object(assets_dir: Path, obj_id: str, mass: float, friction: float) 
         mat = UsdShade.Material.Define(stage, mat_path)
         phys_mat = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
         phys_mat.CreateStaticFrictionAttr(friction)
-        phys_mat.CreateDynamicFrictionAttr(friction * 0.75)
+        phys_mat.CreateDynamicFrictionAttr(friction)
         phys_mat.CreateRestitutionAttr(0.1)
 
         for prim in stage.Traverse():

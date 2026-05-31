@@ -90,11 +90,14 @@ python scripts/process_dataset/oakink.py
 python scripts/process_dataset/hocap.py
 isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap]   # requires Isaac Lab env
 
-# Frame-0 arm IK — TWO implementations:
-#   (A) compute_frame0_ik.py      — Isaac Lab DLS controller, robot-in-sim. Slower startup.
-#   (B) compute_frame0_ik_pink.py — pink (QP) on pinocchio. PREFERRED: pos_err≈0 vs ~2cm DLS.
-#       Uses URDF at data/robots/FFW/urdf/ (no Isaac sim spawn). Joint limits as inequality
-#       constraints; PostureTask regularizes 7-DOF arm null-space toward default.
+# Full-trajectory arm reference pipeline (PRIMARY entry point).
+# Canonicalize + VPoser SMPL fit with robot-bone rescaling + per-frame pink IK + mp4 visualization.
+# Outputs per trajectory: elbow_joint_pos.npy (N,3), arm_joint_pos.npy (N,7), vposer_ik_video.mp4.
+# The env loads frame-0 arm pose from arm_joint_pos.npy[0] at episode init.
+python scripts/process_dataset/process_arm_pipeline.py --dataset hocap --overwrite
+
+# (standalone) Frame-0-only arm IK — pink QP on pinocchio. Not used by env/benchmark anymore;
+# kept as a diagnostic / single-frame solver, and provides helpers imported by process_arm_pipeline.
 python scripts/process_dataset/compute_frame0_ik_pink.py --dataset oakink --overwrite
 ```
 
@@ -176,7 +179,8 @@ Key design patterns:
 - **State cache (physical curriculum)**: `_save_state_cache` stores per-frame "best" sim state
   (97D = reward + obj pose/vel + 28D joint state + 27D smoothed action). On reset, cache-hit
   envs restore from the saved state, cache-miss envs use default pose + frame-0 IK.
-- **Frame-0 arm IK**: precomputed wrist pose for frame 0 loaded from `frame0_arm_joint_pos.npy`.
+- **Frame-0 arm IK**: precomputed wrist pose for frame 0 loaded from `arm_joint_pos.npy[0]`
+  (full-trajectory IK from `process_arm_pipeline.py`).
 - **EMA action smoothing** (TJ/rl_games convention, `alpha = new action weight`):
   `smoothed = alpha * raw + (1 - alpha) * prev_smoothed`. Split α: fingers use
   `action_smoothing=0.5` (responsive grasping); arm slice [20:27] uses `arm_action_smoothing=0.17`
@@ -295,7 +299,7 @@ no-object pretrain distribution. `log_std_parameter` is also skipped (TJ-style �
 | `entropy_loss_scale` | 0.004 (modified by entropy_flip) | 0.004 | |
 | `action_smoothing` (env cfg, finger EMA α) | 0.5 | 0.5 | finger: prev 50% + raw 50% |
 | `arm_action_smoothing` (env cfg, arm EMA α) | 0.2 | 0.2 | arm: prev 80% + raw 20% (stronger smoothing → less wrist tremor) |
-| `rew_arm_action_reg` / `rew_arm_pose_reg` | -0.012 / -0.003 | -0.012 / -0.003 | 3× hand — penalize arm null-space wandering |
+| `rew_arm_action_reg` / `rew_arm_pose_reg` | -0.008 / -0.002 | -0.008 / -0.002 | 2× hand — penalize arm null-space wandering |
 
 Epoch relationship: `10000 timesteps / 8 rollouts = 1250 PPO updates`.
 
@@ -319,7 +323,9 @@ data/processed/<dataset>/              # oakink or hocap
 ├── object_mass.json                   # {object_id: [min_kg, max_kg]}
 ├── mano/right/<task>/<id>/
 │   ├── trajectory_keypoints.npz       # wrist, fingertip, obj poses + mano keypoints
-│   └── frame0_arm_joint_pos.npy       # precomputed IK for arm init
+│   ├── elbow_joint_pos.npy            # (N, 3) SMPL elbow per frame (robot-bone rescaled)
+│   ├── arm_joint_pos.npy              # (N, 7) per-frame arm IK; env uses [0] for frame-0 init
+│   └── vposer_ik_video.mp4            # visualization of SMPL fit + IK
 ├── ffw_sh5/right/<task>/<id>/         # single-agent checkpoints
 │   ├── pretrain.pt
 │   ├── agent.pt

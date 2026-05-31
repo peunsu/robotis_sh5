@@ -36,7 +36,7 @@ TIMESTEPS=40000
 # logs/skrl/<task>/<run>/videos/train/. Reduce {PRETRAIN_,}NUM_ENVS to fit GPU
 # memory when enabling video (camera rendering adds significant VRAM overhead).
 VIDEO="${VIDEO:-0}"
-VIDEO_LENGTH="${VIDEO_LENGTH:-200}"
+VIDEO_LENGTH="${VIDEO_LENGTH:-300}"
 VIDEO_INTERVAL="${VIDEO_INTERVAL:-1000}"
 
 # Sequence keys — format matches mano/right folder names: subject_{N}-{DATE_TIME}-{G_OBJECT_ID}
@@ -142,10 +142,10 @@ for key in "${SEQUENCES[@]}"; do
     fi
     echo "[train] Mano data exists — ok."
 
-    # ── Step 2: Frame-0 arm IK ────────────────────────────────────────────────
+    # ── Step 2: Arm reference pipeline (elbow + per-frame IK + video) ─────────
     echo ""
-    echo "[train] Step 2/4 — Frame-0 IK: ${TRAJECTORY_TASK} / ${DATA_ID}"
-    python scripts/process_dataset/compute_frame0_ik_pink.py \
+    echo "[train] Step 2/4 — Arm pipeline: ${TRAJECTORY_TASK} / ${DATA_ID}"
+    python scripts/process_dataset/process_arm_pipeline.py \
         --dataset "${DATASET}" \
         --task    "${TRAJECTORY_TASK}" \
         --data_id "${DATA_ID}"

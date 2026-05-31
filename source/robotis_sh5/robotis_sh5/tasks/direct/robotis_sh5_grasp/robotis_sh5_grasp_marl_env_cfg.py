@@ -33,20 +33,20 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
 
     **Canonical MAPPO** — single critic V(s_global) + shared team reward:
       - **hand agent (20D)**: 20 finger joints. Sees full single-agent grasping
-        context (276D — 21 MANO kpts + palm state + full joint state (no lift) +
+        context (22 MANO+elbow kpts + palm state + full joint state (no lift) +
         object state + reference deltas + future_contact + prev_action + ft_forces).
-      - **arm agent (7D)**: arm_r joints. Sees minimal obs (54D — own joints +
+      - **arm agent (7D)**: arm_r joints. Sees minimal obs (own joints +
         current palm pose + next-frame target palm pose + prev_arm_action +
         current_hand_action slot). Hand decides first; its action is injected
         into arm's obs (sequential conditioning hand → arm).
 
     Both agents receive the SAME team reward (identical to single-agent reward
-    formula: alive + 21-kpt tracking + obj_pos/rot + fingertip + force + regs).
+    formula: alive + 22-kpt tracking + obj_pos/rot + fingertip + force + regs).
     The centralized critic V(s_global) is shared across agents (patched in
     `train_marl.py` via `_share_value_critic`).
 
-    Shared state (centralized critic input): EXPLICIT non-redundant 279D —
-    hand_obs (276D) + delta_wrist_rot (3D). Computed by `_get_states()`. No
+    Shared state (centralized critic input): EXPLICIT non-redundant 292D —
+    hand_obs (289D) + delta_wrist_rot (3D). Computed by `_get_states()`. No
     duplication with arm_obs features (jp_arm ⊂ full_jp, wrist_quat_w shared, etc.).
 
     Coordination is implicit: shared reward + shared critic give both agents
@@ -54,12 +54,18 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     injection, so arm can anticipate finger motion during grasp.
 
     Observation spaces (per-agent dict):
-      - arm  ( 34D): jp_arm(7) + jv_arm(7) + wrist_pos_env(3) + wrist_quat_w(4)
-                     + delta_wrist_pos(3) + delta_wrist_rot(3) + prev_arm_action(7)
-      - hand (278D): single-agent obs minus mass — 21 MANO kpts world + palm state +
-                     fingertip vel + full 28D joint state + object state + reference
-                     deltas + future_contact + prev_action(27, no mass) + ft_forces
-    Shared state (centralized critic): state_space=-1 → auto-flatten = 34+278 = 312D.
+      - arm   (89D): jp_arm(7) + jv_arm(7) + wrist_pos(3) + wrist_quat_6d(6)
+                     + wrist_linvel(3) + wrist_angvel(3) + delta_wrist_pos(3)
+                     + delta_wrist_rot(3) + prev_arm_action(7) + obj_pos(3)
+                     + obj_quat_6d(6) + obj_linvel(3) + obj_angvel(3)
+                     + delta_wrist_obj(3) + delta_obj_pos(3) + delta_obj_rot_6d(6)
+                     + hand_action_slot(20)
+      - hand (289D): 21 MANO kpts (63) + elbow_pos(3) + wrist_quat_6d(6) + wrist_linvel(3)
+                     + wrist_angvel(3) + ft_vel(15) + jp(27) + jv(27) + obj_pos(3)
+                     + obj_quat_6d(6) + obj_linvel(3) + obj_angvel(3) + delta_kpts(63)
+                     + delta_elbow(3) + delta_ft_obj(15) + delta_obj_pos(3) + delta_obj_rot_6d(6)
+                     + future_contact(5) + prev_action(27, no mass) + ft_forces(5)
+    Shared state (centralized critic): hand_obs (289) + delta_wrist_rot (3) = 292D.
 
     Action spaces:
       - arm: 7D (arm_r joints), [-1, 1] → [lower, upper] via _scale()
@@ -69,8 +75,8 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     # ── Agent / space definitions ─────────────────────────────────────────────
     possible_agents: list = ["arm", "hand"]
     action_spaces: dict = {"arm": 7, "hand": 20}
-    observation_spaces: dict = {"arm": 89, "hand": 283}
-    state_space: int = 286   # explicit non-redundant shared state via _get_states()
+    observation_spaces: dict = {"arm": 89, "hand": 289}   # hand: 21 MANO kpts + elbow_pos (separated)
+    state_space: int = 292   # explicit non-redundant shared state via _get_states() — hand_obs + delta_wrist_rot
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
 
     # ── Viewer (identical to single-agent) ────────────────────────────────────
@@ -194,17 +200,20 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
 
     # ── Reward weights ───────────────────────────────────────────────────────
     # Canonical MAPPO: SINGLE team reward shared across all agents. Identical
-    # formula and coefficients to single-agent train cfg.
-    rew_alive: float = 1.5
-    rew_kpts: float = -1.76               # mean over all 21 MANO kpts, Z-weighted, world
-    rew_obj_pos: float = -4.26            # object position tracking (Z-weighted)
-    rew_obj_rot: float = -1.0             # object rotation tracking (rad)
-    rew_fingertip: float = -5.2           # contact-conditioned fingertip tracking
-    rew_fingertip_force: float = 1.0
+    # formula and coefficients to single-agent train cfg. `rew_kpts` averages
+    # over 21 MANO keypoints ONLY (elbow handled separately via `rew_elbow_pos`).
+    rew_alive: float = 1.8
+    rew_kpts: float = -1.76               # mean over 21 MANO kpts (elbow excluded), Z-weighted, world
+    rew_wrist_pos: float = -0.7           # wrist emphasis (~8× per-kpt strength)
+    rew_elbow_pos: float = -0.1           # elbow guidance (≈ per-kpt strength)
+    rew_obj_pos: float = -5.0             # boosted to maintain signal after wrist/elbow added
+    rew_obj_rot: float = -1.2             # boosted
+    rew_fingertip: float = -6.0           # boosted
+    rew_fingertip_force: float = 1.2      # boosted
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg: float = -0.008   # 2× hand — penalize arm null-space wandering
+    rew_arm_action_reg: float = -0.004    # uniform with hand
     rew_hand_pose_reg: float = -0.001
-    rew_arm_pose_reg: float = -0.002     # 2× hand — pull arm toward default pose
+    rew_arm_pose_reg: float = -0.001      # uniform with hand
 
     # ── Termination (shared between agents) ──────────────────────────────────
     termination: bool = True
@@ -214,6 +223,8 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     max_wrist_pos_err: float = 0.15
     max_wrist_rot_err: float = 0.75
     max_ft_mean_err: float = 0.15   # synced with TJ — absorbs open-vs-curled finger mismatch at frame 0
+    # elbow position tracking error (m); loose threshold since elbow is soft guidance only
+    max_elbow_pos_err: float = 0.2
     # Grace period: disable early termination for the first N frames of each episode. 0 = disabled.
     early_termination_grace_frames: int = 0
 

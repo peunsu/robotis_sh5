@@ -6,8 +6,8 @@ inputs provided directly from the kinematic reference trajectory. Object trackin
 are excluded. This follows the paper's Section 3.3 progressive training design.
 
 Key differences from the main grasp env:
-  - Action space: 28D (no mass dim)
-  - Observation space: 189D (same structure as train 190D; prev_action 28 vs 29)
+  - Action space: 27D (no mass dim, lift excluded)
+  - Observation space: 291D (matches train env layout for checkpoint transfer)
   - No physics object in scene; object inputs from kinematic reference
   - No state cache, no adaptive sampling
   - Reward: fingertip + wrist tracking only (no object position/rotation reward)
@@ -42,24 +42,26 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     Object is entirely removed from the physics simulation; all object-related inputs
     come directly from the kinematic reference. Object tracking rewards are excluded.
 
-    Observation space (total=279, same structure as train env except prev_action 28 vs 29):
-        hand_kpts_pos      [21*3]   all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
-        wrist_quat         [4]      wrist global orientation (wxyz)
+    Observation space (total=291, matches train env layout for checkpoint transfer):
+        hand_kpts_pos      [21*3]   21 MANO keypoints in world frame
+        elbow_pos          [3]      right elbow position in world frame
+        wrist_quat_6d      [6]      wrist global orientation (6D continuous rotation rep)
         wrist_linvel       [3]      wrist global linear velocity
         wrist_angvel       [3]      wrist global angular velocity
         fingertip_vel      [5*3]    fingertip linear velocities
         joint_pos          [28]     controlled joint angles (normalized)
         joint_vel          [28]     controlled joint velocities
         ref_obj_pos        [3]      reference object position (world frame, from kinematic ref)
-        ref_obj_quat       [4]      reference object orientation (wxyz, from kinematic ref)
+        ref_obj_quat_6d    [6]      reference object orientation (6D rot, from kinematic ref)
         obj_linvel         [3]      zeros (no physics object)
         obj_angvel         [3]      zeros (no physics object)
-        delta_kpts_world   [21*3]   next-frame delta for all 21 keypoints in world frame
+        delta_kpts_world   [21*3]   next-frame delta for 21 MANO keypoints
+        delta_elbow_world  [3]      next-frame delta for right elbow
         delta_ft_obj       [5*3]    next-frame fingertip error in object frame (contact-cond.)
         delta_obj_pos      [3]      next-frame ref obj position delta (ref traj dynamics)
-        delta_obj_rot      [3]      next-frame ref obj rotation delta
+        delta_obj_rot_6d   [6]      next-frame ref obj rotation delta (6D rot)
         future_contact     [5]      predicted contact flag per fingertip
-        prev_action        [28]     previous action
+        prev_action        [27]     previous joint action (fingers + arm; lift NOT actioned)
         fingertip_forces   [5]      normal contact force per fingertip
 
     Action space (28): [fingers(20) | arm_r(7) | lift(1)] delta from default pose.
@@ -81,7 +83,9 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     num_arm_r_dofs: int = 7
     num_lift_dofs: int = 1            # lift_joint (NOT in action — held at fixed_lift_target)
     action_space: int = 27           # fingers(20) + arm_r(7); lift excluded
-    observation_space: int = 285     # 63+6+3+3+15+28+28+3+6+3+3+63+15+3+6+5+27+5  (6D rot, prev_action=27)
+    # 63+3+6+3+3+15+28+28+3+6+3+3+63+3+15+3+6+5+27+5 — 21 MANO kpts + elbow (separated);
+    # 6D rot; prev_action=27 joint-only (lift not actioned). Matches train env for ckpt transfer.
+    observation_space: int = 291
     state_space: int = 0
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
     # Lift target (joint position). 0.0 = URDF upper limit (fully up).
@@ -174,22 +178,28 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     arm_action_smoothing: float = 0.2
 
     # Reward scales (GR pretrain: 1.5*alive - clamp(1.76*kpts + 12.5*ft, 1.5) + reg)
-    rew_alive: float = 1.5
-    rew_kpts: float = -1.76           # GR pretrain: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
-    rew_fingertip: float = -12.5
+    # `rew_kpts` averages over 21 MANO keypoints ONLY (elbow handled separately).
+    # Wrist/elbow weights scale with pretrain's higher fingertip baseline.
+    rew_alive: float = 1.8
+    rew_kpts: float = -1.76           # mean Z-weighted L2 over 21 MANO keypoints (elbow excluded)
+    rew_wrist_pos: float = -0.80       # wrist position emphasis (~1/2x kpts strength)
+    rew_elbow_pos: float = -0.20       # elbow guidance (≈ 1/8x kpts strength)
+    rew_fingertip: float = -14.5      # boosted to maintain signal after wrist/elbow added
     rew_fingertip_force: float = 0.0
-    # Action/pose regularization split by region (3× stronger on arm than hand).
+    # Action/pose regularization (uniform weights across hand and arm).
     # Action layout (pretrain, no mass): [fingers(20) | arm_r(7)]; pose excludes lift.
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg:  float = -0.008   # 2× hand — penalize arm null-space wandering
+    rew_arm_action_reg:  float = -0.004
     rew_hand_pose_reg:   float = -0.001
-    rew_arm_pose_reg:    float = -0.002   # 2× hand — pull arm toward default pose
+    rew_arm_pose_reg:    float = -0.001
 
     # Termination (fingertip + wrist only — no object-based termination)
     termination: bool = True
     max_wrist_pos_err: float = 0.15
     max_wrist_rot_err: float = 0.75   # GR pretrain: delta_hand_rot_value > 0.75
     max_ft_mean_err: float = 0.1      # matches TJ pretrain: delta_fingertip_pos_value_mean > 0.1
+    # elbow position tracking error (m); loose threshold since elbow is soft guidance only
+    max_elbow_pos_err: float = 0.2
     # Grace period: disable early termination for the first N frames of each episode. 0 = disabled.
     early_termination_grace_frames: int = 0
 

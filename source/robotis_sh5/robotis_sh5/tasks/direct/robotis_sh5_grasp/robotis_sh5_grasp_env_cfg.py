@@ -96,28 +96,28 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         "DY_80": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[1-3]", "arm_r_joint[1-3]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=1e6,  # 61.4,
+            effort_limit_sim=100,  # 61.4,
             stiffness=600.0,
             damping=90.0  # default: 30.0
         ),
         "DY_70": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[4-6]", "arm_r_joint[4-6]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=1e6,  # 31.7,
+            effort_limit_sim=100,  # 31.7,
             stiffness=600.0,
             damping=60.0  # default: 20.0
         ),
         "DP_42": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint7", "arm_r_joint7"],
             velocity_limit_sim=6.0,
-            effort_limit_sim=1e6,  # 5.1,
+            effort_limit_sim=100,  # 5.1,
             stiffness=200.0,
             damping=25.0  # default: 3.0
         ),
         "hand": ImplicitActuatorCfg(
             joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
             velocity_limit_sim=2.2,
-            effort_limit_sim=1e6,  # 2.0,
+            effort_limit_sim=100,  # 2.0,
             stiffness=20.0,
             damping=1.0,  # default: 1.0
         ),
@@ -142,24 +142,26 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     by the PD controller; lift remains in joint_pos/joint_vel observations for state awareness.
     Additional output: 1D normalized object mass parameter (MassDexMimic).
 
-    Observation space (total=279, paper S4.1 layout):
-        hand_kpts_pos      [21*3]   all 21 MANO keypoints in world frame (GR: hand_kpts_pos)
-        wrist_quat         [4]      wrist global orientation (wxyz)
+    Observation space (total=291):
+        hand_kpts_pos      [21*3]   21 MANO keypoints in world frame
+        elbow_pos          [3]      right elbow position in world frame
+        wrist_quat_6d      [6]      wrist global orientation (6D continuous rotation rep)
         wrist_linvel       [3]      wrist global linear velocity
         wrist_angvel       [3]      wrist global angular velocity
         fingertip_vel      [5*3]    fingertip linear velocities
         joint_pos          [28]     controlled joint angles (normalized)
         joint_vel          [28]     controlled joint velocities
         obj_pos            [3]      object position
-        obj_quat           [4]      object orientation (wxyz)
+        obj_quat_6d        [6]      object orientation (6D continuous rotation rep)
         obj_linvel         [3]      object linear velocity
         obj_angvel         [3]      object angular velocity
-        delta_kpts_world   [21*3]   next-frame delta for all 21 keypoints in world frame
+        delta_kpts_world   [21*3]   next-frame delta for 21 MANO keypoints
+        delta_elbow_world  [3]      next-frame delta for right elbow
         delta_ft_obj       [5*3]    next-frame fingertip error in object frame (contact-cond.)
         delta_obj_pos      [3]      next-frame obj position error
-        delta_obj_rot      [3]      next-frame rotation error (axis-angle approximation)
+        delta_obj_rot_6d   [6]      next-frame rotation error (6D continuous rotation rep)
         future_contact     [5]      predicted contact flag per fingertip
-        prev_action        [28]     previous action (27 joints + 1 mass; lift NOT actioned)
+        prev_action        [27]     previous joint action (mass excluded; lift NOT actioned)
         fingertip_forces   [5]      normal contact force per fingertip
 
     Action space (28): [fingers(20) | arm_r(7) | mass(1)] from default pose.
@@ -185,7 +187,9 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     num_arm_r_dofs: int = 7   # arm_r_joint1-7
     num_lift_dofs: int = 1    # lift_joint (NOT in action — held at fixed_lift_target via PD ctrl)
     action_space: int = 28    # 20(fingers) + 7(arm) + 1(mass); lift excluded
-    observation_space: int = 285  # 63+6+3+3+15+28+28+3+6+3+3+63+15+3+6+5+27+5  (6D rot, prev_action=27 joint-only; matches pretrain for ckpt transfer)
+    # 63+3+6+3+3+15+28+28+3+6+3+3+63+3+15+3+6+5+27+5 — 21 MANO kpts + elbow (separated);
+    # 6D rot; prev_action=27 joint-only (mass excluded). Matches pretrain for ckpt transfer.
+    observation_space: int = 291
     state_space: int = 0
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
     # Lift target (joint position in radians/meters depending on joint type).
@@ -296,18 +300,23 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     arm_action_smoothing: float = 0.2
 
     # Reward scales (GR env: 1.5*alive - clamp(4.26*pos + 1.0*rot + 5.2*ft + 1.76*kpts, 1.5) + force + reg)
-    rew_alive: float = 1.5
-    rew_kpts: float = -1.76           # GR env: 1.76 (mean Z-weighted L2 over all 21 MANO keypoints)
-    rew_obj_pos: float = -4.26        # GR env: 4.26
-    rew_obj_rot: float = -1.0         # GR env: 1.0
-    rew_fingertip: float = -5.2       # GR env: 5.2
-    rew_fingertip_force: float = 1.0  # GR env: 1.125 (slightly different normalization)
-    # Action/pose regularization split by region (3× stronger on arm than hand).
+    # `rew_kpts` averages over 21 MANO keypoints ONLY (elbow handled separately).
+    # `rew_wrist_pos`: per-kpt-level emphasis on wrist (~3-4× per-kpt strength inside kpts mean).
+    # `rew_elbow_pos`: soft guidance only (~per-kpt-level). Elbow is NOT in `kpts_err_w`.
+    rew_alive: float = 1.8
+    rew_kpts: float = -1.76           # mean Z-weighted L2 over 21 MANO keypoints (elbow excluded)
+    rew_wrist_pos: float = -0.80       # wrist position emphasis (~1/2x kpts strength)
+    rew_elbow_pos: float = -0.20       # elbow guidance (≈ 1/8x kpts strength)
+    rew_obj_pos: float = -5.0         # boosted to maintain signal after wrist/elbow added
+    rew_obj_rot: float = -1.2         # boosted
+    rew_fingertip: float = -6.0       # boosted
+    rew_fingertip_force: float = 1.2  # boosted
+    # Action/pose regularization (uniform weights across hand and arm).
     # Action layout: [fingers(20) | arm_r(7) | mass(1)]; pose excludes lift (PD-fixed).
-    rew_hand_action_reg: float = -0.004   # GR baseline kept for fingers
-    rew_arm_action_reg:  float = -0.008   # 2× hand — penalize arm null-space wandering
+    rew_hand_action_reg: float = -0.004
+    rew_arm_action_reg:  float = -0.004
     rew_hand_pose_reg:   float = -0.001
-    rew_arm_pose_reg:    float = -0.002   # 2× hand — pull arm toward default pose; lift excluded
+    rew_arm_pose_reg:    float = -0.001
     # Termination
     # termination=False disables early termination entirely (only timeout) — use for warm-up.
     # GR env uses this flag to avoid infinite termination loops early in training when the
@@ -319,6 +328,8 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     max_wrist_pos_err: float = 0.15   # wrist (arm end-effector) position tracking error (m)
     max_wrist_rot_err: float = 0.75   # wrist rotation tracking error (rad) — matches GR env
     max_ft_mean_err: float = 0.15     # mean fingertip tracking error (m) — synced with TJ (0.15) to absorb open-vs-curled finger mismatch at frame 0
+    # elbow position tracking error (m); loose threshold since elbow is soft guidance only
+    max_elbow_pos_err: float = 0.2
     # Grace period: disable early termination for the first N frames of each episode.
     # Helps absorb the IK-lift offset and open-vs-curled finger mismatch at t=0.
     # 0 = disabled (no grace; standard TJ behavior).

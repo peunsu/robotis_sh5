@@ -431,7 +431,7 @@ Each `train_sequences*.sh` runs **four steps per sequence** in order:
 | Step | Action | Skip condition |
 |---|---|---|
 | 1. Data check | Verify `mano/right/<task>/` exists | Error if missing |
-| 2. Frame-0 arm IK | `scripts/process_dataset/compute_frame0_ik.py --dataset <DATASET>` | `frame0_arm_joint_pos.npy` exists |
+| 2. Arm reference pipeline | `scripts/process_dataset/process_arm_pipeline.py --dataset <DATASET>` | `arm_joint_pos.npy` exists |
 | 3. Pretrain | `<TASK_PRETRAIN>` for `PRETRAIN_TIMESTEPS` env steps | `pretrain.pt` exists |
 | 4. Train | `<TASK>` for `TIMESTEPS` env steps, loading pretrain.pt | `agent.pt` exists |
 
@@ -461,8 +461,8 @@ You can also run individual steps manually for a single sequence:
 python scripts/process_dataset/oakink.py \
     --seq-id-ts "C11001_0001_0007/2021-10-03-14-32-01"
 
-# Step 2: frame-0 arm IK
-python scripts/process_dataset/compute_frame0_ik.py \
+# Step 2: arm reference pipeline (canonicalize + SMPL fit + per-frame IK + video)
+python scripts/process_dataset/process_arm_pipeline.py \
     --dataset oakink --task C11001-0001-0007 --data_id 0
 
 # Step 3: pretrain (single-agent)

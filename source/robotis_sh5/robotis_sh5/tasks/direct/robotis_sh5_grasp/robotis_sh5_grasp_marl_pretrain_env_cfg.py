@@ -32,8 +32,8 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     # ── Agent / space definitions (same shapes as train for ckpt transfer) ───
     possible_agents: list = ["arm", "hand"]
     action_spaces: dict = {"arm": 7, "hand": 20}
-    observation_spaces: dict = {"arm": 89, "hand": 283}
-    state_space: int = 286   # explicit non-redundant shared state via _get_states()
+    observation_spaces: dict = {"arm": 89, "hand": 289}   # hand: 21 MANO kpts + elbow_pos (separated)
+    state_space: int = 292   # explicit non-redundant shared state via _get_states() — hand_obs + delta_wrist_rot
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
 
     # ── Viewer ───────────────────────────────────────────────────────────────
@@ -125,23 +125,28 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
 
     # ── Reward weights ───────────────────────────────────────────────────────
     # Canonical MAPPO: single team reward (matches single-agent PRETRAIN cfg —
-    # no obj_pos/rot, no force, stronger rew_fingertip).
-    rew_alive: float = 1.5
-    rew_kpts: float = -1.76               # mean over 21 MANO kpts, Z-weighted, world
+    # no obj_pos/rot, no force, stronger rew_fingertip). `rew_kpts` averages
+    # over 21 MANO keypoints ONLY (elbow handled separately).
+    rew_alive: float = 1.8
+    rew_kpts: float = -1.76               # mean over 21 MANO kpts (elbow excluded), Z-weighted
+    rew_wrist_pos: float = -1.5           # wrist emphasis
+    rew_elbow_pos: float = -0.3           # elbow guidance (pretrain stronger)
     rew_obj_pos: float = 0.0              # disabled — no object in pretrain
     rew_obj_rot: float = 0.0
-    rew_fingertip: float = -12.5          # single-agent pretrain weight
+    rew_fingertip: float = -14.5          # boosted to maintain signal after wrist/elbow added
     rew_fingertip_force: float = 0.0      # no contact in pretrain
     rew_hand_action_reg: float = -0.004
-    rew_arm_action_reg: float = -0.008   # 2× hand — penalize arm null-space wandering
+    rew_arm_action_reg: float = -0.004    # uniform with hand
     rew_hand_pose_reg: float = -0.001
-    rew_arm_pose_reg: float = -0.002     # 2× hand — pull arm toward default pose
+    rew_arm_pose_reg: float = -0.001      # uniform with hand
 
     # ── Termination ──────────────────────────────────────────────────────────
     termination: bool = True
     max_wrist_pos_err: float = 0.15
     max_wrist_rot_err: float = 0.75
     max_ft_mean_err: float = 0.1      # matches TJ pretrain: delta_fingertip_pos_value_mean > 0.1
+    # elbow position tracking error (m); loose threshold since elbow is soft guidance only
+    max_elbow_pos_err: float = 0.2
     # Grace period: disable early termination for the first N frames of each episode. 0 = disabled.
     early_termination_grace_frames: int = 0
 
