@@ -1,17 +1,13 @@
-"""Configuration for the OakInk dexterous grasping **pretrain** environment.
+"""Configuration for the Shadow-Hand-on-Robotis dexterous grasping **pretrain** env.
 
 Pretrain phase: the object is entirely removed from the physics simulation.
 The policy learns to track hand keypoints (fingertips + wrist) with all object-related
 inputs provided directly from the kinematic reference trajectory. Object tracking rewards
-are excluded. This follows the paper's Section 3.3 progressive training design.
+are excluded.
 
-Key differences from the main grasp env:
-  - Action space: 27D (no mass dim, lift excluded)
-  - Observation space: 291D (matches train env layout for checkpoint transfer)
-  - No physics object in scene; object inputs from kinematic reference
-  - No state cache, no adaptive sampling
-  - Reward: fingertip + wrist tracking only (no object position/rotation reward)
-  - Termination: fingertip + wrist error only (no object-based termination)
+Robot: FFW-SH5 arm + Shadow Dexterous Hand (24 hand joints, 18 actuated).
+Policy controls: Shadow Hand actuated (22) + right arm (7) + lift (1) = 30 DOF
+(action=29: 22 shadow fingers + 7 arm). No mass action (object removed).
 """
 
 from __future__ import annotations
@@ -26,7 +22,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.utils import configclass
 
-from .robotis_sh5_grasp_env_cfg import FFW_SH5_DEX_CFG
+from .robotis_shadow_grasp_env_cfg import FFW_SH5_DEX_CFG
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
 _OAKINK_DATA_DIR = str(_DATA_DIR / "processed" / "oakink")
@@ -34,11 +30,11 @@ _HOCAP_DATA_DIR = str(_DATA_DIR / "processed" / "hocap")
 
 
 @configclass
-class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
-    """Configuration for OakInk dexterous grasping pretrain.
+class RobotisShadowGraspPretrainEnvCfg(DirectRLEnvCfg):
+    """Configuration for Shadow-Hand grasping pretrain (kinematic-only, no object).
 
-    Robot: FFW-SH5 full-body (fix_root_link=True).
-    Policy controls: right-hand fingers (20) + right arm (7) + lift (1) = 28 DOF.
+    Robot: FFW-SH5 arm + Shadow Dexterous Hand (fix_root_link=True).
+    Policy controls: Shadow Hand commanded (22) + right arm (7) = 29 DOF (no mass).
     Object is entirely removed from the physics simulation; all object-related inputs
     come directly from the kinematic reference. Object tracking rewards are excluded.
 
@@ -67,26 +63,26 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     Action space (28): [fingers(20) | arm_r(7) | lift(1)] delta from default pose.
     """
 
-    # Viewer: same viewpoint as train env — front-right of table, elevated.
+    # Viewer: same as train env (front-left elevated, env-local). See train cfg comment.
     viewer: ViewerCfg = ViewerCfg(
-        eye=(0.2, 0.15, 2.2),
-        lookat=(-0.2, 0.5, 2.0),
+        eye=(-0.4, -0.6, 1.8),
+        lookat=(0.4, 0.2, 1.0),
         resolution=(1280, 720),
+        origin_type="env",
+        env_index=0,
     )
 
     # Simulation
     decimation: int = 4
     episode_length_s: float = 5.0
 
-    # DOF counts
-    num_hand_dofs: int = 20
+    # DOF counts (Shadow Hand: 18 actuated; J0 for FF/MF/RF/LF tendon-absorbed)
+    num_hand_dofs: int = 18
     num_arm_r_dofs: int = 7
     num_lift_dofs: int = 1            # lift_joint (NOT in action — held at fixed_lift_target)
-    action_space: int = 27           # fingers(20) + arm_r(7); lift excluded
-    # 63+3+3+6+3+3+15+28+28+3+6+3+3+63+3+3+15+3+6+5+27+5 — 21 MANO kpts + elbow + link7
-    # (separated); 6D rot; prev_action=27 joint-only (lift not actioned). Matches train env
-    # for ckpt transfer.
-    observation_space: int = 297
+    action_space: int = 25           # shadow fingers(18) + arm_r(7); lift excluded, no mass
+    # joint_pos/joint_vel: 26 (18+7+1), prev_action: 25 (18+7). Matches train env for ckpt transfer.
+    observation_space: int = 291
     state_space: int = 0
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
     # Lift target (joint position). 0.0 = URDF upper limit (fully up).
@@ -121,22 +117,22 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # Robot
     robot_cfg: ArticulationCfg = FFW_SH5_DEX_CFG
 
-    # Controlled joint name patterns
-    finger_joint_names: str = "finger_r_joint.*"
+    # 18 actuated Shadow Hand joints (J0 of FF/MF/RF/LF excluded — tendon-coupled).
+    finger_joint_names: str = "robot0_(?:(?:FF|MF|RF|LF|TH)J[1-3]|LFJ4|THJ[04])"
     arm_r_joint_names: str = "arm_r_joint.*"
     lift_joint_name: str = "lift_joint"
 
-    # Fingertip body names
+    # Shadow Hand fingertip bodies (thumb, index, middle, ring, little)
     fingertip_body_names: list = [
-        "finger_r_link4",
-        "finger_r_link8",
-        "finger_r_link12",
-        "finger_r_link16",
-        "finger_r_link20",
+        "robot0_thdistal",
+        "robot0_ffdistal",
+        "robot0_mfdistal",
+        "robot0_rfdistal",
+        "robot0_lfdistal",
     ]
 
-    # Wrist link name
-    wrist_body_name: str = "hx5_d20_right_base"
+    # Wrist body — Shadow Hand palm acts as the wrist/end-effector root
+    wrist_body_name: str = "robot0_palm"
 
     # Canonical reference XY (env-local) for trajectory orientation alignment.
     # Trajectories are rotated in XY so the reference wrist approaches the object
@@ -191,8 +187,8 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     # Arm table-contact penalty (anti-cheating: arm_r_link3..link7).
     # Hybrid: soft per-N penalty (auto-clamped at rew_arm_contact × max_arm_contact_force)
     # + hard termination on strong press. Force used = MAX across the 5 tracked arm links.
-    rew_arm_contact: float = -0.05               # penalty weight per N of (max) arm-link contact force
-    max_arm_contact_force: float = 10.0          # termination threshold (N): episode ends if max link force exceeds this
+    rew_arm_contact: float = -0.1               # penalty weight per N of (max) arm-link contact force
+    max_arm_contact_force: float = 5.0          # termination threshold (N): episode ends if max link force exceeds this
     # Action/pose regularization (uniform weights across hand and arm).
     # Action layout (pretrain, no mass): [fingers(20) | arm_r(7)]; pose excludes lift.
     rew_hand_action_reg: float = -0.004

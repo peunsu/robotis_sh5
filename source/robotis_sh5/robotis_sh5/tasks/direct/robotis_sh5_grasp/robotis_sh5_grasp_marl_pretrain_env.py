@@ -23,6 +23,7 @@ import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
 
@@ -88,10 +89,15 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         overhang_y = float(self.cfg.tabletop_overhang_y_pos)
         mat = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.38, 0.18))
 
+        # Kinematic rigid-body table prims (required for ContactSensor GPU filter — see env.py for rationale).
+        _table_rigid_props = sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True)
+        _table_mass_props = sim_utils.MassPropertiesCfg(mass=1.0)
         base_h = table_h - thickness
         base_spawner = sim_utils.CuboidCfg(
             size=(table_w, table_d, base_h),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            rigid_props=_table_rigid_props,
+            mass_props=_table_mass_props,
             visual_material=mat,
         )
         base_spawner.func(
@@ -105,6 +111,8 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         top_spawner = sim_utils.CuboidCfg(
             size=(table_w, top_d, thickness),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            rigid_props=_table_rigid_props,
+            mass_props=_table_mass_props,
             visual_material=mat,
         )
         top_spawner.func(
@@ -115,6 +123,29 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
 
         self.robot = Articulation(self.cfg.robot_cfg)
         self._contact_sensors: dict = {}  # no object → all fingertip forces are zero
+
+        # ── Arm ↔ Table contact sensors (anti-cheating; see `rew_arm_contact`) ──
+        # Track arm_r_link3..link7 vs table; MAX magnitude drives penalty + termination.
+        _ARM_CONTACT_LINK_NAMES = [
+            "arm_r_link3", "arm_r_link4", "arm_r_link5", "arm_r_link6", "arm_r_link7",
+        ]
+        self._arm_contact_sensors: dict[str, ContactSensor] = {}
+        for link_name in _ARM_CONTACT_LINK_NAMES:
+            arm_contact_cfg = ContactSensorCfg(
+                prim_path=f"/World/envs/env_.*/Robot/{link_name}",
+                filter_prim_paths_expr=[
+                    "/World/envs/env_.*/TableBase",
+                    "/World/envs/env_.*/TableTop",
+                ],
+                update_period=0.0,
+                history_length=3,
+                debug_vis=False,
+                track_pose=False,
+                track_air_time=False,
+            )
+            sensor = ContactSensor(arm_contact_cfg)
+            self._arm_contact_sensors[link_name] = sensor
+            self.scene.sensors[f"contact_{link_name}"] = sensor
 
         self.scene.clone_environments(copy_from_source=False)
         self.scene.filter_collisions(global_prim_paths=["/World/ground"])
@@ -258,10 +289,11 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         ], dim=-1)
         # = 89
 
-        # ── Hand obs (289D) — single-agent style (no mass, no lift; 21 MANO + elbow separated) ──
+        # ── Hand obs (295D) — single-agent style (no mass, no lift; 21 MANO + elbow + link7 separated) ──
         hand_obs = torch.cat([
             hand_kpts_pos[:, :21].reshape(B, 63),  # 63  21 MANO kpts world
             hand_kpts_pos[:, 21],                  # 3   right elbow position
+            hand_kpts_pos[:, 22],                  # 3   arm_r_link7 position
             quat_to_6d(wrist_quat_w),       # 6   (6D)
             wrist_linvel,                   # 3
             vs * wrist_angvel,              # 3   (TJ scaled)
@@ -274,6 +306,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             vs * obj_angvel,                # 3
             delta_kpts_world[:, :21].reshape(B, 63),  # 63  21 MANO kpts delta
             delta_kpts_world[:, 21],                  # 3   right elbow delta
+            delta_kpts_world[:, 22],                  # 3   arm_r_link7 delta
             delta_ft_obj.reshape(B, 15),    # 15
             delta_obj_pos,                  # 3
             delta_obj_rot_6d,               # 6   (6D)
@@ -281,15 +314,16 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             prev_action_27,                 # 27
             fingertip_forces,               # 5
         ], dim=-1)
-        # = 289 (21 MANO + elbow separated)
+        # = 295 (21 MANO + elbow + link7 separated)
 
-        # ── Shared state (292D) — non-redundant; hand_obs (289) + delta_wrist_rot (3) ──
+        # ── Shared state (298D) — non-redundant; hand_obs (295) + delta_wrist_rot (3) ──
         self._shared_state = torch.cat([hand_obs, delta_wrist_rot], dim=-1)
 
         if self.cfg.debug_vis:
             ref_wrist_pos = self._ref_wrist_pos[traj, frame] + env_orig
             ref_elbow_pos = self._ref_mano_kpts[traj, frame, 21] + env_orig  # kpt 21 = elbow
-            self._update_debug_vis(ref_ft_pos_next, ft_pos, ref_wrist_pos, ref_elbow_pos)
+            ref_link7_pos = self._ref_mano_kpts[traj, frame, 22] + env_orig  # kpt 22 = arm_r_link7
+            self._update_debug_vis(ref_ft_pos_next, ft_pos, ref_wrist_pos, ref_elbow_pos, ref_link7_pos)
 
         if hasattr(self, "_joint_actions"):
             self._prev_arm_action = self._joint_actions[:, N_f:N_f+N_a].clone()
@@ -298,7 +332,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         return {"arm": arm_obs, "hand": hand_obs}
 
     def _get_states(self) -> torch.Tensor:
-        """Non-redundant centralized critic input (292D), cached in _get_observations."""
+        """Non-redundant centralized critic input (298D), cached in _get_observations."""
         return self._shared_state
 
     # ------------------------------------------------------------------
@@ -315,24 +349,26 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         ft_pos = hand_kpts_pos[:, self._kpt_ft_mano_indices_t, :]
 
         # No physics object → reference keypoints in world frame (no drift compensation).
-        ref_kpts_world = self._ref_mano_kpts[traj, frame] + env_orig.unsqueeze(1)  # (B, 22, 3)
+        ref_kpts_world = self._ref_mano_kpts[traj, frame] + env_orig.unsqueeze(1)  # (B, 23, 3)
         delta_kpts = hand_kpts_pos - ref_kpts_world
-        # 21 MANO kpts Z-weighted for rew_kpts; elbow handled separately.
-        delta_kpts_mano = delta_kpts[:, :21]                              # (B, 21, 3)
-        delta_kpts_mano_w = delta_kpts_mano.clone()
-        delta_kpts_mano_w[:, :, 2] *= 1.5
+        delta_kpts_w = delta_kpts.clone()
+        delta_kpts_w[:, :, 2] *= 1.5                                       # Z-weighted (paper S4.2: gravity emphasis)
+        # 21 MANO kpts Z-weighted for rew_kpts; arm (elbow+link7) handled separately.
+        delta_kpts_mano = delta_kpts[:, :21]                              # (B, 21, 3) MANO kpts only, unweighted
+        delta_kpts_mano_w = delta_kpts_w[:, :21]                          # (B, 21, 3) MANO kpts only, Z-weighted
         kpts_err_w = torch.norm(delta_kpts_mano_w, dim=-1).mean(dim=-1)
         self._last_kpts_err = torch.norm(delta_kpts_mano, dim=-1).mean(dim=-1)
         self._last_kpts_err_raw = self._last_kpts_err.clone()
 
-        # Arm reward signals: wrist (kpt 0) world-frame, Z-weighted
-        delta_wrist_kpt = delta_kpts_mano[:, 0, :].clone()
-        delta_wrist_kpt[:, 2] *= 1.5
-        wrist_pos_err_w = torch.norm(delta_wrist_kpt, dim=-1)
-        wrist_err = torch.norm(delta_kpts_mano[:, 0, :], dim=-1)
+        # Wrist error from keypoint 0 (unweighted): termination + monitoring (TJ-style raw L2).
+        wrist_err = torch.norm(delta_kpts_mano[:, 0, :], dim=-1)          # (B,) unweighted
 
-        # Elbow error (kpt 21, unweighted) — used for rew_elbow_pos.
-        elbow_err = torch.norm(delta_kpts[:, 21, :], dim=-1)
+        # Arm error: mean over wrist (kpt 0) + elbow (kpt 21) + arm_r_link7 (kpt 22).
+        # - `arm_pos_err` (unweighted mean): logged as `Error / arm_pos_m`.
+        # - `arm_err_w`   (Z-weighted mean): used by `rew_arm_pos`.
+        arm_kpt_idx = [0, 21, 22]
+        arm_pos_err = torch.norm(delta_kpts[:, arm_kpt_idx, :], dim=-1).mean(dim=-1)   # (B,)
+        arm_err_w = torch.norm(delta_kpts_w[:, arm_kpt_idx, :], dim=-1).mean(dim=-1)   # (B,) Z-weighted
 
         # Wrist rotation
         wrist_rot_err = torch.zeros(B, device=self.device)
@@ -384,6 +420,13 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         hand_pose_reg = ((jp[:, self._finger_joint_ids] - dp[:, self._finger_joint_ids]) ** 2).sum(dim=-1)
         arm_pose_reg  = ((jp[:, self._arm_r_joint_ids]  - dp[:, self._arm_r_joint_ids])  ** 2).sum(dim=-1)
 
+        # Arm-table contact (anti-cheating, link3..link7). MAX across links → penalty + termination.
+        arm_table_force = self._get_arm_table_force()                                     # (B,) N
+        arm_penalty = (self.cfg.rew_arm_contact * arm_table_force).clamp(
+            min=self.cfg.rew_arm_contact * self.cfg.max_arm_contact_force
+        )                                                                                  # (B,) ≤ 0  (auto-clamped at penalty value at termination threshold)
+        arm_strong_press = arm_table_force > self.cfg.max_arm_contact_force
+        self._last_arm_table_force = arm_table_force                                       # for logging
         # Termination: only wrist + ft (no object). Use ft_err_raw (unweighted, no
         # contact conditioning) so a misbehaving hand pose triggers termination
         # regardless of contact-target switching. Matches SA pretrain L802.
@@ -391,7 +434,7 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         wrist_err_large = wrist_err > self.cfg.max_wrist_pos_err
         wrist_rot_err_large = wrist_rot_err > self.cfg.max_wrist_rot_err
         # elbow termination disabled — elbow is soft guidance only (cfg.max_elbow_pos_err kept for future use)
-        early_terminate = ft_err_large | wrist_err_large | wrist_rot_err_large
+        early_terminate = ft_err_large | wrist_err_large | wrist_rot_err_large | arm_strong_press
         if not self.cfg.termination:
             early_terminate = torch.zeros_like(early_terminate)
         if self.cfg.enable_warmup:
@@ -415,16 +458,16 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         # ── Single team reward (matches single-agent pretrain reward) ────────
         # No obj_pos/rot/force terms (no physics object); strong rew_fingertip
         # (no contact gating to dampen the signal). `rew_kpts` averages 21 MANO
-        # kpts; wrist gets extra emphasis; elbow is a separate soft-guidance term.
+        # kpts; `rew_arm_pos` supervises the 3 arm endpoints (wrist + elbow + link7).
         tracking_penalty = (
-            self.cfg.rew_kpts * kpts_err_w
-            + self.cfg.rew_wrist_pos * wrist_err
-            + self.cfg.rew_elbow_pos * elbow_err
+            self.cfg.rew_kpts * kpts_err_w           # 21 MANO kpts, Z-weighted mean
+            + self.cfg.rew_arm_pos * arm_err_w       # Z-weighted mean of (wrist + elbow + link7) L2
             + self.cfg.rew_fingertip * ft_err
         ).clamp(min=-self.cfg.rew_alive)
         team_reward = (
             self.cfg.rew_alive * alive
             + tracking_penalty
+            + arm_penalty                                       # soft penalty (auto-clamped at rew_arm_contact × max_arm_contact_force)
             + self.cfg.rew_hand_action_reg * hand_action_reg
             + self.cfg.rew_arm_action_reg  * arm_action_reg
             + self.cfg.rew_hand_pose_reg   * hand_pose_reg
@@ -440,13 +483,15 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
             "Error / kpts_mean_m":       torch.norm(delta_kpts_mano, dim=-1).mean(),
             "Error / wrist_pos_m":       wrist_err.mean(),
             "Error / wrist_rot_deg":     torch.rad2deg(wrist_rot_err).mean(),
-            "Error / elbow_pos_m":       elbow_err.mean(),
+            "Error / arm_pos_m":         arm_pos_err.mean(),    # mean over (wrist, elbow, link7); matches reward kpts
             "Error / ft_mean_m":         ft_err.mean(),
+            "Force / arm_table_N":       arm_table_force.mean(),
+            "Force / arm_press_rate":    arm_strong_press.float().mean(),
             "Episode_Reward / alive":            (self.cfg.rew_alive * alive).mean(),
             "Episode_Reward / kpts":             (self.cfg.rew_kpts * kpts_err_w).mean(),
-            "Episode_Reward / wrist_pos":        (self.cfg.rew_wrist_pos * wrist_err).mean(),
-            "Episode_Reward / elbow_pos":        (self.cfg.rew_elbow_pos * elbow_err).mean(),
+            "Episode_Reward / arm_pos":          (self.cfg.rew_arm_pos * arm_err_w).mean(),
             "Episode_Reward / fingertip":        (self.cfg.rew_fingertip * ft_err).mean(),
+            "Episode_Reward / arm_contact":      arm_penalty.mean(),
             "Episode_Reward / hand_action_reg":  (self.cfg.rew_hand_action_reg * hand_action_reg).mean(),
             "Episode_Reward / arm_action_reg":   (self.cfg.rew_arm_action_reg  * arm_action_reg).mean(),
             "Episode_Reward / hand_pose_reg":    (self.cfg.rew_hand_pose_reg   * hand_pose_reg).mean(),
@@ -541,11 +586,15 @@ class RobotisSh5GraspMarlPretrainEnv(RobotisSh5GraspMarlEnv):
         # ── Start frame sampling (with train-style upper_a + upper_b) ─────────
         if self.cfg.adaptive_sampling and self._reached_frame > 0:
             valid_len = min(self._reached_frame + 1, self._max_traj_len)
-            valid_counts = self._failure_count[:valid_len]
-            ur = self.cfg.adaptive_uniform_ratio
-            fail_probs = valid_counts / (valid_counts.sum() + 1e-8)
-            probs = (fail_probs + ur / valid_len) / (1.0 + ur)  # TJ: add uniform then renormalize
-            sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
+            if self.cfg.failure_weighted_sampling:
+                valid_counts = self._failure_count[:valid_len]
+                ur = self.cfg.adaptive_uniform_ratio
+                fail_probs = valid_counts / (valid_counts.sum() + 1e-8)
+                probs = (fail_probs + ur / valid_len) / (1.0 + ur)  # TJ: add uniform then renormalize
+                sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
+            else:
+                # Pure uniform sampling within [0, _reached_frame] — no failure weighting.
+                sampled = torch.randint(0, valid_len, (n,), device=self.device)
             start_frames = (sampled - self._adaptive_back_frames).clamp(min=0)
             upper_a = max(0, self._max_traj_len - self._num_frame_chunk)
             upper_b = max(self._reached_frame - self._adaptive_back_frames, 0)

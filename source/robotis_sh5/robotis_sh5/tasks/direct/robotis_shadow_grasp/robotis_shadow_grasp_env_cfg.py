@@ -1,4 +1,10 @@
-"""Configuration for the OakInk dexterous grasping environment."""
+"""Configuration for the Shadow-Hand-on-Robotis-arm dexterous grasping environment.
+
+Replaces FFW-SH5's native 20-DOF hand with a Shadow Dexterous Hand (24 joints,
+18 actuated; the 4 distal "J0" joints are coupled to "J1" via fixed tendons in
+the USD). Joint/body naming follows the standard Shadow Hand convention
+(`robot0_*`), mounted on the existing `arm_r_link7` of the FFW-SH5 arm.
+"""
 
 from __future__ import annotations
 
@@ -13,16 +19,17 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.utils import configclass
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
-_ROBOT_USD = str(_DATA_DIR / "robots" / "FFW" / "FFW_SH5_simplified_dex_instanced.usd")
+_ROBOT_USD = str(_DATA_DIR / "robots" / "FFW" / "FFW_SH5_shadow_instanced.usd")
 _OAKINK_DATA_DIR = str(_DATA_DIR / "processed" / "oakink")
 _HOCAP_DATA_DIR = str(_DATA_DIR / "processed" / "hocap")
 
 
 ##
-# Full-body FFW-SH5 robot config.
+# Full-body FFW-SH5 + Shadow Hand robot config.
 # fix_root_link=True: robot base is fixed to the ground.
-# Policy controls only finger_r_joint1-20 (20 DOFs).
-# Arm joints are initialized to a pre-grasp pose and held fixed by high stiffness.
+# Policy controls only the Shadow Hand actuated joints (18) + arm_r (7) = 25 DOF
+# (plus 1 mass action). The 4 unactuated distal joints (robot0_FFJ0/MFJ0/RFJ0)
+# are coupled to J1 via tendons in the USD. Left arm/hand remain at zero pose.
 ##
 FFW_SH5_DEX_CFG = ArticulationCfg(
     prim_path="/World/envs/env_.*/Robot",
@@ -65,9 +72,14 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             "arm_r_joint5": -0.609,
             "arm_r_joint6": 0.335,
             "arm_r_joint7": -0.368,
-            # Fingers (both hands, zero = open)
+            # Left fingers (unused, zero — kept from FFW-SH5 base)
             **{f"finger_l_joint{i + 1}": 0.0 for i in range(20)},
-            **{f"finger_r_joint{i + 1}": 0.0 for i in range(20)},
+            # Right hand = Shadow Hand (zero = open, neutral pose)
+            "robot0_FFJ3": 0.0, "robot0_FFJ2": 0.0, "robot0_FFJ1": 0.0, "robot0_FFJ0": 0.0,
+            "robot0_MFJ3": 0.0, "robot0_MFJ2": 0.0, "robot0_MFJ1": 0.0, "robot0_MFJ0": 0.0,
+            "robot0_RFJ3": 0.0, "robot0_RFJ2": 0.0, "robot0_RFJ1": 0.0, "robot0_RFJ0": 0.0,
+            "robot0_LFJ4": 0.0, "robot0_LFJ3": 0.0, "robot0_LFJ2": 0.0, "robot0_LFJ1": 0.0, "robot0_LFJ0": 0.0,
+            "robot0_THJ4": 0.0, "robot0_THJ3": 0.0, "robot0_THJ2": 0.0, "robot0_THJ1": 0.0, "robot0_THJ0": 0.0,
             # Head
             "head_joint1": 0.0,
             "head_joint2": 0.0,
@@ -114,12 +126,39 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             stiffness=200.0,
             damping=25.0  # default: 3.0
         ),
-        "hand": ImplicitActuatorCfg(
-            joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
+        # Left hand: FFW-SH5 native fingers (kept, unused — zero pose)
+        "hand_l": ImplicitActuatorCfg(
+            joint_names_expr=["finger_l_joint.*"],
             velocity_limit_sim=2.2,
-            effort_limit_sim=10,  # 2.0,
+            effort_limit_sim=10,
             stiffness=200.0,
-            damping=5.0,  # default: 1.0
+            damping=5.0,
+        ),
+        # Right hand: Shadow Dexterous Hand (18 actuated DOF, matching TJ's actuated_joint_names).
+        # FFJ0/MFJ0/RFJ0/LFJ0 are tendon-coupled to J1 (not independently actuated) and
+        # therefore excluded from this regex; PhysX absorbs them into the tendon constraint
+        # rather than exposing them as separate articulation DOFs.
+        "shadow_fingers": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "robot0_(FF|MF|RF|LF|TH)J[1-3]",   # J1/J2/J3 for all 5 fingers (15 joints)
+                "robot0_LFJ4",                      # little finger metacarpal (1)
+                "robot0_THJ4",                      # thumb base (1)
+                "robot0_THJ0",                      # thumb distal — independently actuated (1)
+            ],
+            velocity_limit_sim=2.0,
+            effort_limit_sim=10.0,
+            stiffness={
+                "robot0_(FF|MF|RF|LF|TH)J[1-3]": 1.0,
+                "robot0_LFJ4": 1.0,
+                "robot0_THJ4": 1.0,
+                "robot0_THJ0": 1.0,
+            },
+            damping={
+                "robot0_(FF|MF|RF|LF|TH)J[1-3]": 0.1,
+                "robot0_LFJ4": 0.1,
+                "robot0_THJ4": 0.1,
+                "robot0_THJ0": 0.1,
+            },
         ),
         "head": ImplicitActuatorCfg(
             joint_names_expr=["head_joint1", "head_joint2"],
@@ -133,13 +172,15 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
 
 
 @configclass
-class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
-    """Configuration for OakInk dexterous grasping with kinematic reference tracking.
+class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
+    """Configuration for dexterous grasping with Shadow Hand mounted on FFW-SH5 arm.
 
-    Robot: FFW-SH5 full-body (fix_root_link=True).
-    Policy controls: right-hand fingers (20) + right arm (7) = 27 DOF total.
-    Lift joint is excluded from the action and held at `fixed_lift_target` (0.0 = fully up)
-    by the PD controller; lift remains in joint_pos/joint_vel observations for state awareness.
+    Robot: FFW-SH5 full-body with Shadow Dexterous Hand replacing the right hand
+    (fix_root_link=True).
+    Policy controls: Shadow Hand actuated joints (18) + right arm (7) = 25 DOF total.
+    The 4 distal "J0" joints (robot0_FFJ0/MFJ0/RFJ0/LFJ0) are coupled to "J1" via
+    fixed tendons in the USD; the policy only commands the 18 actuated DOFs.
+    Lift joint is excluded from the action and held at `fixed_lift_target` (0.0 = fully up).
     Additional output: 1D normalized object mass parameter (MassDexMimic).
 
     Observation space (total=291):
@@ -169,29 +210,37 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
         mass dim [-1,1] → [object_mass_min, object_mass_max] applied at episode start.
     """
 
-    # Viewer: positioned in front of and to the right of the table, elevated, looking
-    # at the table surface (z=1.0) where the robot hand approaches from behind.
-    # Robot base is at env-local (0.65, 0.60); table top is at (0.3, 0.0, 1.0).
+    # Viewer: front-left/elevated angled view of the table with the robot reaching
+    # in from the back-right. Camera coords are ENV-LOCAL (origin_type="env")
+    # so the camera stays anchored to env 0's contents regardless of num_envs
+    # (default origin_type="world" caused the camera-to-table relationship to
+    # shift when the GridCloner placed env 0 at different world positions for
+    # different num_envs).
+    # Scene layout (env-local):
+    #   Table top center: (0.3, 0.0, 1.0); table extends ±0.3 m in X/Y, height 1.0
+    #   Robot base:       (0.65, 0.65, 0.0); right arm reaches toward the table
     viewer: ViewerCfg = ViewerCfg(
-        eye=(0.2, 0.15, 2.2),
-        lookat=(-0.2, 0.5, 2.0),
+        eye=(-0.4, -0.6, 1.8),       # front-left of the table, elevated
+        lookat=(0.4, 0.2, 1.0),      # table top, slightly biased toward robot side
         resolution=(1280, 720),
+        origin_type="env",
+        env_index=0,
     )
 
     # Simulation
     decimation: int = 4  # control at 30 Hz (120 / 4)
     episode_length_s: float = 5.0
 
-    # DOF counts
-    num_hand_dofs: int = 20   # finger_r_joint1-20
-    num_arm_r_dofs: int = 7   # arm_r_joint1-7
-    num_lift_dofs: int = 1    # lift_joint (NOT in action — held at fixed_lift_target via PD ctrl)
-    action_space: int = 28    # 20(fingers) + 7(arm) + 1(mass); lift excluded
-    # 63+3+3+6+3+3+15+28+28+3+6+3+3+63+3+3+15+3+6+5+27+5 — 21 MANO kpts + elbow + link7
-    # (separated); 6D rot; prev_action=27 joint-only (mass excluded). Matches pretrain for
-    # ckpt transfer. +6 vs prior 291: elbow_pos (already counted) joined by link7_pos (+3)
-    # and delta_link7 (+3).
-    observation_space: int = 297
+    # DOF counts (Shadow Hand: 18 actuated; J0 for FF/MF/RF/LF are tendon-absorbed).
+    num_hand_dofs: int = 18         # actuated Shadow Hand joints (commanded by policy)
+    num_arm_r_dofs: int = 7         # arm_r_joint1-7
+    num_lift_dofs: int = 1          # lift_joint (NOT in action — held at fixed_lift_target via PD ctrl)
+    action_space: int = 26          # 18(shadow fingers) + 7(arm) + 1(mass); lift excluded
+    # Adjusted from the FFW-SH5 297 layout by:
+    #   joint_pos/joint_vel: 28 (sh5) → 26 (shadow 18 actuated + 7 arm + 1 lift)
+    #   prev_action:        27 (sh5) → 25 (shadow 18 + 7, mass excluded)
+    # 21 MANO kpts + elbow + link7 keypoints retained as 23-keypoint reference.
+    observation_space: int = 291
     state_space: int = 0
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
     # Lift target (joint position in radians/meters depending on joint type).
@@ -227,23 +276,25 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Robot
     robot_cfg: ArticulationCfg = FFW_SH5_DEX_CFG
 
-    # Controlled joint name patterns (action order: fingers → arm_r → lift)
-    finger_joint_names: str = "finger_r_joint.*"
+    # Controlled joint name patterns (action order: shadow fingers → arm_r → lift)
+    # 18 actuated Shadow Hand joints (J0 of FF/MF/RF/LF excluded — tendon-coupled).
+    finger_joint_names: str = "robot0_(?:(?:FF|MF|RF|LF|TH)J[1-3]|LFJ4|THJ[04])"
     arm_r_joint_names: str = "arm_r_joint.*"
     lift_joint_name: str = "lift_joint"
 
-    # Actual fingertip body names in FFW_SH5_simplified_dex.usd
-    # Corresponds to: thumb, index, middle, ring, little (in finger order 4,8,12,16,20)
+    # Shadow Hand fingertip bodies (distal links)
+    # Order: thumb, index, middle, ring, little — matches TJ's gr_env_cfg.fingertip_body_names.
     fingertip_body_names: list = [
-        "finger_r_link4",
-        "finger_r_link8",
-        "finger_r_link12",
-        "finger_r_link16",
-        "finger_r_link20",
+        "robot0_thdistal",
+        "robot0_ffdistal",
+        "robot0_mfdistal",
+        "robot0_rfdistal",
+        "robot0_lfdistal",
     ]
 
-    # Right-hand wrist link name (end-effector base)
-    wrist_body_name: str = "hx5_d20_right_base"
+    # Right-hand wrist link name (end-effector base). For Shadow Hand the palm body
+    # acts as the wrist/end-effector anchor — TJ's gr_env uses 'robot0_palm' as root_body.
+    wrist_body_name: str = "robot0_palm"
 
     # Canonical reference XY (env-local) for trajectory orientation alignment.
     # Trajectories are rotated in XY so the reference wrist approaches the object
@@ -321,8 +372,8 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     # Per-step penalty is clamped at `rew_arm_contact × max_arm_contact_force` — the
     # penalty value at the termination threshold, so above-threshold contacts (which
     # would terminate anyway) can't dominate the reward in the same step.
-    rew_arm_contact: float = -0.05               # penalty weight per N of (max) arm-link contact force
-    max_arm_contact_force: float = 10.0          # termination threshold (N): episode ends if max link force exceeds this
+    rew_arm_contact: float = -0.1               # penalty weight per N of (max) arm-link contact force
+    max_arm_contact_force: float = 5.0          # termination threshold (N): episode ends if max link force exceeds this
     # Action/pose regularization (uniform weights across hand and arm).
     # Action layout: [fingers(20) | arm_r(7) | mass(1)]; pose excludes lift (PD-fixed).
     rew_hand_action_reg: float = -0.004

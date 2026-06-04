@@ -1,13 +1,13 @@
-"""OakInk dexterous grasping **pretrain** environment — Isaac Lab Direct RL.
+"""Shadow-Hand-on-Robotis grasping **pretrain** environment — Isaac Lab Direct RL.
 
-Pretrain phase: the object is entirely removed from the physics simulation (paper Sec. 3.3).
+Pretrain phase: the object is entirely removed from the physics simulation.
 The policy learns hand motion tracking (fingertips + wrist) using kinematic reference data.
 All object-related inputs (position, rotation, contact targets) come from the preloaded
 reference trajectory — no physics object exists in the scene. Object tracking rewards are
 excluded; only fingertip and wrist tracking rewards are used.
 
-Once pretrain is complete, the checkpoint transfers to RobotisSh5GraspEnv for full
-dexterous manipulation with real object physics (observation space: 279 → 280D).
+Once pretrain is complete, the checkpoint transfers to RobotisShadowGraspEnv for full
+dexterous manipulation with real object physics.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_conjugate, quat_mul
 
-from .robotis_sh5_grasp_env import _NUM_KPTS
-from .robotis_sh5_grasp_pretrain_env_cfg import RobotisSh5GraspPretrainEnvCfg
+from .robotis_shadow_grasp_env import _NUM_KPTS
+from .robotis_shadow_grasp_pretrain_env_cfg import RobotisShadowGraspPretrainEnvCfg
 
 
 def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
@@ -54,36 +54,38 @@ def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
     a2 = torch.nn.functional.normalize(a2, dim=-1)
     return torch.cat([a1, a2], dim=-1)
 
-# Pretrain state cache dim (no object; 1 reward + 28 jp + 28 jv + 27 smoothed_act = 84).
-_STATE_DIM_PRETRAIN = 84
+# Pretrain state cache dim for Shadow Hand variant:
+#   1 (reward) + 26 (joint_pos: 18 fingers + 7 arm + 1 lift)
+#             + 26 (joint_vel) + 25 (smoothed_action: 18 + 7, no mass) = 78
+_STATE_DIM_PRETRAIN = 78
 
 
-# Local-frame offsets from link origin to actual fingertip contact point.
+# Shadow Hand fingertip offsets (mirrors TJ gr_env.py:204-208 exactly).
 _FINGERTIP_OFFSETS: dict[str, list[float]] = {
-    "finger_r_link4":  [0.0,    0.03975, 0.012],
-    "finger_r_link8":  [0.012,  0.0,     0.02425],
-    "finger_r_link12": [0.012,  0.0,     0.02425],
-    "finger_r_link16": [0.012,  0.0,     0.02425],
-    "finger_r_link20": [0.012,  0.0,     0.02425],
+    "robot0_thdistal": [-0.0085, 0.0,    0.02],
+    "robot0_ffdistal": [ 0.0,   -0.006,  0.0175],
+    "robot0_mfdistal": [ 0.0,   -0.006,  0.0175],
+    "robot0_rfdistal": [ 0.0,   -0.006,  0.0175],
+    "robot0_lfdistal": [ 0.0,   -0.006,  0.0175],
 }
 
-# Pad-outward normals in each fingertip link's LOCAL frame (mirrors train env;
-# identified via scripts/process_dataset/visualize_fingertip_normals.py).
+# Shadow Hand pad-outward normals (mirrors TJ gr_env.py `fingertip_normal` exactly).
+# Projection: force_into_pad = (force_w * -pad_normal_w).sum(-1).clamp_min(0)
 _FINGERTIP_PAD_NORMALS: dict[str, list[float]] = {
-    "finger_r_link4":  [0.0, 0.0, 1.0],   # thumb: +Z (palm-outward)
-    "finger_r_link8":  [1.0, 0.0, 0.0],   # index: +X (palm-outward)
-    "finger_r_link12": [1.0, 0.0, 0.0],
-    "finger_r_link16": [1.0, 0.0, 0.0],
-    "finger_r_link20": [1.0, 0.0, 0.0],
+    "robot0_thdistal": [-1.0, 0.0, 0.0],   # thumb: -X local
+    "robot0_ffdistal": [0.0, -1.0, 0.0],   # index: -Y local
+    "robot0_mfdistal": [0.0, -1.0, 0.0],
+    "robot0_rfdistal": [0.0, -1.0, 0.0],
+    "robot0_lfdistal": [0.0, -1.0, 0.0],
 }
 
 
-class RobotisSh5GraspPretrainEnv(DirectRLEnv):
+class RobotisShadowGraspPretrainEnv(DirectRLEnv):
     """Pretrain environment: track reference hand pose with a frozen (teleported) object."""
 
-    cfg: RobotisSh5GraspPretrainEnvCfg
+    cfg: RobotisShadowGraspPretrainEnvCfg
 
-    def __init__(self, cfg: RobotisSh5GraspPretrainEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: RobotisShadowGraspPretrainEnvCfg, render_mode: str | None = None, **kwargs):
         self._load_reference_trajectories(cfg)
         # Episode length matches train env: chunked to `episode_length_s × action_fps` frames
         # when adaptive_sampling=True (TJ-style 5s chunks); full trajectory in rollout mode.
@@ -103,7 +105,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
     # Data loading  (identical to main grasp env)
     # ------------------------------------------------------------------
 
-    def _load_reference_trajectories(self, cfg: RobotisSh5GraspPretrainEnvCfg) -> None:
+    def _load_reference_trajectories(self, cfg: RobotisShadowGraspPretrainEnvCfg) -> None:
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
         data_dir = _data_root / "mano" / "right"
 
@@ -149,7 +151,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             # 22nd, 23rd keypoints: right elbow + arm_r_link7 from process_arm_pipeline.py
             # (`arm_keypoints.npz` with `elbow_pos`, `link7_pos`). Both saved in the same
             # RAW frame as mano_kpts_right, so they go through canonicalization uniformly.
-            arm_kp_path = path.parent / "arm_keypoints.npz"
+            arm_kp_path = path.parent / "arm_keypoints_shadow.npz"
             if arm_kp_path.exists():
                 arm_kp = np.load(str(arm_kp_path))
                 kp_elbow = arm_kp["elbow_pos"].astype(np.float32).reshape(-1, 1, 3)
@@ -377,7 +379,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # generated by scripts/process_dataset/process_arm_pipeline.py).
         frame0_arm_list = []
         for path in traj_files:
-            ik_path = path.parent / "arm_joint_pos.npy"
+            ik_path = path.parent / "arm_joint_pos_shadow.npy"
             if ik_path.exists():
                 frame0_arm_list.append(np.load(str(ik_path))[0].astype(np.float32))
             else:
@@ -513,8 +515,14 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         if self._wrist_body_id is None:
             print(f"[warn] Wrist body '{self.cfg.wrist_body_name}' not found; wrist rotation tracking disabled.")
 
+        # Static palm→landmark rotation (see train env for derivation).
+        self._palm_to_landmark_quat = torch.tensor(
+            [-0.706025, 0.039103, -0.039103, 0.706025],
+            dtype=torch.float32, device=self.device,
+        )
+
         # Elbow position: arm_r_link3 + URDF joint4 offset (stable across joint4 rotation).
-        from .robotis_sh5_grasp_env import _ELBOW_OFFSET_IN_LINK3_LOCAL
+        from .robotis_shadow_grasp_env import _ELBOW_OFFSET_IN_LINK3_LOCAL
         link3_ids, _ = self.robot.find_bodies("arm_r_link3")
         self._link3_body_id: int | None = link3_ids[0] if link3_ids else None
         if self._link3_body_id is None:
@@ -524,7 +532,7 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         )
 
         # Resolve body IDs for all 16 non-fingertip MANO keypoints
-        from .robotis_sh5_grasp_env import _MANO_NON_FT_BODY_NAMES, _MANO_FT_INDICES
+        from .robotis_shadow_grasp_env import _MANO_NON_FT_BODY_NAMES, _MANO_FT_INDICES
         _kpt_mano_indices, _kpt_body_ids = [], []
         for mano_idx, body_name in _MANO_NON_FT_BODY_NAMES:
             body_ids, _ = self.robot.find_bodies(body_name)
@@ -781,16 +789,17 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             self._frame_idx = new_frame
         # ── END WARMUP ────────────────────────────────────────────────────────
 
-        # EMA smoothing (27 actioned joint dims; lift is NOT in action).
+        # EMA smoothing (25 actioned joint dims for Shadow Hand variant; lift is NOT in action).
         # TJ/rl_games convention: alpha = weight on the new (raw) action.
-        # Split α: hand uses action_smoothing, arm uses arm_action_smoothing (stronger smoothing → less wrist tremor).
+        # Split α: hand uses action_smoothing, arm uses arm_action_smoothing.
         a_h = self.cfg.action_smoothing
         a_a = self.cfg.arm_action_smoothing
-        self._smoothed_actions[:, :20] = a_h * self.actions[:, :20] + (1.0 - a_h) * self._smoothed_actions[:, :20]
-        self._smoothed_actions[:, 20:] = a_a * self.actions[:, 20:] + (1.0 - a_a) * self._smoothed_actions[:, 20:]
+        N_f = self.cfg.num_hand_dofs   # 18 for Shadow Hand
+        self._smoothed_actions[:, :N_f] = a_h * self.actions[:, :N_f] + (1.0 - a_h) * self._smoothed_actions[:, :N_f]
+        self._smoothed_actions[:, N_f:] = a_a * self.actions[:, N_f:] + (1.0 - a_a) * self._smoothed_actions[:, N_f:]
 
     def _apply_action(self) -> None:
-        N_f = self.cfg.num_hand_dofs   # 20
+        N_f = self.cfg.num_hand_dofs   # 18 (Shadow Hand)
         N_a = self.cfg.num_arm_r_dofs  # 7
 
         # Map smoothed actions from [-1, 1] to full joint limit range (action joints only).
@@ -837,8 +846,14 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
             ft_vel = torch.zeros(B, 5, 3, device=self.device)
 
         # Wrist global state: rotation, linear and angular velocity (position in hand_kpts_pos[0])
+        # Convert robot0_palm body quat to HOcap landmark frame for compatibility with
+        # MANO ref (see train env for derivation).
         if self._wrist_body_id is not None:
-            wrist_quat   = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
+            wrist_quat_body = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
+            wrist_quat   = quat_mul(
+                wrist_quat_body,
+                self._palm_to_landmark_quat.unsqueeze(0).expand(B, -1),
+            )
             wrist_linvel = self.robot.data.body_lin_vel_w[:, self._wrist_body_id, :]
             wrist_angvel = self.robot.data.body_ang_vel_w[:, self._wrist_body_id, :]
         else:
@@ -997,10 +1012,15 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         arm_pos_err = torch.norm(delta_kpts[:, arm_kpt_idx, :], dim=-1).mean(dim=-1)   # (B,)
         arm_err_w = torch.norm(delta_kpts_w[:, arm_kpt_idx, :], dim=-1).mean(dim=-1)   # (B,) Z-weighted
 
-        # Wrist rotation (needed for termination check).
+        # Wrist rotation (needed for termination check). Convert robot0_palm body quat
+        # into landmark frame before comparing against ref (landmark) quat.
         wrist_rot_err = torch.zeros(B, device=self.device)
         if self._wrist_body_id is not None:
-            wrist_quat = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
+            wrist_quat_body = self.robot.data.body_quat_w[:, self._wrist_body_id, :]
+            wrist_quat = quat_mul(
+                wrist_quat_body,
+                self._palm_to_landmark_quat.unsqueeze(0).expand(B, -1),
+            )
             ref_wrist_quat = self._ref_wrist_quat[traj, frame]
             q_err = quat_mul(wrist_quat, quat_conjugate(ref_wrist_quat))
             wrist_rot_err = 2.0 * torch.asin(torch.clamp(torch.norm(q_err[:, 1:4], dim=-1), max=1.0))
@@ -1030,10 +1050,12 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
 
         force_rew = self._get_fingertip_forces().sum(dim=-1)
 
-        # Regularization split by region. Action layout (pretrain, no mass):
-        # [fingers(20) | arm_r(7)]. Pose excludes lift (PD-held → contributes noise only).
-        hand_action_reg = (self.actions[:, :20] ** 2).sum(dim=-1)
-        arm_action_reg  = (self.actions[:, 20:27] ** 2).sum(dim=-1)
+        # Regularization split by region. Shadow Hand action layout (pretrain, no mass):
+        # [fingers(18) | arm_r(7)]. Pose excludes lift (PD-held → contributes noise only).
+        N_f = self.cfg.num_hand_dofs   # 18 (Shadow Hand)
+        N_a = self.cfg.num_arm_r_dofs  # 7
+        hand_action_reg = (self.actions[:, :N_f] ** 2).sum(dim=-1)
+        arm_action_reg  = (self.actions[:, N_f:N_f + N_a] ** 2).sum(dim=-1)
         jp = self.robot.data.joint_pos
         dp = self.robot.data.default_joint_pos
         hand_pose_reg = ((jp[:, self._finger_joint_ids] - dp[:, self._finger_joint_ids]) ** 2).sum(dim=-1)
@@ -1264,16 +1286,17 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         traj = self._traj_idx[env_ids]
 
         # ── Robot state restore (state cache when available, else default + IK) ──
-        cached = self._state_cache[start_frames]              # (n, 84)
+        cached = self._state_cache[start_frames]              # (n, _STATE_DIM_PRETRAIN=78)
         has_cache = ~self._init_flg[start_frames]             # (n,) bool
         cache_mask = has_cache.unsqueeze(-1)                  # (n, 1) for broadcasting
 
-        # cached[:, 1:29]   = joint_pos (28)
-        # cached[:, 29:57]  = joint_vel (28)
-        # cached[:, 57:84]  = smoothed_action (27)
-        cached_jp = cached[:, 1:29]
-        cached_jv = cached[:, 29:57]
-        cached_sa = cached[:, 57:84]
+        # Shadow Hand state cache layout:
+        #   cached[:, 1:27]   = joint_pos (26: 18 fingers + 7 arm + 1 lift)
+        #   cached[:, 27:53]  = joint_vel (26)
+        #   cached[:, 53:78]  = smoothed_action (25: 18 + 7, lift held)
+        cached_jp = cached[:, 1:27]
+        cached_jv = cached[:, 27:53]
+        cached_sa = cached[:, 53:78]
 
         default_joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_pos_reset = default_joint_pos.clone()

@@ -32,8 +32,8 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     # ── Agent / space definitions (same shapes as train for ckpt transfer) ───
     possible_agents: list = ["arm", "hand"]
     action_spaces: dict = {"arm": 7, "hand": 20}
-    observation_spaces: dict = {"arm": 89, "hand": 289}   # hand: 21 MANO kpts + elbow_pos (separated)
-    state_space: int = 292   # explicit non-redundant shared state via _get_states() — hand_obs + delta_wrist_rot
+    observation_spaces: dict = {"arm": 89, "hand": 295}   # hand: 21 MANO kpts + elbow_pos + link7_pos (separated)
+    state_space: int = 298   # explicit non-redundant shared state via _get_states() — hand_obs + delta_wrist_rot
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
 
     # ── Viewer ───────────────────────────────────────────────────────────────
@@ -126,15 +126,19 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     # ── Reward weights ───────────────────────────────────────────────────────
     # Canonical MAPPO: single team reward (matches single-agent PRETRAIN cfg —
     # no obj_pos/rot, no force, stronger rew_fingertip). `rew_kpts` averages
-    # over 21 MANO keypoints ONLY (elbow handled separately).
-    rew_alive: float = 1.8
-    rew_kpts: float = -1.76               # mean over 21 MANO kpts (elbow excluded), Z-weighted
-    rew_wrist_pos: float = -1.5           # wrist emphasis
-    rew_elbow_pos: float = -0.3           # elbow guidance (pretrain stronger)
+    # over 21 MANO keypoints (includes wrist as kpt 0). `rew_arm_pos` supervises
+    # the 3 arm endpoints (wrist + elbow + arm_r_link7) under a single weight.
+    rew_alive: float = 1.5
+    rew_kpts: float = -1.76               # mean over 21 MANO kpts, Z-weighted
+    rew_arm_pos: float = -1.0             # mean Z-weighted L2 over (wrist, elbow, link7)
     rew_obj_pos: float = 0.0              # disabled — no object in pretrain
     rew_obj_rot: float = 0.0
-    rew_fingertip: float = -14.5          # boosted to maintain signal after wrist/elbow added
+    rew_fingertip: float = -12.5          # single-agent pretrain weight
     rew_fingertip_force: float = 0.0      # no contact in pretrain
+    # Arm table-contact penalty (anti-cheating: arm_r_link3..link7).
+    # Per-step penalty auto-clamped at `rew_arm_contact × max_arm_contact_force`.
+    rew_arm_contact: float = -0.5               # penalty weight per N of (max) arm-link contact force
+    max_arm_contact_force: float = 1.0          # termination threshold (N): episode ends if max link force exceeds this
     rew_hand_action_reg: float = -0.004
     rew_arm_action_reg: float = -0.004    # uniform with hand
     rew_hand_pose_reg: float = -0.001
@@ -167,6 +171,8 @@ class RobotisSh5GraspMarlPretrainEnvCfg(DirectMARLEnvCfg):
     # ── Adaptive sampling (pretrain — state cache enabled) ────────────────
     # Same semantics as single-agent pretrain.
     adaptive_sampling: bool = True
+    # Pretrain: uniform sampling within [0, _reached_frame] (no failure weighting).
+    failure_weighted_sampling: bool = False
     adaptive_alpha: float = 0.001
-    adaptive_uniform_ratio: float = 0.1
-    adaptive_back_seconds: float = 1.2   # rewind window (s); frames = int(action_fps × this). Matches TJ.
+    adaptive_uniform_ratio: float = 0.1   # unused when failure_weighted_sampling=False
+    adaptive_back_seconds: float = 1.2    # rewind window (s); frames = int(action_fps × this). Matches TJ.

@@ -45,8 +45,8 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     The centralized critic V(s_global) is shared across agents (patched in
     `train_marl.py` via `_share_value_critic`).
 
-    Shared state (centralized critic input): EXPLICIT non-redundant 292D —
-    hand_obs (289D) + delta_wrist_rot (3D). Computed by `_get_states()`. No
+    Shared state (centralized critic input): EXPLICIT non-redundant 298D —
+    hand_obs (295D) + delta_wrist_rot (3D). Computed by `_get_states()`. No
     duplication with arm_obs features (jp_arm ⊂ full_jp, wrist_quat_w shared, etc.).
 
     Coordination is implicit: shared reward + shared critic give both agents
@@ -60,12 +60,12 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
                      + obj_quat_6d(6) + obj_linvel(3) + obj_angvel(3)
                      + delta_wrist_obj(3) + delta_obj_pos(3) + delta_obj_rot_6d(6)
                      + hand_action_slot(20)
-      - hand (289D): 21 MANO kpts (63) + elbow_pos(3) + wrist_quat_6d(6) + wrist_linvel(3)
+      - hand (295D): 21 MANO kpts (63) + elbow_pos(3) + link7_pos(3) + wrist_quat_6d(6) + wrist_linvel(3)
                      + wrist_angvel(3) + ft_vel(15) + jp(27) + jv(27) + obj_pos(3)
                      + obj_quat_6d(6) + obj_linvel(3) + obj_angvel(3) + delta_kpts(63)
-                     + delta_elbow(3) + delta_ft_obj(15) + delta_obj_pos(3) + delta_obj_rot_6d(6)
+                     + delta_elbow(3) + delta_link7(3) + delta_ft_obj(15) + delta_obj_pos(3) + delta_obj_rot_6d(6)
                      + future_contact(5) + prev_action(27, no mass) + ft_forces(5)
-    Shared state (centralized critic): hand_obs (289) + delta_wrist_rot (3) = 292D.
+    Shared state (centralized critic): hand_obs (295) + delta_wrist_rot (3) = 298D.
 
     Action spaces:
       - arm: 7D (arm_r joints), [-1, 1] → [lower, upper] via _scale()
@@ -75,8 +75,8 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     # ── Agent / space definitions ─────────────────────────────────────────────
     possible_agents: list = ["arm", "hand"]
     action_spaces: dict = {"arm": 7, "hand": 20}
-    observation_spaces: dict = {"arm": 89, "hand": 289}   # hand: 21 MANO kpts + elbow_pos (separated)
-    state_space: int = 292   # explicit non-redundant shared state via _get_states() — hand_obs + delta_wrist_rot
+    observation_spaces: dict = {"arm": 89, "hand": 295}   # hand: 21 MANO kpts + elbow_pos + link7_pos (separated)
+    state_space: int = 298   # explicit non-redundant shared state via _get_states() — hand_obs + delta_wrist_rot
     vel_obs_scale: float = 0.2  # TJ: 0.2 — applied to angular velocities and joint velocities
 
     # ── Viewer (identical to single-agent) ────────────────────────────────────
@@ -201,15 +201,21 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
     # ── Reward weights ───────────────────────────────────────────────────────
     # Canonical MAPPO: SINGLE team reward shared across all agents. Identical
     # formula and coefficients to single-agent train cfg. `rew_kpts` averages
-    # over 21 MANO keypoints ONLY (elbow handled separately via `rew_elbow_pos`).
-    rew_alive: float = 1.8
-    rew_kpts: float = -1.76               # mean over 21 MANO kpts (elbow excluded), Z-weighted, world
-    rew_wrist_pos: float = -0.7           # wrist emphasis (~8× per-kpt strength)
-    rew_elbow_pos: float = -0.1           # elbow guidance (≈ per-kpt strength)
-    rew_obj_pos: float = -5.0             # boosted to maintain signal after wrist/elbow added
-    rew_obj_rot: float = -1.2             # boosted
-    rew_fingertip: float = -6.0           # boosted
-    rew_fingertip_force: float = 1.2      # boosted
+    # over 21 MANO keypoints (includes wrist as kpt 0). `rew_arm_pos` supervises
+    # the 3 arm endpoints (wrist + elbow + arm_r_link7) under a single weight.
+    # link7 indirectly constrains wrist orientation (compensates for no rew_wrist_rot).
+    rew_alive: float = 1.5
+    rew_kpts: float = -1.76               # mean over 21 MANO kpts, Z-weighted, world
+    rew_arm_pos: float = -1.0             # mean Z-weighted L2 over (wrist, elbow, link7)
+    rew_obj_pos: float = -4.26            # GR env: 4.26
+    rew_obj_rot: float = -1.0             # GR env: 1.0
+    rew_fingertip: float = -5.2           # GR env: 5.2
+    rew_fingertip_force: float = 1.0      # GR env: 1.125 (slightly different normalization)
+    # Arm table-contact penalty (anti-cheating: arm_r_link3..link7).
+    # Hybrid: soft per-N penalty (auto-clamped at rew_arm_contact × max_arm_contact_force)
+    # + hard termination on strong press. Force used = MAX across the 5 tracked arm links.
+    rew_arm_contact: float = -0.5               # penalty weight per N of (max) arm-link contact force
+    max_arm_contact_force: float = 1.0          # termination threshold (N): episode ends if max link force exceeds this
     rew_hand_action_reg: float = -0.004
     rew_arm_action_reg: float = -0.004    # uniform with hand
     rew_hand_pose_reg: float = -0.001
@@ -234,9 +240,12 @@ class RobotisSh5GraspMarlEnvCfg(DirectMARLEnvCfg):
 
     # ── Adaptive sampling (kept same as single-agent) ────────────────────────
     adaptive_sampling: bool = True
+    # When True: TJ failure-weighted start-frame sampling within [0, _reached_frame].
+    # When False: uniform sampling within [0, _reached_frame] (skips multinomial entirely).
+    failure_weighted_sampling: bool = True
     adaptive_alpha: float = 0.001
-    adaptive_uniform_ratio: float = 0.1
-    adaptive_back_seconds: float = 1.2   # rewind window (s); frames = int(action_fps × this). Matches TJ.
+    adaptive_uniform_ratio: float = 0.1   # unused when failure_weighted_sampling=False
+    adaptive_back_seconds: float = 1.2    # rewind window (s); frames = int(action_fps × this). Matches TJ.
 
     # ── State cache quality thresholds (kept same as single-agent) ───────────
     enough_ft_threshold: float = 0.10

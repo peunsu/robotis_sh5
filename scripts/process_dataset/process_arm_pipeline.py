@@ -5,12 +5,19 @@ For each trajectory under `<dataset>/mano/right/<task>/<data_id>/`:
   2. VPoser-IK (batched, all N frames) → SMPL elbow positions in env frame.
   3. Pink IK per-frame with warm-start (wrist FrameTask + elbow FrameTask soft prior +
      21 MANO keypoint barriers for z ≥ table_height) → robot arm_r joint angles.
+     FK after IK convergence also extracts arm_r_link7 origin position.
   4. Render an mp4 visualization (SMPL mesh + skeleton + robot arm chain per frame).
 
 Outputs written to each trajectory directory:
-    elbow_joint_pos.npy   shape (N, 3) float32  — SMPL elbow per frame (env frame)
-    arm_joint_pos.npy     shape (N, 7) float32  — robot arm_r joint angles per frame
-    vposer_ik_video.mp4                          — visualization
+    arm_keypoints.npz   {elbow_pos: (N,3), link7_pos: (N,3)} float32
+                        — Arm-side reference keypoints in RAW frame (same convention
+                          as `mano_kpts_right`). `elbow_pos` is from SMPL/VPoser fit;
+                          `link7_pos` is the robot's arm_r_link7 origin from IK FK
+                          (the last revolute link before the FIXED wrist mount —
+                          tracking it adds a positional constraint that indirectly
+                          constrains wrist orientation along its local Z axis).
+    arm_joint_pos.npy   shape (N, 7) float32  — robot arm_r joint angles per frame
+    vposer_ik_video.mp4                        — visualization
 
 Run:
     /home/peunsu/anaconda3/envs/env_isaaclab/bin/python scripts/process_dataset/process_arm_pipeline.py \\
@@ -201,7 +208,108 @@ _URDF_PATH = _SCRIPT_DIR / "source" / "robotis_sh5" / "data" / "robots" / "FFW" 
 # Robot landmark frames
 _ROBOT_SHOULDER_FRAME = "arm_r_link1"
 _ROBOT_ELBOW_FRAME    = "arm_r_link4"
-_ROBOT_WRIST_FRAME    = "hx5_d20_right_base"
+_ROBOT_WRIST_FRAME    = "hx5_d20_right_base"   # SH5 default
+
+# Per-robot wrist mount transform (from arm_r_link7 to the wrist body the IK targets).
+#   SH5: hx5_d20_right_base at (0, 0, -0.078) with rpy=[0, π, -π/2] from arm_r_link7
+#   Shadow: robot0_palm at (0, -0.010, -0.112) with R = 180° around X axis (composed
+#           through hx5_d20_right_joint → robot0_WRJ0 in FFW_SH5_shadow_flat.usd)
+_WRIST_MOUNT_TRANSFORMS = {
+    "sh5": {
+        "frame_name": "hx5_d20_right_base",   # already exists in URDF
+        # offset/quat used when registering a virtual frame (unused for sh5 — frame
+        # already exists in URDF; kept for code symmetry).
+        "offset_in_link7": np.array([0.0, 0.0, -0.078], dtype=np.float64),
+        # q wxyz of R(rpy=[0, π, -π/2])
+        "quat_in_link7_wxyz": np.array([0.0, 0.7071068, 0.7071068, 0.0], dtype=np.float64),
+    },
+    "shadow": {
+        "frame_name": "robot0_palm_virtual",   # added at IK setup time
+        # Position: where robot0_palm body sits relative to arm_r_link7 (from
+        # FFW_SH5_shadow_flat.usd composed chain arm_r_link7 → robot0_wrist → robot0_palm).
+        "offset_in_link7": np.array([0.0, -0.010, -0.112], dtype=np.float64),
+        # Rotation: composition R_link7_to_palm × R_palm_to_landmark.
+        # R_link7_to_palm = 180° around X (USD-extracted).
+        # R_palm_to_landmark = static rotation aligning robot0_palm body axes with
+        # the HOcap landmark frame (computed via extract_wrist_rotation on Shadow
+        # Hand knuckle positions at neutral pose; ≈ +90° around palm Z with a small
+        # ~5° tilt from middle finger MCP offset).
+        # Resulting matrix is very close to SH5's R(rpy=[0, π, -π/2]) so the IK
+        # behaves analogously to the sh5 wrist task on robot0_palm.
+        "quat_in_link7_wxyz": np.array(
+            [0.039103, 0.706025, 0.706025, 0.039103], dtype=np.float64
+        ),
+    },
+}
+
+
+# Shadow Hand 21 MANO keypoint SE3 placements relative to arm_r_link7 (at default
+# pose: arm_r_joint7's frame, all Shadow Hand joints at 0). Pre-computed offline by
+# composing USD joint chains from FFW_SH5_shadow_flat.usd. These are registered as
+# OP_FRAMEs in the Pinocchio model so the IK barrier (z-floor) and any kpt-tracking
+# constraints use the ACTUAL Shadow Hand body locations — not the SH5 finger phantoms
+# that would otherwise come from the URDF.
+#
+# Ordering matches MANO 21-keypoint indices:
+#   0  = wrist (palm)
+#   1-4 = thumb (CMC, MCP, DIP, TIP)
+#   5-8 = index (MCP, PIP, DIP, TIP)
+#   9-12 = middle (MCP, PIP, DIP, TIP)
+#   13-16 = ring (MCP, PIP, DIP, TIP)
+#   17-20 = pinky (MCP, PIP, DIP, TIP)
+_SHADOW_KPT_PLACEMENTS: list[tuple[str, np.ndarray, np.ndarray]] = [
+    # name, position (3,), quat_wxyz (4,)
+    ("robot0_palm",         np.array([0.0, -0.010001, -0.112]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_thbase",       np.array([0.034, -0.001001, -0.141]),  np.array([0.0, 0.923956, 0.0, 0.382499])),
+    ("robot0_thmiddle",     np.array([0.060859, -0.001001, -0.167881]), np.array([0.0, 0.923956, 0.0, 0.382499])),
+    ("robot0_thdistal",     np.array([0.083478, -0.001001, -0.190517]), np.array([0.0, 0.923956, 0.0, 0.382499])),
+    ("robot0_thdistal_tip", np.array([0.091602, -0.001001, -0.210673]), np.array([1.0, 0.0, 0.0, 0.0])),
+    ("robot0_ffknuckle",    np.array([0.033, -0.010001, -0.207]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_ffmiddle",     np.array([0.033, -0.010002, -0.252]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_ffdistal",     np.array([0.033, -0.010002, -0.277]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_ffdistal_tip", np.array([0.033, -0.004002, -0.2945]), np.array([1.0, 0.0, 0.0, 0.0])),
+    ("robot0_mfknuckle",    np.array([0.011, -0.010001, -0.211]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_mfmiddle",     np.array([0.011, -0.010002, -0.256]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_mfdistal",     np.array([0.011, -0.010002, -0.281]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_mfdistal_tip", np.array([0.011, -0.004002, -0.2985]), np.array([1.0, 0.0, 0.0, 0.0])),
+    ("robot0_rfknuckle",    np.array([-0.011, -0.010001, -0.207]), np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_rfmiddle",     np.array([-0.011, -0.010002, -0.252]), np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_rfdistal",     np.array([-0.011, -0.010002, -0.277]), np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_rfdistal_tip", np.array([-0.011, -0.004002, -0.2945]),np.array([1.0, 0.0, 0.0, 0.0])),
+    ("robot0_lfknuckle",    np.array([-0.034, -0.010001, -0.2]),   np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_lfmiddle",     np.array([-0.034, -0.010002, -0.245]), np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_lfdistal",     np.array([-0.034, -0.010002, -0.27]),  np.array([0.0, 1.0, 0.0, 0.0])),
+    ("robot0_lfdistal_tip", np.array([-0.034, -0.004002, -0.2875]),np.array([1.0, 0.0, 0.0, 0.0])),
+]
+# Ordered list of 21 kpt frame names (used as barrier targets in shadow IK).
+_SHADOW_KPT_FRAME_NAMES: list[str] = [name for name, _, _ in _SHADOW_KPT_PLACEMENTS]
+
+# URDF fixed-joint transform from wrist (`hx5_d20_right_base`) to its parent `arm_r_link7`.
+# In wrist's LOCAL frame, the arm_r_link7 origin is at [0, 0, -0.078] (derived from
+# `-R(rpy=[0,π,-π/2])^T @ [0,0,-0.078]`, which happens to equal the input by the symmetric
+# form of R^T). This lets us compute the link7 reference position analytically from any
+# wrist pose (position + quaternion) — no IK required.
+_LINK7_OFFSET_IN_WRIST_LOCAL = np.array([0.0, 0.0, -0.078], dtype=np.float64)
+
+
+def _compute_link7_from_wrist(
+    wrist_pos: np.ndarray,         # (N, 3) wrist position in env frame
+    wrist_quat_wxyz: np.ndarray,   # (N, 4) wrist orientation (wxyz) in env frame
+) -> np.ndarray:
+    """Compute arm_r_link7 origin from wrist pose using the fixed URDF transform.
+
+    `link7_pos_env = wrist_pos_env + R(wrist_quat) @ _LINK7_OFFSET_IN_WRIST_LOCAL`.
+    Identical to what IK FK would yield (up to IK convergence residual), but independent
+    of the IK solve — keeps the saved reference consistent with the human side.
+    """
+    wp = np.asarray(wrist_pos, dtype=np.float64)
+    wq = np.asarray(wrist_quat_wxyz, dtype=np.float64)
+    N = wp.shape[0]
+    out = np.zeros((N, 3), dtype=np.float64)
+    for i in range(N):
+        R_w = _quat_wxyz_to_R(wq[i])
+        out[i] = wp[i] + R_w @ _LINK7_OFFSET_IN_WRIST_LOCAL
+    return out
 
 # SMPL-X joint indices
 _R_SHOULDER, _R_ELBOW, _R_WRIST = 17, 19, 21
@@ -270,8 +378,80 @@ def _smpl_right_wrist_world_R(pose_body: torch.Tensor) -> torch.Tensor:
 # Robot anchor (one-time)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _add_shadow_kpt_frames(model: pin.Model) -> list[str]:
+    """Register Shadow Hand 21 MANO keypoint OP_FRAMEs on the Pinocchio model.
+
+    All frames are attached to arm_r_link7's parent joint (arm_r_joint7) with
+    static SE3 placements taken from ``_SHADOW_KPT_PLACEMENTS`` (default-pose
+    body positions computed offline from FFW_SH5_shadow_flat.usd).
+
+    The resulting frames represent Shadow Hand body locations as they appear at
+    runtime in the env, so the IK barrier z-floor and any kpt-tracking
+    constraints actually correspond to the deployed robot — replacing the SH5
+    finger phantoms that come from the URDF.
+
+    Returns: the list of registered frame names (matches MANO 21-kpt ordering).
+    """
+    link7_fid = model.getFrameId("arm_r_link7")
+    link7_frame = model.frames[link7_fid]
+    parent_joint = link7_frame.parent
+    link7_placement = link7_frame.placement
+    for name, t, q_wxyz in _SHADOW_KPT_PLACEMENTS:
+        if model.existFrame(name):
+            continue
+        R_mat = _quat_wxyz_to_R(q_wxyz)
+        offset_se3 = pin.SE3(R_mat, np.asarray(t, dtype=np.float64))
+        # Placement relative to the parent joint = link7_placement * offset.
+        new_placement = link7_placement * offset_se3
+        model.addFrame(
+            pin.Frame(name, parent_joint, link7_fid, new_placement, pin.FrameType.OP_FRAME)
+        )
+    return _SHADOW_KPT_FRAME_NAMES
+
+
+def _add_virtual_wrist_frame(model: pin.Model, robot_kind: str) -> str:
+    """Add a virtual frame to the Pinocchio model representing the wrist mount of
+    the chosen robot variant. Returns the frame name to use for IK.
+
+    For ``sh5``: returns the URDF-defined ``hx5_d20_right_base`` (no-op).
+    For ``shadow``: adds a frame at ``arm_r_link7 + offset`` from
+        ``_WRIST_MOUNT_TRANSFORMS["shadow"]`` and returns its name.
+
+    The virtual frame is attached to ``arm_r_link7``'s joint so it moves
+    rigidly with the arm under inverse kinematics.
+    """
+    transform = _WRIST_MOUNT_TRANSFORMS[robot_kind]
+    frame_name = transform["frame_name"]
+    if model.existFrame(frame_name):
+        return frame_name
+    # Build SE3 placement: position offset + rotation in arm_r_link7 frame
+    R_offset = _quat_wxyz_to_R(transform["quat_in_link7_wxyz"])
+    placement = pin.SE3(R_offset, transform["offset_in_link7"].copy())
+    parent_link7_frame_id = model.getFrameId("arm_r_link7")
+    parent_joint = model.frames[parent_link7_frame_id].parent
+    # Stack on top of arm_r_link7's existing local placement.
+    M_link7 = model.frames[parent_link7_frame_id].placement
+    new_placement = M_link7 * placement
+    new_frame = pin.Frame(
+        frame_name,
+        parent_joint,
+        parent_link7_frame_id,
+        new_placement,
+        pin.FrameType.OP_FRAME,
+    )
+    model.addFrame(new_frame)
+    return frame_name
+
+
 def _compute_robot_anchors() -> tuple[np.ndarray, float, float]:
-    """Return (robot right shoulder in env frame, robot upper-arm length, robot forearm length)."""
+    """Return (robot right shoulder in env frame, upper-arm length, elbow→link7 length).
+
+    The "forearm" length used by bone rescaling is now the elbow→arm_r_link7 distance,
+    NOT elbow→wrist. The wrist (hx5_d20_right_base) is reached afterward by adding a
+    FIXED 7.8cm offset rotated by wrist orientation — this matches the URDF kinematic
+    chain where joints 5/6/7 rotate the elbow→link7 segment and the link7→wrist mount
+    is a rigid attachment.
+    """
     model = pin.buildModelFromUrdf(str(_URDF_PATH))
     data = model.createData()
     q = pin.neutral(model)
@@ -279,11 +459,11 @@ def _compute_robot_anchors() -> tuple[np.ndarray, float, float]:
     pin.updateFramePlacements(model, data)
     sh_base = np.asarray(data.oMf[model.getFrameId(_ROBOT_SHOULDER_FRAME)].translation, dtype=np.float64)
     el_base = np.asarray(data.oMf[model.getFrameId(_ROBOT_ELBOW_FRAME)].translation, dtype=np.float64)
-    wr_base = np.asarray(data.oMf[model.getFrameId(_ROBOT_WRIST_FRAME)].translation, dtype=np.float64)
+    link7_base = np.asarray(data.oMf[model.getFrameId("arm_r_link7")].translation, dtype=np.float64)
     upper_arm = float(np.linalg.norm(el_base - sh_base))
-    forearm = float(np.linalg.norm(wr_base - el_base))
+    forearm_to_link7 = float(np.linalg.norm(link7_base - el_base))   # actual "forearm bone" length
     sh_env = _R_BASE_ENV @ sh_base + _ROBOT_POS_ENV
-    return sh_env, upper_arm, forearm
+    return sh_env, upper_arm, forearm_to_link7
 
 
 
@@ -295,10 +475,14 @@ def _compute_robot_anchors() -> tuple[np.ndarray, float, float]:
 class VPoserPipeline:
     """Holds SMPL-X + VPoser + fitted β; provides batched elbow extraction."""
 
-    def __init__(self, device: torch.device, robot_upper_arm: float, robot_forearm: float):
+    def __init__(self, device: torch.device, robot_upper_arm: float, robot_forearm_to_link7: float):
+        """`robot_forearm_to_link7` is the robot's elbow → arm_r_link7 distance. The
+        wrist (palm mount) is computed by adding a fixed link7→wrist offset rotated by
+        MANO wrist quaternion — see `_rescale_arm` inside `extract_batched`.
+        """
         self.device = device
         self.robot_upper_arm = float(robot_upper_arm)
-        self.robot_forearm = float(robot_forearm)
+        self.robot_forearm_to_link7 = float(robot_forearm_to_link7)
         beta_np = np.load(str(_BETA_PATH)).astype(np.float32)
         self.beta = torch.from_numpy(beta_np).unsqueeze(0).to(device)
 
@@ -324,6 +508,7 @@ class VPoserPipeline:
     def extract_batched(
         self,
         wrist_targets_env: np.ndarray,         # (N, 3)
+        wrist_quats_env: np.ndarray,           # (N, 4) wxyz — MANO wrist orientation in env frame
         mano_kpts_env: np.ndarray,             # (N, 21, 3) MANO 21 hand keypoints in env frame
         shoulder_anchor_env: np.ndarray,       # (3,)
         num_iter: int = 300,
@@ -336,21 +521,27 @@ class VPoserPipeline:
         min_iter: int = 50,
         patience: int = 10,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, np.ndarray]:
-        """VPoser-IK with wrist position + palm-cloud alignment + shoulder anchor.
+        """VPoser-IK with palm position + palm-cloud alignment + shoulder anchor.
 
         VPoser decodes 21 body-pose axis-angles INCLUDING the wrist (joint 20). Wrist
         orientation is driven by 3D palm-cloud alignment (wrist + 5 MCP joints, root-aligned
-        at the wrist) — since this is a Cartesian constraint at natural reaching/grasping
-        poses, it stays inside VPoser's training distribution (AMASS) and fits cleanly.
+        at the wrist) — Cartesian constraint at natural reaching/grasping poses, stays inside
+        VPoser's AMASS distribution.
 
-        Bone rescaling: SMPL FK output's shoulder→elbow→wrist segments are stretched in
-        env frame to robot bone lengths (directions preserved). The rescaled wrist is what
-        gets matched to ``wrist_targets_env`` — this anchors SMPL's elbow on the robot's
-        elbow swivel circle, making the elbow target IK-feasible.
+        Bone rescaling (kinematics-faithful, 2-segment chain):
+          (a) shoulder → elbow → link7 — driven by SMPL elbow/forearm rotation; rescaled to
+              robot's `upper_arm` and `forearm_to_link7` lengths.
+          (b) link7 → wrist (palm) — FIXED 7.8cm mount in wrist's local frame, rotated by
+              MANO wrist orientation (NOT by SMPL elbow rotation). Matches URDF
+              `hx5_d20_right_joint` (fixed type).
+        The optimizer matches `wr_rescaled` = SMPL palm position (end of the 2-segment
+        chain) to MANO wrist target — palm-to-palm correspondence preserved. The mount
+        geometry is decoupled from elbow rotation so the elbow joint isn't forced to
+        absorb wrist-mount displacement.
 
         Returns:
             elbow_envs:           (N, 3) SMPL elbow positions in env frame (robot-rescaled)
-            wrist_pos_residuals:  (N,)   ‖SMPL wrist − wrist target‖ (m)
+            wrist_pos_residuals:  (N,)   ‖SMPL palm − MANO wrist‖ (m)
             palm_residuals:       (N,)   mean ‖SMPL MCP − MANO MCP‖ per frame (m)
             z_traj:               (N, 32) optimized VPoser latents
             pelvis_env:           (3,)   anchored pelvis position in env frame
@@ -367,30 +558,51 @@ class VPoserPipeline:
         pelvis_env = shoulder_anchor_env - self._pelvis_to_shoulder_env
         pelvis_env_t = torch.from_numpy(pelvis_env.astype(np.float32)).to(device)
         wrist_targets_t = torch.from_numpy(wrist_targets_env.astype(np.float32)).to(device)
+        wrist_quats_t = torch.from_numpy(wrist_quats_env.astype(np.float32)).to(device)         # (N, 4) wxyz
         shoulder_anchor_t = torch.from_numpy(shoulder_anchor_env.astype(np.float32)).to(device)
         mano_kpts_t = torch.from_numpy(mano_kpts_env.astype(np.float32)).to(device)    # (N, 21, 3)
 
         mano_palm_rel = mano_kpts_t[:, _MANO_PALM_IDX] - mano_kpts_t[:, _MANO_PALM_IDX[0:1]]
 
         ua_robot = self.robot_upper_arm
-        fa_robot = self.robot_forearm
+        fa_robot = self.robot_forearm_to_link7
+
+        # Pre-compute the world-frame link7→wrist mount vector from MANO wrist quat.
+        # In wrist's local frame, link7 sits at `_LINK7_OFFSET_IN_WRIST_LOCAL` (constant from URDF).
+        # So wrist = link7 + (− R(wrist_quat) @ offset_in_wrist_local) in world frame.
+        # This vector is fixed per frame (does not depend on z).
+        offset_local_t = torch.tensor(
+            _LINK7_OFFSET_IN_WRIST_LOCAL, dtype=torch.float32, device=device
+        )                                                                  # (3,)
+        R_wrist_world = _quat_wxyz_to_R_torch(wrist_quats_t)                # (N, 3, 3)
+        # World-frame displacement from link7 to wrist (palm mount).
+        link7_to_wrist_world = -(R_wrist_world @ offset_local_t)            # (N, 3)
 
         z = torch.zeros(N, self.vp.latentD, device=device, requires_grad=True)
         opt = torch.optim.Adam([z], lr=lr)
 
         def _rescale_arm(J_env_):
-            """Rescale shoulder→elbow→wrist segments to robot bone lengths (directions preserved).
-            Returns (sh, el_rescaled, wr_rescaled), each (N, 3)."""
+            """Two-segment rescaling that matches the physical robot kinematics:
+              (1) shoulder → elbow → link7 — driven by SMPL elbow/forearm rotation,
+                  rescaled to robot's `upper_arm` and `forearm_to_link7` lengths.
+              (2) link7 → wrist (palm) — FIXED 7.8cm mount in wrist's local frame,
+                  rotated by MANO wrist orientation (NOT by SMPL elbow rotation).
+            The chain ends at `wr_new` = SMPL palm position (matched to MANO wrist target).
+            Returns (sh, el_rescaled, link7_rescaled, wr_rescaled), each (N, 3).
+            """
             sh_ = J_env_[:, _R_SHOULDER]
             el_ = J_env_[:, _R_ELBOW]
-            wr_ = J_env_[:, _R_WRIST]
+            wr_smpl_ = J_env_[:, _R_WRIST]
             u_vec = el_ - sh_
             u_len = u_vec.norm(dim=-1, keepdim=True).clamp(min=1e-9)
             el_new = sh_ + u_vec / u_len * ua_robot
-            f_vec = wr_ - el_
+            # Use SMPL forearm direction (elbow → SMPL wrist joint) for the elbow→link7 segment.
+            f_vec = wr_smpl_ - el_
             f_len = f_vec.norm(dim=-1, keepdim=True).clamp(min=1e-9)
-            wr_new = el_new + f_vec / f_len * fa_robot
-            return sh_, el_new, wr_new
+            link7_new = el_new + f_vec / f_len * fa_robot
+            # Palm (wrist body) = link7 + fixed mount vector (constant per frame).
+            wr_new = link7_new + link7_to_wrist_world
+            return sh_, el_new, link7_new, wr_new
 
         prev_loss = float("inf")
         plateau = 0
@@ -401,9 +613,11 @@ class VPoserPipeline:
             J_world_smpl = out.joints                                          # (N, 127, 3)
             J_env = ((J_world_smpl - J_world_smpl[:, 0:1]) @ self.R_smpl_env.T) + pelvis_env_t
 
-            sh_env, el_rescaled, wr_rescaled = _rescale_arm(J_env)
+            sh_env, el_rescaled, link7_rescaled, wr_rescaled = _rescale_arm(J_env)
 
-            # Wrist position loss uses RESCALED wrist (robot bone lengths)
+            # Palm (= SMPL wrist) position matched to MANO wrist target. The two-segment
+            # chain (elbow→link7 driven by SMPL forearm rotation + link7→wrist fixed mount
+            # driven by MANO wrist quat) decouples elbow rotation from the wrist mount.
             wrist_pos_loss = (wr_rescaled - wrist_targets_t).pow(2).sum(-1).mean()
             shoulder_loss = (sh_env - shoulder_anchor_t).pow(2).sum(-1).mean()
 
@@ -445,7 +659,7 @@ class VPoserPipeline:
             out = smpl_b(betas=beta_N, body_pose=pose_body_flat)
             J_world_smpl = out.joints
             J_env = ((J_world_smpl - J_world_smpl[:, 0:1]) @ self.R_smpl_env.T) + pelvis_env_t
-            sh_env, el_rescaled, wr_rescaled = _rescale_arm(J_env)
+            sh_env, el_rescaled, _, wr_rescaled = _rescale_arm(J_env)
             elbow_envs = el_rescaled.cpu().numpy().astype(np.float64)             # robot-bone-rescaled
             wrist_env_np = wr_rescaled.cpu().numpy().astype(np.float64)
             smpl_palm_rel_env = (J_world_smpl[:, _SMPLX_PALM_IDX] - J_world_smpl[:, _SMPLX_PALM_IDX[0:1]]) @ self.R_smpl_env.T
@@ -492,25 +706,38 @@ def _solve_ik_per_frame(
     arm_q_idx: list[int],
     wrist_pos_env_all: np.ndarray,   # (N, 3)
     wrist_quat_env_wxyz_all: np.ndarray,   # (N, 4)
-    elbow_target_env_all: np.ndarray | None,   # (N, 3) or None
+    elbow_target_env_all: np.ndarray | None,   # (N, 3) or None — soft elbow target
+    link7_target_env_all: np.ndarray | None = None,   # (N, 3) or None — soft link7 target
     num_iter: int = 100,
     barrier_gain: float = 10.0,
     barrier_margin: float = 0.0,
     elbow_cost: float = 0.3,
+    link7_cost: float = 0.3,
     dt: float = 1.0 / 60.0,
     solver: str = "quadprog",
     v_tol: float = 1e-3,
+    wrist_frame_name: str = _WRIST_FRAME,   # override for Shadow Hand variant
+    barrier_frame_names: list[str] | None = None,  # override for Shadow Hand variant
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-frame pink IK with warm-start q from previous frame.
 
-    Early termination: stops iterating once ``‖v‖ < v_tol`` (the QP-returned joint velocity
-    is small, i.e. the configuration has converged on the QP optimum). Warm-started frames
-    typically converge in <20 iterations vs the 100-iteration cap.
+    Tasks:
+      - wrist (`hx5_d20_right_base`) HARD: position_cost=1.0, orientation_cost=1.0.
+      - elbow (`arm_r_link4`) SOFT (if provided): position_cost=`elbow_cost` (default 0.3).
+      - link7 (`arm_r_link7`) SOFT (if provided): position_cost=`link7_cost` (default 0.3).
+        Redundant with wrist (link7 = wrist + R(wrist_quat) @ const), but serves as a
+        position-space surrogate for wrist orientation — numerically more stable and
+        explicitly constrains the elbow→link7 forearm direction together with the elbow task.
+      - posture: cost=1e-3 regularization.
+      - 21 MANO-kpt z-floor PositionBarriers (no penetrating the table).
+
+    Early termination: stops iterating once ``‖v‖ < v_tol``. Warm-started frames typically
+    converge in <20 iterations vs the 100-iteration cap.
 
     Returns:
         arm_qs:  (N, 7) robot arm_r joint angles (rad)
-        pos_err: (N,) wrist position error (m) per frame
-        rot_err: (N,) wrist orientation error (rad) per frame
+        pos_err: (N,)   wrist position error (m) per frame
+        rot_err: (N,)   wrist orientation error (rad) per frame
     """
     N = int(wrist_pos_env_all.shape[0])
     table_height = float(_TABLE_SIZE[2])
@@ -524,17 +751,22 @@ def _solve_ik_per_frame(
     pos_errs = np.zeros(N, dtype=np.float64)
     rot_errs = np.zeros(N, dtype=np.float64)
 
-    # Pre-build PositionBarriers once (reused per frame; pure inequality constraint)
+    # Pre-build PositionBarriers once (reused per frame; pure inequality constraint).
+    # For SH5: uses the SH5 finger/MANO link frames added via _resolve_frame_ids.
+    # For Shadow Hand: pass shadow-specific kpt frame names so the z-floor
+    # barrier constrains the ACTUAL Shadow Hand bodies (registered via
+    # _add_shadow_kpt_frames) rather than the SH5 finger phantoms.
     p_min_z = float(table_height + barrier_margin)
+    barrier_names = barrier_frame_names if barrier_frame_names is not None else _KPT_21_FRAME_NAMES
     barriers = [
         PositionBarrier(
             fname, indices=[2], p_min=np.array([p_min_z]),
             gain=barrier_gain, safe_displacement_gain=0.0,
         )
-        for fname in _KPT_21_FRAME_NAMES
+        for fname in barrier_names
     ]
 
-    wrist_frame_id = model.getFrameId(_WRIST_FRAME)
+    wrist_frame_id = model.getFrameId(wrist_frame_name)
 
     for i in range(N):
         target_pos_base, target_quat_base = _env_pose_to_base(
@@ -544,7 +776,7 @@ def _solve_ik_per_frame(
 
         config = pink.Configuration(model, data, q_warm.copy())
 
-        ee_task = FrameTask(_WRIST_FRAME, position_cost=1.0, orientation_cost=1.0)
+        ee_task = FrameTask(wrist_frame_name, position_cost=1.0, orientation_cost=1.0)
         ee_task.set_target(target_SE3)
         posture_task = PostureTask(cost=1e-3)
         posture_task.set_target_from_configuration(config)
@@ -557,6 +789,14 @@ def _solve_ik_per_frame(
             elbow_task = FrameTask("arm_r_link4", position_cost=elbow_cost, orientation_cost=0.0)
             elbow_task.set_target(pin.SE3(np.eye(3), elbow_pos_base))
             tasks.append(elbow_task)
+
+        if link7_target_env_all is not None:
+            link7_pos_base, _ = _env_pose_to_base(
+                link7_target_env_all[i], np.array([1.0, 0.0, 0.0, 0.0])
+            )
+            link7_task = FrameTask("arm_r_link7", position_cost=link7_cost, orientation_cost=0.0)
+            link7_task.set_target(pin.SE3(np.eye(3), link7_pos_base))
+            tasks.append(link7_task)
 
         for _ in range(num_iter):
             try:
@@ -656,27 +896,27 @@ def _render_video(
     smpl_verts_env: np.ndarray,    # (N, 10475, 3)
     smpl_joints_env: np.ndarray,   # (N, 127, 3)
     smpl_faces: np.ndarray,        # (F, 3)
-    wrist_targets_env: np.ndarray, # (N, 3)
-    arm_qs: np.ndarray,            # (N, 7)
-    model: pin.Model,
-    data: pin.Data,
-    arm_q_idx: list[int],
+    wrist_targets_env: np.ndarray, # (N, 3)  MANO wrist target (env reference)
+    arm_qs: np.ndarray,            # (N, 7)  unused now — kept for API compat
+    model: pin.Model,               # unused now — kept for API compat
+    data: pin.Data,                 # unused now — kept for API compat
+    arm_q_idx: list[int],           # unused now — kept for API compat
+    elbow_envs: np.ndarray,        # (N, 3)  rescaled SMPL elbow (env reference)
+    link7_envs: np.ndarray,        # (N, 3)  analytic link7 (env reference)
+    shoulder_env: np.ndarray,      # (3,)    robot shoulder anchor (env, fixed)
     fps: int = 30,
     width: int = 960,
     height: int = 720,
 ) -> None:
     """Render per-frame pyrender scene → mp4 video (true offscreen via EGL).
 
-    Each frame shows:
+    Each frame shows two uniformly-colored chains plus the SMPL body mesh:
       • SMPL body mesh (light gray, semi-transparent)
-      • SMPL right arm chain (red shoulder → green elbow → blue wrist)
-      • Wrist target (yellow sphere)
-      • Robot right arm chain at IK-solved pose (cyan spheres + lines)
+      • PINK   — SMPL skeleton chain (VPoser fit, raw): shoulder → elbow → wrist
+      • YELLOW — Env reference chain (what the env actually tracks):
+                 robot shoulder → rescaled elbow → analytic link7 → MANO wrist
     """
     N = int(smpl_verts_env.shape[0])
-    wrist_frame_id = model.getFrameId(_WRIST_FRAME)
-    sh_frame_id = model.getFrameId(_ROBOT_SHOULDER_FRAME)
-    el_frame_id = model.getFrameId(_ROBOT_ELBOW_FRAME)
 
     # Fixed camera pose (env frame, Z-up)
     cam_T = _build_camera_transform(
@@ -712,39 +952,30 @@ def _render_video(
             body_tm = trimesh.Trimesh(vertices=smpl_verts_env[i], faces=smpl_faces, process=False)
             scene.add(pyrender.Mesh.from_trimesh(body_tm, smooth=True, material=body_material))
 
+            # Two chains, each in a single color:
+            #   (1) SMPL skeleton (VPoser fit, raw)   — PINK
+            #   (2) Env reference chain (what env tracks) — YELLOW
+            SMPL_COLOR = [230, 100, 180, 255]
+            REF_COLOR  = [255, 220,   0, 255]
+
+            # (1) SMPL skeleton (raw VPoser output): shoulder → elbow → wrist
             sm_sh = smpl_joints_env[i, _R_SHOULDER]
             sm_el = smpl_joints_env[i, _R_ELBOW]
             sm_wr = smpl_joints_env[i, _R_WRIST]
-
-            # SMPL right arm chain markers
-            for center, rgba in [
-                (sm_sh, [255, 50,  50,  255]),
-                (sm_el, [50,  255, 50,  255]),
-                (sm_wr, [50,  100, 255, 255]),
-                (wrist_targets_env[i], [255, 230, 0, 255]),
-            ]:
-                scene.add(_pyr_primitive(_make_sphere(center, rgba)))
-            for a, b, col in [
-                (sm_sh, sm_el, [255, 180, 180, 255]),
-                (sm_el, sm_wr, [180, 255, 180, 255]),
-            ]:
-                c = _make_line(a, b, col)
+            for center in (sm_sh, sm_el, sm_wr):
+                scene.add(_pyr_primitive(_make_sphere(center, SMPL_COLOR)))
+            for a, b in [(sm_sh, sm_el), (sm_el, sm_wr)]:
+                c = _make_line(a, b, SMPL_COLOR, radius=0.004)
                 if c is not None:
                     scene.add(_pyr_primitive(c))
 
-            # Robot arm landmarks via pinocchio FK at IK-solved q
-            q = pin.neutral(model)
-            for j in range(7):
-                q[arm_q_idx[j]] = float(arm_qs[i, j])
-            pin.forwardKinematics(model, data, q)
-            pin.updateFramePlacements(model, data)
-            sh_env = _R_BASE_ENV @ np.asarray(data.oMf[sh_frame_id].translation) + _ROBOT_POS_ENV
-            el_env = _R_BASE_ENV @ np.asarray(data.oMf[el_frame_id].translation) + _ROBOT_POS_ENV
-            wr_env = _R_BASE_ENV @ np.asarray(data.oMf[wrist_frame_id].translation) + _ROBOT_POS_ENV
-            for center in (sh_env, el_env, wr_env):
-                scene.add(_pyr_primitive(_make_sphere(center, [50, 220, 220, 255])))
-            for a, b in [(sh_env, el_env), (el_env, wr_env)]:
-                c = _make_line(a, b, [180, 240, 240, 255], radius=0.004)
+            # (2) Env reference chain (the exact positions the env uses for arm tracking):
+            #     robot shoulder (anchor) → rescaled elbow → analytic link7 → MANO wrist
+            ref_pts = [shoulder_env, elbow_envs[i], link7_envs[i], wrist_targets_env[i]]
+            for center in ref_pts:
+                scene.add(_pyr_primitive(_make_sphere(center, REF_COLOR)))
+            for a, b in zip(ref_pts[:-1], ref_pts[1:]):
+                c = _make_line(a, b, REF_COLOR, radius=0.004)
                 if c is not None:
                     scene.add(_pyr_primitive(c))
 
@@ -780,12 +1011,17 @@ def _process_trajectory(
     args: argparse.Namespace,
 ) -> tuple[int, str]:
     """Run the full pipeline for one trajectory. Returns (status_code, message)."""
-    elbow_path = out_dir / "elbow_joint_pos.npy"
-    arm_path = out_dir / "arm_joint_pos.npy"
-    video_path = out_dir / "vposer_ik_video.mp4"
+    # Output: arm_keypoints.npz holds reference positions for arm-side tracking
+    #   - elbow_pos : SMPL elbow position (from VPoser fit) per frame
+    #   - link7_pos : robot arm_r_link7 position from IK FK per frame.
+    # Per-robot variants get a suffix so sh5 and shadow can coexist.
+    suffix = "" if args.robot == "sh5" else f"_{args.robot}"
+    arm_keypoints_path = out_dir / f"arm_keypoints{suffix}.npz"
+    arm_path = out_dir / f"arm_joint_pos{suffix}.npy"
+    video_path = out_dir / f"vposer_ik_video{suffix}.mp4"
 
     # Skip if everything exists and not overwriting
-    if not args.overwrite and elbow_path.exists() and arm_path.exists() and video_path.exists():
+    if not args.overwrite and arm_keypoints_path.exists() and arm_path.exists() and video_path.exists():
         return 0, "skip (all outputs exist)"
 
     # 1. Canonicalize (wrist + MANO 21 keypoints) and capture transform params
@@ -794,10 +1030,10 @@ def _process_trajectory(
         return -1, "canonicalize failed"
     wp_all, wq_all, mano_kpts_canon, canon_offset, canon_angle, canon_pivot = res
 
-    # 2. VPoser elbow extraction (palm cloud alignment)
+    # 2. VPoser elbow extraction (palm-to-palm match via 2-segment chain with fixed wrist mount)
     (elbow_envs, wrist_pos_resids, palm_resids,
      z_traj, pelvis_env) = pipeline.extract_batched(
-        wp_all, mano_kpts_canon, shoulder_env,
+        wp_all, wq_all, mano_kpts_canon, shoulder_env,
         num_iter=args.vposer_iter, lr=args.vposer_lr, z_reg=args.z_reg,
         smooth_reg=args.smooth_reg,
         shoulder_anchor_weight=args.shoulder_anchor_weight,
@@ -806,31 +1042,57 @@ def _process_trajectory(
         min_iter=args.vposer_min_iter,
         patience=args.vposer_patience,
     )
-    # Save elbow in RAW frame (same convention as `mano_kpts_right` in trajectory_keypoints.npz)
-    # so the env's existing canonicalization handles it uniformly with mano_kpts. The VPoser
-    # fit ran in canonical frame, so we invert the canonicalization before saving.
-    elbow_raw = _uncanonicalize_pos(elbow_envs, canon_offset, canon_angle, canon_pivot)
-    np.save(str(elbow_path), elbow_raw.astype(np.float32))
+    # Compute link7 reference analytically from MANO wrist pose using the fixed
+    # URDF wrist→link7 transform. Used as both (a) a soft IK task and (b) the saved
+    # reference position used by the RL env. Both elbow_envs and link7_envs are
+    # human-side references (independent of IK convergence quality).
+    link7_envs = _compute_link7_from_wrist(wp_all, wq_all)
 
-    # 3. Pink IK per-frame
+    # Save elbow + link7 in RAW frame (same convention as `mano_kpts_right` in
+    # trajectory_keypoints.npz) so the env's existing canonicalization handles them
+    # uniformly with mano_kpts. The VPoser/IK steps run in canonical frame; we invert
+    # the canonicalization before saving.
+    elbow_raw = _uncanonicalize_pos(elbow_envs, canon_offset, canon_angle, canon_pivot)
+    link7_raw = _uncanonicalize_pos(link7_envs, canon_offset, canon_angle, canon_pivot)
+
+    # 3. Pink IK per-frame (with elbow + link7 soft targets)
+    wrist_frame_name = _WRIST_MOUNT_TRANSFORMS[args.robot]["frame_name"]
+    # For shadow, use Shadow Hand kpt frames (registered earlier via
+    # _add_shadow_kpt_frames). For sh5, pass None to fall back to default SH5
+    # finger phantom frames.
+    barrier_frame_names = _SHADOW_KPT_FRAME_NAMES if args.robot == "shadow" else None
     arm_qs, pos_errs, rot_errs = _solve_ik_per_frame(
         robot_model, robot_data, arm_q_idx,
         wp_all, wq_all, elbow_envs,
+        link7_target_env_all=link7_envs,
         num_iter=args.ik_iter,
         barrier_gain=args.barrier_gain,
         barrier_margin=args.barrier_margin,
         elbow_cost=args.elbow_cost,
+        link7_cost=args.link7_cost,
         v_tol=args.ik_v_tol,
+        wrist_frame_name=wrist_frame_name,
+        barrier_frame_names=barrier_frame_names,
     )
     np.save(str(arm_path), arm_qs.astype(np.float32))
 
-    # 4. Render video
+    # Save both arm-reference keypoints in one npz file.
+    np.savez(
+        str(arm_keypoints_path),
+        elbow_pos=elbow_raw.astype(np.float32),   # (N, 3)  SMPL elbow (env→raw)
+        link7_pos=link7_raw.astype(np.float32),   # (N, 3)  arm_r_link7 from MANO wrist (env→raw)
+    )
+
+    # 4. Render video (env reference chain + SMPL skeleton, no IK FK overlay).
     smpl_verts_env, smpl_joints_env = pipeline.render_smpl_per_frame(z_traj, pelvis_env)
     _render_video(
         video_path,
         smpl_verts_env, smpl_joints_env, pipeline._smpl_faces,
         wp_all, arm_qs,
         robot_model, robot_data, arm_q_idx,
+        elbow_envs=elbow_envs,
+        link7_envs=link7_envs,
+        shoulder_env=shoulder_env,
         fps=args.fps, width=args.video_w, height=args.video_h,
     )
 
@@ -851,6 +1113,15 @@ def main():
     parser.add_argument("--object_id", type=str, default="")
     parser.add_argument("--task", type=str, default="")
     parser.add_argument("--data_id", type=int, default=-1)
+    parser.add_argument(
+        "--robot", type=str, default="sh5", choices=["sh5", "shadow"],
+        help="Which robot variant to solve IK for. 'sh5' (default) targets the "
+             "URDF body 'hx5_d20_right_base' (FFW-SH5 native wrist). 'shadow' "
+             "registers a virtual frame at the position+orientation of "
+             "robot0_palm relative to arm_r_link7 (extracted from "
+             "FFW_SH5_shadow_flat.usd) and targets that. Output files get a "
+             "'_shadow' suffix to coexist with sh5 outputs.",
+    )
     # VPoser params
     parser.add_argument("--vposer_iter", type=int, default=300)
     parser.add_argument("--vposer_lr", type=float, default=0.05)
@@ -873,6 +1144,11 @@ def main():
     parser.add_argument("--barrier_gain", type=float, default=10.0)
     parser.add_argument("--barrier_margin", type=float, default=0.0)
     parser.add_argument("--elbow_cost", type=float, default=0.3)
+    parser.add_argument("--link7_cost", type=float, default=0.3,
+                        help="Pink FrameTask position_cost for the arm_r_link7 soft target. "
+                             "Redundant with wrist FrameTask (link7 = wrist + R(wrist_quat) @ const) "
+                             "but adds a position-space surrogate that stabilizes wrist-orientation "
+                             "matching and constrains the elbow→link7 forearm direction.")
     # Video params
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--video_w", type=int, default=640)
@@ -885,18 +1161,36 @@ def main():
     device = torch.device(args.device)
     print(f"\n[setup] device={device}")
 
-    print(f"[setup] Loading robot URDF + reducing to arm_r...")
+    print(f"[setup] Loading robot URDF + reducing to arm_r (robot={args.robot})...")
     robot_model, _, arm_q_idx, _ = _build_arm_only_model()
     robot_data = robot_model.createData()
     _ = _resolve_frame_ids(robot_model)   # registers fingertip OP_FRAMES on the model
+    # For shadow variant, register additional OP_FRAMEs:
+    #   (1) virtual wrist frame at arm_r_link7 + offset representing robot0_palm pose
+    #       — IK targets this instead of hx5_d20_right_base
+    #   (2) 21 MANO keypoint frames at Shadow Hand body default-pose locations
+    #       — IK barrier z-floor constrains THESE (not the SH5 finger phantoms)
+    shadow_barrier_frame_names: list[str] | None = None
+    if args.robot == "shadow":
+        wrist_frame_name = _add_virtual_wrist_frame(robot_model, "shadow")
+        shadow_barrier_frame_names = _add_shadow_kpt_frames(robot_model)
+        robot_data = robot_model.createData()   # recreate after model mutation
+        print(f"  registered virtual wrist frame '{wrist_frame_name}' "
+              f"+ {len(shadow_barrier_frame_names)} Shadow Hand kpt frames for IK")
     print(f"  reduced model nq={robot_model.nq}, arm_r idx_q={arm_q_idx}")
 
-    shoulder_env, upper_arm_robot, forearm_robot = _compute_robot_anchors()
+    shoulder_env, upper_arm_robot, forearm_to_link7_robot = _compute_robot_anchors()
     print(f"[setup] Robot right shoulder (env): {shoulder_env}")
-    print(f"[setup] Robot upper_arm = {upper_arm_robot:.4f} m, forearm = {forearm_robot:.4f} m\n")
+    print(f"[setup] Robot upper_arm = {upper_arm_robot:.4f} m, "
+          f"forearm→link7 = {forearm_to_link7_robot:.4f} m  "
+          f"(wrist mount adds fixed 7.8cm via MANO wrist quat)\n")
 
     print(f"[setup] Loading VPoser + SMPL-X + β (arm rescaled to robot bone lengths)...")
-    pipeline = VPoserPipeline(device, robot_upper_arm=upper_arm_robot, robot_forearm=forearm_robot)
+    pipeline = VPoserPipeline(
+        device,
+        robot_upper_arm=upper_arm_robot,
+        robot_forearm_to_link7=forearm_to_link7_robot,
+    )
 
     dataset_dir = _HOCAP_DIR if args.dataset == "hocap" else _OAKINK_DIR
     mano_dir = dataset_dir / "mano" / "right"

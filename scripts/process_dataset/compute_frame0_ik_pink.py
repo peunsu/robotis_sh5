@@ -690,7 +690,7 @@ def main():
     # ── Optional elbow target from VPoser (process_arm_pipeline.py) ──
     parser.add_argument("--use-elbow", action="store_true",
                         help="Add an arm_r_link4 (elbow) FrameTask using per-trajectory targets from "
-                             "`elbow_joint_pos.npy` (pre-computed by process_arm_pipeline.py). "
+                             "`arm_keypoints.npz`['elbow_pos'] (pre-computed by process_arm_pipeline.py). "
                              "Helps regularize null-space toward a human-like elbow position.")
     parser.add_argument("--elbow-cost", type=float, default=0.3,
                         help="position_cost for the elbow FrameTask (lower → soft prior; wrist still wins).")
@@ -753,17 +753,18 @@ def main():
             continue
         wrist_pos_env, wrist_quat_env_wxyz = result
 
-        # Optional: load pre-computed elbow target from VPoser.
-        # `elbow_joint_pos.npy` may be shape (3,) frame-0-only or (N, 3) all-frames;
-        # we always use frame 0 here for the frame-0 IK task.
+        # Optional: load pre-computed elbow target from VPoser/IK pipeline.
+        # New format: `arm_keypoints.npz` with `elbow_pos` (N, 3); we always use
+        # frame 0 here for the frame-0 IK task.
         elbow_target_env = None
         if args.use_elbow:
-            elbow_path = out_dir / "elbow_joint_pos.npy"
-            if elbow_path.exists():
-                arr = np.load(str(elbow_path)).astype(np.float64)
+            arm_kp_path = out_dir / "arm_keypoints.npz"
+            if arm_kp_path.exists():
+                arm_kp = np.load(str(arm_kp_path))
+                arr = arm_kp["elbow_pos"].astype(np.float64)
                 elbow_target_env = arr[0] if arr.ndim == 2 else arr
             else:
-                print(f"{prefix} warn — --use-elbow but {elbow_path.name} missing; skipping elbow task")
+                print(f"{prefix} warn — --use-elbow but {arm_kp_path.name} missing; skipping elbow task")
 
         if args.use_barriers:
             arm_q, pos_err, rot_err, clearance = _solve_ik_with_barriers(
