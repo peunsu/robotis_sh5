@@ -38,6 +38,8 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=True,   # position control; gravity compensation handled by stiffness
+            linear_damping=2.0,
+            angular_damping=4.0,
             max_depenetration_velocity=5.0,
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(
@@ -64,14 +66,16 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             "lift_joint": 0.0,
             # Left arm (unused, zero)
             **{f"arm_l_joint{i + 1}": 0.0 for i in range(7)},
-            # Right arm: pre-grasp pose matching pick_and_place env
-            "arm_r_joint1": 0.0,
-            "arm_r_joint2": -1.162,
-            "arm_r_joint3": 0.291,
-            "arm_r_joint4": -1.876,
-            "arm_r_joint5": -0.609,
-            "arm_r_joint6": 0.335,
-            "arm_r_joint7": -0.368,
+            # Right arm: pre-grasp pose. Frame-0 IK from `arm_joint_pos_shadow.npy[0]`
+            # overrides these during _reset_idx; this spawn pose is used before the
+            # first reset and as a fallback when no IK reference is available.
+            "arm_r_joint1": 0.00,
+            "arm_r_joint2": -1.13,
+            "arm_r_joint3": 0.03,
+            "arm_r_joint4": -2.1,
+            "arm_r_joint5": -1.44,
+            "arm_r_joint6": 0.43,
+            "arm_r_joint7": -0.65,
             # Left fingers (unused, zero — kept from FFW-SH5 base)
             **{f"finger_l_joint{i + 1}": 0.0 for i in range(20)},
             # Right hand = Shadow Hand (zero = open, neutral pose)
@@ -108,31 +112,31 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         "DY_80": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[1-3]", "arm_r_joint[1-3]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=100,  # 61.4,
-            stiffness=600.0,
-            damping=90.0  # default: 30.0
+            effort_limit_sim=61.4,  # 61.4,
+            stiffness=150.0,  # 600.0
+            damping=30.0  # default: 30.0
         ),
         "DY_70": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[4-6]", "arm_r_joint[4-6]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=100,  # 31.7,
-            stiffness=600.0,
-            damping=60.0  # default: 20.0
+            effort_limit_sim=31.7,  # 31.7,
+            stiffness=150.0,  # 600.0
+            damping=20.0  # default: 20.0
         ),
         "DP_42": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint7", "arm_r_joint7"],
             velocity_limit_sim=6.0,
-            effort_limit_sim=100,  # 5.1,
-            stiffness=200.0,
-            damping=25.0  # default: 3.0
+            effort_limit_sim=5.1,  # 5.1,
+            stiffness=30.0,  # 200.0
+            damping=3.0  # default: 3.0
         ),
         # Left hand: FFW-SH5 native fingers (kept, unused — zero pose)
         "hand_l": ImplicitActuatorCfg(
             joint_names_expr=["finger_l_joint.*"],
-            velocity_limit_sim=2.2,
-            effort_limit_sim=10,
-            stiffness=200.0,
-            damping=5.0,
+            velocity_limit_sim=15.0,
+            effort_limit_sim=3.09,
+            stiffness=1.0,  # 500.0
+            damping=0.1,  # 3.0
         ),
         # Right hand: Shadow Dexterous Hand (18 actuated DOF, matching TJ's actuated_joint_names).
         # FFJ0/MFJ0/RFJ0/LFJ0 are tendon-coupled to J1 (not independently actuated) and
@@ -145,8 +149,8 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
                 "robot0_THJ4",                      # thumb base (1)
                 "robot0_THJ0",                      # thumb distal — independently actuated (1)
             ],
-            velocity_limit_sim=2.0,
-            effort_limit_sim=10.0,
+            velocity_limit_sim=15.0,
+            effort_limit_sim=3.09,
             stiffness={
                 "robot0_(FF|MF|RF|LF|TH)J[1-3]": 1.0,
                 "robot0_LFJ4": 1.0,

@@ -687,8 +687,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _data_root = Path(
             env_cfg.hocap_data_dir if env_cfg.dataset == "hocap" else env_cfg.oakink_data_dir
         )
+        # Select output tree by task name — keeps Shadow Hand results separate
+        # from FFW-SH5 native-hand results (mirrors train_sequences_shadow.sh).
+        _robot_tree = "ffw_shadow" if "Shadow" in (args_cli.task or "") else "ffw_sh5"
         _ckpt_dir = (
-            _data_root / "ffw_sh5" / "right"
+            _data_root / _robot_tree / "right"
             / env_cfg.trajectory_task
             / str(env_cfg.trajectory_data_id)
         )

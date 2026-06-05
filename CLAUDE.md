@@ -11,6 +11,12 @@ from the OakInk or HO-Cap dataset onto the robot's right hand and arm. A MARL va
 trained via HAPPO (Kuba et al. 2022): single shared critic + team reward + sequential actor
 updates with recursive advantage M and hand → arm sequential conditioning.
 
+A **Shadow Hand variant** (`Robotis-Shadow-Grasp-Direct-v0`) replaces FFW-SH5's native 20-DOF
+right hand with a Shadow Dexterous Hand (24 joints, 18 actuated) mounted on the same arm. Joint /
+body / reference-keypoint conventions follow TJ's `gr` reference (`/home/peunsu/workspaceTJ/gr`).
+The variant uses a separate set of data assets (`FFW_SH5_shadow_instanced.usd`, `arm_joint_pos_shadow.npy`,
+`arm_keypoints_shadow.npz`) so it can coexist with the native sh5 pipeline.
+
 ## Commands
 
 **Installation** (requires Isaac Lab Python environment):
@@ -48,6 +54,22 @@ python scripts/skrl/train_marl.py --task=Robotis-Sh5-Grasp-Marl-Direct-v0 --num_
 - The MARL task is gated: `--task` must contain `"Marl"` or `train_marl.py` exits.
 - Use `--freeze-arm-from <CKPT>` / `--freeze-hand-from <CKPT>` to load one sub-agent
   from an external ckpt and freeze its parameters (curriculum / sim-to-real workflows).
+
+**Train — Shadow Hand variant:**
+```bash
+# Generate Shadow-Hand-specific arm references first (writes _shadow-suffixed files)
+python scripts/process_dataset/process_arm_pipeline.py --dataset hocap --robot shadow --overwrite
+
+# Pretrain → train
+python scripts/skrl/train.py --task=Robotis-Shadow-Grasp-Pretrain-Direct-v0 --num_envs=4096 --headless \
+    --dataset hocap --object_id G10_1 --trajectory_task subject_1-20231025_170231-G10_1
+python scripts/skrl/train.py --task=Robotis-Shadow-Grasp-Direct-v0 --num_envs=2048 --headless \
+    --dataset hocap --object_id G10_1 --trajectory_task subject_1-20231025_170231-G10_1 \
+    --checkpoint <PRETRAIN_CKPT>
+
+# Per-sequence benchmark (parallel to sh5; results: data/processed/<ds>/ffw_shadow/)
+VIDEO=1 bash scripts/benchmark/hocap/train_sequences_shadow.sh
+```
 
 **Rollout / evaluation:**
 ```bash
@@ -92,9 +114,10 @@ isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap]  
 
 # Full-trajectory arm reference pipeline (PRIMARY entry point).
 # Canonicalize + VPoser SMPL fit with robot-bone rescaling + per-frame pink IK + mp4 visualization.
-# Outputs per trajectory: elbow_joint_pos.npy (N,3), arm_joint_pos.npy (N,7), vposer_ik_video.mp4.
-# The env loads frame-0 arm pose from arm_joint_pos.npy[0] at episode init.
-python scripts/process_dataset/process_arm_pipeline.py --dataset hocap --overwrite
+# Outputs per trajectory: arm_keypoints.npz, arm_joint_pos.npy (N,7), vposer_ik_video.mp4.
+# --robot sh5 (default) targets hx5_d20_right_base; --robot shadow targets a virtual
+# robot0_palm frame registered at the Shadow Hand mount offset, and writes *_shadow.npy/.npz/.mp4.
+python scripts/process_dataset/process_arm_pipeline.py --dataset hocap --robot {sh5|shadow} --overwrite
 
 # (standalone) Frame-0-only arm IK — pink QP on pinocchio. Not used by env/benchmark anymore;
 # kept as a diagnostic / single-frame solver, and provides helpers imported by process_arm_pipeline.
@@ -114,6 +137,8 @@ pre-commit run --all-files
 | `Robotis-Sh5-Grasp-Pretrain-Direct-v0` | 27D | 285D | Kinematic-only pretrain (no physics object) |
 | `Robotis-Sh5-Grasp-Marl-Direct-v0` | dict{arm:7, hand:20} | dict{arm:89, hand:283}, state:286 | HAPPO (single shared critic + team reward + sequential actor updates with recursive M + hand→arm forward conditioning) |
 | `Robotis-Sh5-Grasp-Marl-Pretrain-Direct-v0` | same shapes | same shapes | MARL pretrain (no object) — ckpt shape-compatible with train |
+| `Robotis-Shadow-Grasp-Direct-v0` | 26D | 291D | Same scheme as sh5 but with Shadow Hand (18 actuated fingers + 7 arm + 1 mass). USD: `FFW_SH5_shadow_instanced.usd` |
+| `Robotis-Shadow-Grasp-Pretrain-Direct-v0` | 25D | 291D | Shadow Hand kinematic-only pretrain (no mass) |
 | `Template-Robotis-Sh5-Direct-v0` | — | — | Single-agent direct RL template |
 | `Template-Robotis-Sh5-Marl-Direct-v0` | — | — | Multi-agent variant |
 | `Robotis-SH5-Pick-and-Place-v0` | — | — | Manager-based dexterous manipulation |
@@ -136,6 +161,10 @@ source/robotis_sh5/robotis_sh5/
 │       └── skrl_mappo_cfg.yaml / _pretrain ← MARL HAPPO config (1024×1024×512×512 ELU)
 │                                              (yaml uses skrl's MAPPO class; HAPPO behavior
 │                                              is layered on via patches in train_marl.py)
+├── tasks/direct/robotis_shadow_grasp/  ← Shadow Hand variant (mirrors sh5 grasp, single-agent only)
+│   ├── robotis_shadow_grasp_env.py / _cfg.py             ← train env (action 26D, obs 291D)
+│   ├── robotis_shadow_grasp_pretrain_env.py / _cfg.py    ← pretrain env (action 25D, obs 291D)
+│   └── agents/                                            ← reuses MassDexMimicPolicy + skrl PPO yaml
 ├── tasks/direct/robotis_sh5*/        ← template tasks
 ├── tasks/manager_based/              ← pick-and-place, reach, navigation
 └── data/
@@ -323,15 +352,20 @@ data/processed/<dataset>/              # oakink or hocap
 ├── object_mass.json                   # {object_id: [min_kg, max_kg]}
 ├── mano/right/<task>/<id>/
 │   ├── trajectory_keypoints.npz       # wrist, fingertip, obj poses + mano keypoints
-│   ├── elbow_joint_pos.npy            # (N, 3) SMPL elbow per frame (robot-bone rescaled)
-│   ├── arm_joint_pos.npy              # (N, 7) per-frame arm IK; env uses [0] for frame-0 init
-│   └── vposer_ik_video.mp4            # visualization of SMPL fit + IK
+│   ├── arm_keypoints.npz              # SH5: {elbow_pos, link7_pos}; env uses both as ref
+│   ├── arm_joint_pos.npy              # SH5: (N, 7) per-frame arm IK; env uses [0] for frame-0 init
+│   ├── arm_keypoints_shadow.npz       # Shadow Hand variant: same schema
+│   ├── arm_joint_pos_shadow.npy       # Shadow Hand variant: arm IK targeting robot0_palm
+│   ├── vposer_ik_video.mp4            # SH5 IK visualization
+│   └── vposer_ik_video_shadow.mp4     # Shadow Hand IK visualization
 ├── ffw_sh5/right/<task>/<id>/         # single-agent checkpoints
 │   ├── pretrain.pt
 │   ├── agent.pt
 │   ├── task_info.json
 │   └── evaluation_ep_le_<N>/metrics.csv
-└── ffw_sh5_marl/right/<task>/<id>/    # MARL checkpoints (parallel tree)
+├── ffw_sh5_marl/right/<task>/<id>/    # MARL checkpoints (parallel tree)
+│   └── (same structure)
+└── ffw_shadow/right/<task>/<id>/      # Shadow Hand variant (parallel tree)
     └── (same structure)
 ```
 
@@ -344,16 +378,63 @@ USD variants (in `data/robots/FFW/`):
 - `FFW_SH5_simplified_dex.usd` — used for grasp tasks (enhanced hand collision)
 - `FFW_SH5_simplified.usd` — standard training
 - `FFW_SH5.usd` — full fidelity
+- `FFW_SH5_shadow_instanced.usd` — Shadow Hand replaces right hand (Shadow Hand variant)
+  - Created via: flatten `FFW_SH5_shadow.usd` (remove `/Root` and `/shadow_hand` wrappers, merge
+    joint scopes, remap all relationship paths) → run `make_robot_usd_instanceable.py`
+  - All bodies must live directly under the defaultPrim (e.g. `/FFW_SH5_simplified_dex/<body>`)
+    so Isaac Lab's `ContactSensorCfg` paths like `/World/envs/env_*/Robot/<body>` resolve.
 
 Joint groups:
 - Base: 6 swerve (`*_wheel_drive/steer`)
 - Lift: 1 (`lift_joint`)
 - Arms: 7×2 (`arm_l/r_joint[1-7]`), actuated by DY_80/DY_70/DP-42
-- Hands: 20×2 (`finger_l/r_joint[1-20]`), stiffness=20, damping=0.5
+- Hands (sh5): 20×2 (`finger_l/r_joint[1-20]`), current cfg stiffness=200, damping=5, effort=10
+- Hands (shadow, right only): 22 USD joints (FFJ0-3, MFJ0-3, RFJ0-3, LFJ0-4, THJ0-4); only
+  18 actuated — FFJ0/MFJ0/RFJ0/LFJ0 are tendon-coupled to J1 (absorbed by PhysX). Cfg uses
+  TJ-style PD (stiffness=1.0, damping=0.1) with `effort_limit_sim=10` uniform.
 
 The grasp task fixes the robot base (`fix_root_link=True`) and controls only the right side:
-20 fingers + 7 arm_r + 1 lift. The lift joint is held at `cfg.fixed_lift_target=0.0` by the PD
-controller every step (not part of the action vector in either single-agent or MARL).
+20 fingers (sh5) or 18 fingers (shadow) + 7 arm_r + 1 lift. The lift joint is held at
+`cfg.fixed_lift_target=0.0` by the PD controller every step (not part of the action vector).
+
+### Shadow Hand Variant: Key Mechanics
+
+The Shadow Hand variant lives in `tasks/direct/robotis_shadow_grasp/` and shares the same
+two-phase pretrain → train workflow as sh5. Notable differences:
+
+- **Frame conventions**: HOcap stores `qpos_wrist_right` quat in a LANDMARK frame derived from
+  21 MANO keypoints (z = wrist→middle MCP, x = palm normal). Shadow Hand's `robot0_palm` body
+  frame uses a different axis convention. The env code multiplies `body_quat_w[robot0_palm]`
+  by a static `_palm_to_landmark_quat` ≈ +90° around palm Z + small tilt before comparing to
+  the MANO landmark quat — fix applied both in observation (`wrist_quat_obs`) and in
+  termination-check rotation error (`wrist_rot_err`).
+
+- **IK virtual frame**: `process_arm_pipeline.py --robot shadow` registers a virtual frame
+  `robot0_palm_virtual` on the (still sh5-URDF) Pinocchio model at the static SE3 from
+  `arm_r_link7` to robot0_palm (composed from `FFW_SH5_shadow_flat.usd` joint chain), with the
+  static `R_palm_to_landmark` baked in so the IK target quat is interpreted in landmark frame.
+
+- **IK barriers**: For `--robot shadow`, 21 Shadow Hand MANO-keypoint OP_FRAMEs are registered
+  on the Pinocchio model (from precomputed default-pose offsets in `_SHADOW_KPT_PLACEMENTS`)
+  and used as PositionBarrier targets — replacing the SH5 finger phantom frames. Without this
+  the IK would constrain the WRONG fingers (the URDF's sh5 fingers, not what runs in env).
+
+- **Fingertip offsets / pad normals**: mirror TJ exactly (`gr/source/gr/gr/asset/shadow_hand.py`
+  + `gr/source/gr/gr/tasks/direct/gr/gr_env.py:204-208`). thumb tip offset `[-0.0085, 0, 0.02]`
+  with pad outward `[-1, 0, 0]`; other 4 fingers `[0, -0.006, 0.0175]` with `[0, -1, 0]`.
+  Force projection identical to sh5: `(force * -pad_normal).sum().clamp_min(0)`.
+
+- **Tendon coupling**: actuator regex must match exactly the 18 actuated joints (not all 22)
+  — use `robot0_(FF|MF|RF|LF|TH)J[1-3]` + `LFJ4` + `THJ[04]`. Otherwise Pinocchio reports
+  "actuated joints != joints available" and PhysX silently drops the unmatched ones.
+
+- **State cache dim**: shadow's `_STATE_DIM` (91 for train, 78 for pretrain) replaces sh5's
+  (97 / 84) since num_hand_dofs is 18 vs 20. Slicing offsets in `_reset_idx` and the
+  EMA-smoothing finger/arm splits use `cfg.num_hand_dofs` (no longer hardcoded `:20`).
+
+- **Viewer**: both shadow cfgs use `origin_type="env"`, `env_index=0` so camera coords are
+  env-local and the framing is stable regardless of `num_envs` (default `"world"` made the
+  GridCloner shift env 0's world position with grid size).
 
 ## Key Config Fields
 
@@ -393,6 +474,15 @@ controller every step (not part of the action vector in either single-agent or M
 - **delta_wrist_rot quaternion sign**: canonicalized via `where(q_err.w < 0, -q_err, q_err)`
   to avoid double-cover discontinuity in `delta_wrist_rot` obs (was causing wrist tremor before
   the fix; single-agent's `quat_error_magnitude` is sign-invariant so single-agent didn't show this).
+- **Shadow Hand wrist quat conversion is REQUIRED**: env code must apply `_palm_to_landmark_quat`
+  before comparing `robot0_palm` body quat to MANO ref. Skipping this adds a constant ~90°
+  offset to `wrist_rot_err` and instantly trips `max_wrist_rot_err` termination at frame 0.
+- **Shadow USD layout matters**: defaultPrim must be a root-level prim (not nested). Bodies
+  must live directly under `/<defaultPrim>/<body>` — Isaac Lab `ContactSensorCfg.prim_path`
+  uses pattern `/World/envs/env_*/Robot/<body>` and won't find bodies under sub-prim wrappers.
+- **Per-robot output files**: `process_arm_pipeline.py --robot shadow` writes `*_shadow.npy`
+  / `*_shadow.npz` / `*_shadow.mp4` so sh5 and shadow references coexist. The Shadow env
+  loads the `_shadow`-suffixed files at trajectory load time.
 
 ## Code Style
 

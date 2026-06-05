@@ -535,8 +535,10 @@ class RobotisShadowGraspEnv(DirectRLEnv):
                     disable_gravity=False,
                 ),
                 mass_props=sim_utils.MassPropertiesCfg(mass=cfg.object_mass),
-                # collision_props omitted: geometry is an instanced prim in the USD,
-                # so Isaac Lab cannot override it here — collision is defined in the USD itself.
+                # Object's collision offsets are BAKED into visual.usd by
+                # `scripts/process_dataset/convert_obj_to_usd.py`. Isaac Lab's
+                # spawn-time collision_props override is a no-op on instanced prims,
+                # so the values have to live in the USD itself.
                 activate_contact_sensors=True,
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
