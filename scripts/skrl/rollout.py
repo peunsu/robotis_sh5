@@ -199,11 +199,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy = runner.agent.models["policy"]
     policy.eval()
 
-    # IMPORTANT: skrl PPO normalizes observations via _state_preprocessor before
+    # IMPORTANT: skrl PPO normalizes observations via _observation_preprocessor before
     # passing them to the policy network (RunningStandardScaler with stats learned
     # during training). We must apply the same normalization here — otherwise the
     # policy sees raw observations far outside its training distribution.
-    state_preprocessor = runner.agent._state_preprocessor
+    # (skrl 2.0.0 split obs/state preprocessors; the POLICY input uses observations.)
+    observation_preprocessor = runner.agent._observation_preprocessor
 
     device = runner.agent.device
     actual_env = env.unwrapped  # RobotisSh5GraspEnv
@@ -231,8 +232,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     for _step in range(args_cli.max_steps):
         with torch.no_grad():
-            obs_norm = state_preprocessor(obs)   # apply training-time normalization stats
-            actions, _, outputs = policy.act({"states": obs_norm}, "policy")
+            obs_norm = observation_preprocessor(obs)   # apply training-time normalization stats
+            actions, outputs = policy.act({"observations": obs_norm}, role="policy")
             # Default: deterministic (use policy mean). Pass --stochastic to sample.
             if not args_cli.stochastic:
                 actions = outputs.get("mean_actions", actions)

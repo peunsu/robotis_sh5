@@ -79,8 +79,18 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         network=None,
         **kwargs,  # absorb 'class', 'output', and any future YAML fields
     ):
-        Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
+        # skrl 2.0.0: Model.__init__ is keyword-only and adds state_space.
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        # skrl 2.0.0: GaussianMixin.__init__ is keyword-only; reduction="sum" so log_prob
+        # is summed over action dims → shape (B, 1) as PPO expects.
+        GaussianMixin.__init__(
+            self,
+            clip_actions=clip_actions,
+            clip_log_std=clip_log_std,
+            min_log_std=min_log_std,
+            max_log_std=max_log_std,
+            reduction="sum",
+        )
 
         obs_size = observation_space.shape[0]
         act_size = action_space.shape[0]  # 28 (27 joints + 1 mass)
@@ -173,8 +183,9 @@ class MassDexMimicPolicy(GaussianMixin, Model):
             self._prev_terminated = torch.ones(num_envs, device=device, dtype=torch.bool)
 
     def _clamp_log_std(self, x: torch.Tensor) -> torch.Tensor:
+        # skrl 2.0.0 renamed _g_log_std_min/_max → _g_min_log_std/_g_max_log_std.
         if self._g_clip_log_std:
-            return torch.clamp(x, self._g_log_std_min, self._g_log_std_max)
+            return torch.clamp(x, self._g_min_log_std, self._g_max_log_std)
         return x
 
     def update_mass_terminated(self, terminated: torch.Tensor) -> None:
@@ -189,11 +200,11 @@ class MassDexMimicPolicy(GaussianMixin, Model):
     # GaussianMixin interface
     # ------------------------------------------------------------------
 
-    def get_entropy(self, role=""):
+    def get_entropy(self, *, role=""):
         """Entropy over joint dims only — mass dim excluded (matches GR models.py [:,1:])."""
         if self._g_distribution is not None:
             return self._g_distribution.entropy()[..., :-1].sum(dim=-1)
-        return super().get_entropy(role)
+        return super().get_entropy(role=role)
 
     def compute(self, inputs, role):
         """Called by GaussianMixin.act() during PPO training updates.
@@ -203,8 +214,8 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         Training uses CURRENT global mu_mass / log_std_mass (no per-env cache replacement),
         which makes the PPO ratio for mass non-trivial vs. the rollout old log_prob.
         """
-        B = inputs["states"].shape[0]
-        net_out = self.net_container(inputs["states"])  # (B, 27)
+        B = inputs["observations"].shape[0]
+        net_out = self.net_container(inputs["observations"])  # (B, 27)
 
         # Assemble 28D mean: [joint_mean(27) | mu_mass(1)]
         mean = torch.cat([net_out, self.mu_mass.expand(B, 1)], dim=-1)  # (B, 28)
@@ -212,11 +223,12 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         # Per-dim log-std: joint dims from log_std_parameter (27D), mass from log_std_mass.
         log_std_j = self.log_std_parameter.expand(B, -1)  # (B, 27)
         log_std_m = self.log_std_mass.expand(B, 1)        # (B, 1)
-        log_std = torch.cat([log_std_j, log_std_m], dim=-1)  # (B, 29)
+        log_std = torch.cat([log_std_j, log_std_m], dim=-1)  # (B, 28)
 
-        return mean, log_std, {}
+        # skrl 2.0.0: compute returns (mean_actions, outputs_dict) — log_std under "log_std".
+        return mean, {"log_std": log_std}
 
-    def act(self, inputs, role):
+    def act(self, inputs, *, role=""):
         """Override: fix mass within rollout episodes; delegate training to parent.
 
         Rollout log_prob for mass uses PER-ENV EPISODE-START cached mu and log_std
@@ -226,11 +238,11 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         """
         # Training: GaussianMixin evaluates log_prob(taken_actions | current global params).
         if "taken_actions" in inputs:
-            return super().act(inputs, role)
+            return super().act(inputs, role=role)
 
         # Rollout: fix mass per episode
-        B = inputs["states"].shape[0]
-        device = inputs["states"].device
+        B = inputs["observations"].shape[0]
+        device = inputs["observations"].device
         self._ensure_cache(B, device)
 
         # For envs that just ended their episode: resample mass action and update the
@@ -256,7 +268,7 @@ class MassDexMimicPolicy(GaussianMixin, Model):
             self._cache_log_std_mass[done] = lsm_val
 
         # Network forward: outputs joint dims only (27D — lift excluded).
-        net_out = self.net_container(inputs["states"])  # (B, 27)
+        net_out = self.net_container(inputs["observations"])  # (B, 27)
         joint_mean = net_out                            # (B, 27)
 
         log_std_j = self._clamp_log_std(self.log_std_parameter)  # (27,)
@@ -278,15 +290,15 @@ class MassDexMimicPolicy(GaussianMixin, Model):
         log_prob_m = dist_m.log_prob(mass_action)       # (B,)
         log_prob = (log_prob_j.sum(dim=-1) + log_prob_m).unsqueeze(-1)  # (B, 1)
 
-        # Update GaussianMixin internals for get_entropy() / get_log_std().
+        # Update GaussianMixin internals for get_entropy() / distribution().
+        # (skrl 2.0.0 no longer tracks _g_log_std / _g_num_samples.)
         log_std_m_curr = self._clamp_log_std(self.log_std_mass)
         mean_all = torch.cat([joint_mean, self.mu_mass.expand(B, 1)], dim=-1)
         log_std_all = torch.cat([log_std_j.expand(B, -1), log_std_m_curr.expand(B, 1)], dim=-1)
         self._g_distribution = Normal(mean_all, log_std_all.exp())
-        self._g_log_std = log_std_all
-        self._g_num_samples = B
 
-        return actions, log_prob, {"mean_actions": mean_all}
+        # skrl 2.0.0: act returns (actions, outputs_dict) — log_prob/mean under outputs.
+        return actions, {"log_prob": log_prob, "mean_actions": mean_all, "log_std": log_std_all}
 
     # ------------------------------------------------------------------
     # Optimizer group helpers

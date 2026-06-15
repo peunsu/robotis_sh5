@@ -203,21 +203,25 @@ def _patch_mass_policy(agent, policy_cfg: dict, learning_rate: float) -> None:
     )
     agent.checkpoint_modules["optimizer"] = agent.optimizer
 
-    # Rebuild LR scheduler if configured.
-    if agent._learning_rate_scheduler is not None:
-        agent.scheduler = agent._learning_rate_scheduler(
-            agent.optimizer, **agent.cfg["learning_rate_scheduler_kwargs"]
+    # Rebuild LR scheduler if configured. skrl 2.0.0: cfg is a dataclass and
+    # learning_rate_scheduler / _kwargs are stored as single-element lists.
+    if agent.cfg.learning_rate_scheduler[0] is not None:
+        agent.scheduler = agent.cfg.learning_rate_scheduler[0](
+            agent.optimizer, **agent.cfg.learning_rate_scheduler_kwargs[0]
         )
 
     # Monkey-patch record_transition to propagate terminated signal to the mass cache.
+    # skrl 2.0.0: record_transition is keyword-only and adds observations/next_observations.
     _orig_record = agent.record_transition
 
-    def _record_with_mass(states, actions, rewards, next_states, terminated, truncated,
-                          infos, timestep, timesteps):
+    def _record_with_mass(*, observations, states, actions, rewards, next_observations,
+                          next_states, terminated, truncated, infos, timestep, timesteps):
         done = (terminated | truncated).squeeze(-1)
         new_policy.update_mass_terminated(done)
-        _orig_record(states, actions, rewards, next_states, terminated, truncated,
-                     infos, timestep, timesteps)
+        _orig_record(observations=observations, states=states, actions=actions, rewards=rewards,
+                     next_observations=next_observations, next_states=next_states,
+                     terminated=terminated, truncated=truncated, infos=infos,
+                     timestep=timestep, timesteps=timesteps)
 
     agent.record_transition = _record_with_mass
 
@@ -234,10 +238,12 @@ def _patch_env_info_log(agent) -> None:
     """
     _orig_record = agent.record_transition
 
-    def _record_with_env_log(states, actions, rewards, next_states, terminated, truncated,
-                             infos, timestep, timesteps):
-        _orig_record(states, actions, rewards, next_states, terminated, truncated,
-                     infos, timestep, timesteps)
+    def _record_with_env_log(*, observations, states, actions, rewards, next_observations,
+                             next_states, terminated, truncated, infos, timestep, timesteps):
+        _orig_record(observations=observations, states=states, actions=actions, rewards=rewards,
+                     next_observations=next_observations, next_states=next_states,
+                     terminated=terminated, truncated=truncated, infos=infos,
+                     timestep=timestep, timesteps=timesteps)
         log_dict = infos.get("log") if isinstance(infos, dict) else None
         if log_dict:
             for k, v in log_dict.items():
@@ -267,18 +273,24 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
     import torch.nn.functional as F
     from skrl import config
     from skrl.resources.schedulers.torch import KLAdaptiveLR
+    from skrl.agents.torch.ppo.ppo import compute_gae
 
     # ── Step 1: Add sigma_grad_flg tensor to rollout memory ───────────────────
+    # agent.init() (called by the trainer inside Runner.__init__) already created the
+    # standard tensors and populated _tensors_names, so this append is safe here.
     agent.memory.create_tensor(name="sigma_grad_flg", size=1, dtype=torch.float32)
     agent._tensors_names.append("sigma_grad_flg")
 
     # ── Step 2: Store sigma_grad_flg at each rollout step ─────────────────────
+    # skrl 2.0.0: record_transition is keyword-only and adds observations/next_observations.
     _orig_record = agent.record_transition
 
-    def _record_with_sigma(states, actions, rewards, next_states, terminated, truncated,
-                           infos, timestep, timesteps):
-        _orig_record(states, actions, rewards, next_states, terminated, truncated,
-                     infos, timestep, timesteps)
+    def _record_with_sigma(*, observations, states, actions, rewards, next_observations,
+                           next_states, terminated, truncated, infos, timestep, timesteps):
+        _orig_record(observations=observations, states=states, actions=actions, rewards=rewards,
+                     next_observations=next_observations, next_states=next_states,
+                     terminated=terminated, truncated=truncated, infos=infos,
+                     timestep=timestep, timesteps=timesteps)
         # Write is_reached_end into the slot just committed by add_samples.
         # add_samples increments memory_index after writing, so the written slot is index-1.
         prev_idx = (agent.memory.memory_index - 1) % agent.memory.memory_size
@@ -287,61 +299,51 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
 
     agent.record_transition = _record_with_sigma
 
-    # ── Step 3: Replace _update with per-mini-batch entropy weighting ─────────
-    def _update_with_per_batch_entropy(timestep: int, timesteps: int) -> None:
-
-        def compute_gae(rewards, dones, values, next_values,
-                        discount_factor=0.99, lambda_coefficient=0.95):
-            advantage = 0
-            advantages = torch.zeros_like(rewards)
-            not_dones = dones.logical_not()
-            memory_size = rewards.shape[0]
-            for i in reversed(range(memory_size)):
-                next_v = values[i + 1] if i < memory_size - 1 else next_values
-                advantage = (
-                    rewards[i]
-                    - values[i]
-                    + discount_factor * not_dones[i] * (next_v + lambda_coefficient * advantage)
-                )
-                advantages[i] = advantage
-            returns = advantages + values
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            return returns, advantages
-
-        with torch.no_grad(), torch.autocast(device_type=agent._device_type, enabled=agent._mixed_precision):
-            agent.value.train(False)
-            last_values, _, _ = agent.value.act(
-                {"states": agent._state_preprocessor(agent._current_next_states.float())}, role="value"
-            )
-            agent.value.train(True)
+    # ── Step 3: Replace update() with per-mini-batch entropy weighting ────────
+    # Mirrors skrl 2.0.0 PPO.update() exactly, injecting ONLY the GR sigma-weighted
+    # entropy scale. NOTE vs the old (1.4.3) patch: GAE now uses `terminated` alone
+    # (not terminated|truncated) — this is the 2.0.0 truncation-bootstrap fix, and the
+    # builtin compute_gae already normalizes advantages.
+    def _update_with_per_batch_entropy(*, timestep: int, timesteps: int) -> None:
+        with torch.no_grad(), torch.autocast(device_type=agent._device_type, enabled=agent.cfg.mixed_precision):
+            inputs = {
+                "observations": agent._observation_preprocessor(agent._current_next_observations),
+                "states": agent._state_preprocessor(agent._current_next_states),
+            }
+            agent.value.enable_training_mode(False)
+            last_values, _ = agent.value.act(inputs, role="value")
+            agent.value.enable_training_mode(True)
             last_values = agent._value_preprocessor(last_values, inverse=True)
 
         values = agent.memory.get_tensor_by_name("values")
+        # skrl 2.1.0: compute_gae adds `truncated` + `time_limit_bootstrap` and renames
+        # next_values → last_values. With time_limit_bootstrap=False, GAE uses `terminated`
+        # alone (unchanged from our 2.0.0 mirror).
         returns, advantages = compute_gae(
             rewards=agent.memory.get_tensor_by_name("rewards"),
-            dones=(agent.memory.get_tensor_by_name("terminated")
-                   | agent.memory.get_tensor_by_name("truncated")),
+            terminated=agent.memory.get_tensor_by_name("terminated"),
+            truncated=agent.memory.get_tensor_by_name("truncated"),
             values=values,
-            next_values=last_values,
-            discount_factor=agent._discount_factor,
-            lambda_coefficient=agent._lambda,
+            last_values=last_values,
+            discount_factor=agent.cfg.discount_factor,
+            lambda_coefficient=agent.cfg.gae_lambda,
+            time_limit_bootstrap=agent.cfg.time_limit_bootstrap,
         )
         agent.memory.set_tensor_by_name("values", agent._value_preprocessor(values, train=True))
         agent.memory.set_tensor_by_name("returns", agent._value_preprocessor(returns, train=True))
         agent.memory.set_tensor_by_name("advantages", advantages)
 
-        sampled_batches = agent.memory.sample_all(
-            names=agent._tensors_names, mini_batches=agent._mini_batches
-        )
-
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
 
-        for epoch in range(agent._learning_epochs):
+        for epoch in range(agent.cfg.learning_epochs):
             kl_divergences = []
 
+            # skrl 2.1.0: re-sample mini-batches each epoch (per-epoch shuffling) via
+            # memory.sample(...) instead of a single pre-loop sample_all(...).
             for (
+                sampled_observations,
                 sampled_states,
                 sampled_actions,
                 sampled_log_prob,
@@ -349,22 +351,28 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
                 sampled_returns,
                 sampled_advantages,
                 sampled_sigma,          # sigma_grad_flg: (mini_batch_size, 1)
-            ) in sampled_batches:
+            ) in agent.memory.sample(
+                names=agent._tensors_names,
+                batch_size=len(agent.memory),
+                mini_batches=agent.cfg.mini_batches,
+            ):
 
-                with torch.autocast(device_type=agent._device_type, enabled=agent._mixed_precision):
+                with torch.autocast(device_type=agent._device_type, enabled=agent.cfg.mixed_precision):
 
-                    sampled_states = agent._state_preprocessor(sampled_states, train=not epoch)
+                    inputs = {
+                        "observations": agent._observation_preprocessor(sampled_observations, train=not epoch),
+                        "states": agent._state_preprocessor(sampled_states, train=not epoch),
+                    }
 
-                    _, next_log_prob, _ = agent.policy.act(
-                        {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
-                    )
+                    _, outputs = agent.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
+                    next_log_prob = outputs["log_prob"]
 
                     with torch.no_grad():
                         ratio = next_log_prob - sampled_log_prob
                         kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
                         kl_divergences.append(kl_divergence)
 
-                    if agent._kl_threshold and kl_divergence > agent._kl_threshold:
+                    if agent.cfg.kl_threshold and kl_divergence > agent.cfg.kl_threshold:
                         break
 
                     # ── GR-faithful per-mini-batch entropy weight ──────────
@@ -375,17 +383,17 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
                     ratio = torch.exp(next_log_prob - sampled_log_prob)
                     surrogate = sampled_advantages * ratio
                     surrogate_clipped = sampled_advantages * torch.clip(
-                        ratio, 1.0 - agent._ratio_clip, 1.0 + agent._ratio_clip
+                        ratio, 1.0 - agent.cfg.ratio_clip, 1.0 + agent.cfg.ratio_clip
                     )
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
-                    predicted_values, _, _ = agent.value.act({"states": sampled_states}, role="value")
-                    if agent._clip_predicted_values:
+                    predicted_values, _ = agent.value.act(inputs, role="value")
+                    if agent.cfg.value_clip > 0:
                         predicted_values = sampled_values + torch.clip(
                             predicted_values - sampled_values,
-                            min=-agent._value_clip, max=agent._value_clip,
+                            min=-agent.cfg.value_clip, max=agent.cfg.value_clip,
                         )
-                    value_loss = agent._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+                    value_loss = agent.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
 
                 agent.optimizer.zero_grad()
                 agent.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
@@ -395,14 +403,14 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
                     if agent.policy is not agent.value:
                         agent.value.reduce_parameters()
 
-                if agent._grad_norm_clip > 0:
+                if agent.cfg.grad_norm_clip > 0:
                     agent.scaler.unscale_(agent.optimizer)
                     if agent.policy is agent.value:
-                        nn.utils.clip_grad_norm_(agent.policy.parameters(), agent._grad_norm_clip)
+                        nn.utils.clip_grad_norm_(agent.policy.parameters(), agent.cfg.grad_norm_clip)
                     else:
                         nn.utils.clip_grad_norm_(
                             itertools.chain(agent.policy.parameters(), agent.value.parameters()),
-                            agent._grad_norm_clip,
+                            agent.cfg.grad_norm_clip,
                         )
 
                 agent.scaler.step(agent.optimizer)
@@ -412,7 +420,7 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
                 cumulative_value_loss += value_loss.item()
                 cumulative_entropy_loss += entropy_loss.item()
 
-            if agent._learning_rate_scheduler:
+            if agent.scheduler is not None:
                 if isinstance(agent.scheduler, KLAdaptiveLR):
                     kl = torch.tensor(kl_divergences, device=agent.device).mean()
                     if config.torch.is_distributed:
@@ -422,16 +430,16 @@ def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
                 else:
                     agent.scheduler.step()
 
-        n = agent._learning_epochs * agent._mini_batches
+        n = agent.cfg.learning_epochs * agent.cfg.mini_batches
         agent.track_data("Loss / Policy loss", cumulative_policy_loss / n)
         agent.track_data("Loss / Value loss", cumulative_value_loss / n)
         agent.track_data("Loss / Entropy loss", cumulative_entropy_loss / n)
         agent.track_data("Policy / Standard deviation",
                          agent.policy.distribution(role="policy").stddev.mean().item())
-        if agent._learning_rate_scheduler:
+        if agent.scheduler is not None:
             agent.track_data("Policy / Learning rate", agent.scheduler.get_last_lr()[0])
 
-    agent._update = _update_with_per_batch_entropy
+    agent.update = _update_with_per_batch_entropy
     print(f"[entropy_flip] GR-faithful: base={base_entropy_scale}, flip={_ENTROPY_FLIP_SCALE}")
 
 
@@ -651,7 +659,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent = runner.agent
     
     # log success rate from environment's extras during training
-    def log_success_rate(timestep, timesteps):
+    # skrl 2.0.0: post_interaction is keyword-only.
+    def log_success_rate(*, timestep, timesteps):
         actual_env = env.unwrapped
         
         try:

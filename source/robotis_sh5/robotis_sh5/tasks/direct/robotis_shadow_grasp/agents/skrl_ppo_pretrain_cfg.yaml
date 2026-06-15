@@ -5,11 +5,12 @@ models:
   separate: True
   policy:
     class: GaussianMixin
-    clip_actions: False
+    clip_actions: False  # action space is unbounded; skrl 2.0.0 errors on clip_actions=True
+                         # with None space limits (1.4.3 silently no-op'd). Matches sh5.
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 0.75
-    initial_log_std: -1.5141  # ln(0.22) ≈ -1.514 → σ=0.22 as in MassDexMimic paper
+    initial_log_std: -1.514  # ln(0.22) ≈ -1.514 → σ=0.22 as in MassDexMimic paper
     network:
       - name: net
         input: OBSERVATIONS

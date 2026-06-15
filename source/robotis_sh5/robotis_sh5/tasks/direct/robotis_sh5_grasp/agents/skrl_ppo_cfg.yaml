@@ -12,8 +12,10 @@ models:
     min_log_std: -20.0
     max_log_std: 0.75
     initial_log_std: -1.5141  # ln(0.22) ≈ -1.514 → σ=0.22 as in MassDexMimic paper
-    mass_mu_init: -0.25        # MassDexMimic Section 3.2: initial mass mean
-    mass_log_std_init: -1.25   # MassDexMimic Section 3.2: initial mass log-std
+    # NOTE: mass_mu_init/-log_std_init are defined as MassDexMimicPolicy defaults
+    # (-0.25 / -1.25). They are NOT listed here because skrl 2.0.0's gaussian_model
+    # instantiator rejects unknown kwargs when the Runner builds the throwaway default
+    # policy (which _patch_mass_policy then replaces).
     network:
       - name: net
         input: OBSERVATIONS

@@ -120,14 +120,14 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             joint_names_expr=["arm_l_joint[4-6]", "arm_r_joint[4-6]"],
             velocity_limit_sim=15.0,
             effort_limit_sim=31.7,  # 31.7,
-            stiffness=150.0,  # 600.0
+            stiffness=120.0,  # 600.0
             damping=20.0  # default: 20.0
         ),
         "DP_42": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint7", "arm_r_joint7"],
             velocity_limit_sim=6.0,
             effort_limit_sim=5.1,  # 5.1,
-            stiffness=30.0,  # 200.0
+            stiffness=20.0,  # 200.0
             damping=3.0  # default: 3.0
         ),
         # Left hand: FFW-SH5 native fingers (kept, unused — zero pose)
@@ -136,7 +136,7 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             velocity_limit_sim=15.0,
             effort_limit_sim=3.09,
             stiffness=1.0,  # 500.0
-            damping=0.1,  # 3.0
+            damping=0.2,  # 3.0
         ),
         # Right hand: Shadow Dexterous Hand (18 actuated DOF, matching TJ's actuated_joint_names).
         # FFJ0/MFJ0/RFJ0/LFJ0 are tendon-coupled to J1 (not independently actuated) and
@@ -158,10 +158,10 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
                 "robot0_THJ0": 1.0,
             },
             damping={
-                "robot0_(FF|MF|RF|LF|TH)J[1-3]": 0.1,
-                "robot0_LFJ4": 0.1,
-                "robot0_THJ4": 0.1,
-                "robot0_THJ0": 0.1,
+                "robot0_(FF|MF|RF|LF|TH)J[1-3]": 0.2,
+                "robot0_LFJ4": 0.2,
+                "robot0_THJ4": 0.2,
+                "robot0_THJ0": 0.2,
             },
         ),
         "head": ImplicitActuatorCfg(
@@ -376,8 +376,8 @@ class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
     # Per-step penalty is clamped at `rew_arm_contact × max_arm_contact_force` — the
     # penalty value at the termination threshold, so above-threshold contacts (which
     # would terminate anyway) can't dominate the reward in the same step.
-    rew_arm_contact: float = -0.1               # penalty weight per N of (max) arm-link contact force
-    max_arm_contact_force: float = 5.0          # termination threshold (N): episode ends if max link force exceeds this
+    rew_arm_contact: float = -0.05               # penalty weight per N of (max) arm-link contact force
+    max_arm_contact_force: float = 10.0          # termination threshold (N): episode ends if max link force exceeds this
     # Action/pose regularization (uniform weights across hand and arm).
     # Action layout: [fingers(20) | arm_r(7) | mass(1)]; pose excludes lift (PD-fixed).
     rew_hand_action_reg: float = -0.004

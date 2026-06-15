@@ -304,6 +304,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # reset environment
     obs, _ = env.reset()
+    states = env.state()   # skrl 2.0.0: states are obtained separately from observations
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -311,8 +312,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            # agent stepping — skrl 2.0.0: act(observations, states, ...) → (actions, outputs)
+            outputs = runner.agent.act(obs, states, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
@@ -321,6 +322,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
             obs, _, terminated, truncated, _ = env.step(actions)
+            states = env.state()
             # Propagate episode terminations to MassDexMimicPolicy so mass is
             # re-sampled only at episode boundaries (not every step).
             _policy = getattr(runner.agent, "policy", None)

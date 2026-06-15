@@ -187,8 +187,8 @@ class RobotisShadowGraspPretrainEnvCfg(DirectRLEnvCfg):
     # Arm table-contact penalty (anti-cheating: arm_r_link3..link7).
     # Hybrid: soft per-N penalty (auto-clamped at rew_arm_contact × max_arm_contact_force)
     # + hard termination on strong press. Force used = MAX across the 5 tracked arm links.
-    rew_arm_contact: float = -0.1               # penalty weight per N of (max) arm-link contact force
-    max_arm_contact_force: float = 5.0          # termination threshold (N): episode ends if max link force exceeds this
+    rew_arm_contact: float = -0.05               # penalty weight per N of (max) arm-link contact force
+    max_arm_contact_force: float = 10.0          # termination threshold (N): episode ends if max link force exceeds this
     # Action/pose regularization (uniform weights across hand and arm).
     # Action layout (pretrain, no mass): [fingers(20) | arm_r(7)]; pose excludes lift.
     rew_hand_action_reg: float = -0.004
