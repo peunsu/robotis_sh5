@@ -5,6 +5,7 @@ retargeting/mano_trajectories
 source/robotis_sh5/data/processed
 source/robotis_sh5/data/raw
 **/.claude
+mano_v1_2/
 
 # C++
 **/cmake-build*/

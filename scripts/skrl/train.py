@@ -494,6 +494,13 @@ def _load_partial_checkpoint(agent, path: str) -> None:
                 print(f"[partial load] {key}.{param_name}: shape incompatible {list(ckpt_tensor.shape)} vs {list(cur_tensor.shape)}, skipping")
                 updated_sd[param_name] = cur_tensor
         module.load_state_dict(updated_sd)
+    # NOTE: observation/value preprocessors (RunningStandardScaler) are deliberately NOT
+    # transferred — they stay at their fresh identity init so the scaler re-learns the
+    # TRAIN obs distribution from scratch. The pretrain stats are frozen (current_count
+    # ~3e7 → train batches have ~0 weight) AND have near-zero variance on the object
+    # velocity/force/contact dims (those obs are zero in the no-object pretrain). Loading
+    # them would divide real train physics values by ~√1e-8 → exploding inputs that never
+    # correct → worse than reset. Same rationale as the MARL loader's deliberate reset.
     print("[partial load] Done.")
 
 
@@ -650,7 +657,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     raise
                 print(f"[INFO] Checkpoint mismatch ({err[:80]}...); attempting partial weight loading.")
                 _load_partial_checkpoint(runner.agent, resume_path)
-    
+
+    # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+    # For RSI train tasks: if a `pretrain_state_cache.npz` sits next to the loaded
+    # checkpoint (saved at the end of pretrain — see post-run block below), hand it to
+    # the env so the first N control steps roll out from the pretrain state cache.
+    # No-op for envs without set_pretrain_cache (all non-RSI tasks).
+    if resume_path and _is_grasp_train and hasattr(env.unwrapped, "set_pretrain_cache"):
+        _cache_sibling = Path(resume_path).resolve().parent / "pretrain_state_cache.npz"
+        if _cache_sibling.is_file():
+            env.unwrapped.set_pretrain_cache(str(_cache_sibling))
+        else:
+            print(f"[pretrain-cache-warmstart] no cache found at {_cache_sibling}; vanilla start.")
+    # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
     #####################
     # Custom callback to log success rate from environment's extras during training
     #####################
@@ -686,6 +706,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     training_time = round(time.time() - start_time, 2)
     print(f"Training time: {training_time} seconds")
 
+    # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+    # After an RSI *pretrain* run, dump the per-frame state cache so the subsequent
+    # RSI *train* run can roll out from it (warm-start). Saved into the run log dir
+    # (mirrors how skrl checkpoints land in logs); the benchmark script copies it next
+    # to pretrain.pt, and train.py loads it as a checkpoint sibling. Also written to
+    # the data-tree checkpoint dir below (when sequence info is available) for manual
+    # runs that point --checkpoint straight at the data tree.
+    _pretrain_cache_payload = None
+    if (
+        _is_grasp_pretrain
+        and "Rsi" in (args_cli.task or "")
+        and hasattr(env.unwrapped, "_state_cache")
+    ):
+        import numpy as _np
+
+        _ue = env.unwrapped
+        _pretrain_cache_payload = dict(
+            state_cache=_ue._state_cache.detach().cpu().numpy(),
+            init_flg=_ue._init_flg.detach().cpu().numpy(),
+            reached_frame=int(_ue._reached_frame),
+            max_traj_len=int(_ue._max_traj_len),
+            trajectory_task=str(getattr(env_cfg, "trajectory_task", "")),
+        )
+        _log_cache_path = os.path.join(log_dir, "pretrain_state_cache.npz")
+        _np.savez(_log_cache_path, **_pretrain_cache_payload)
+        print(f"[pretrain-cache-warmstart] saved pretrain state cache → {_log_cache_path}")
+    # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
     # Save task_info.json to the processed output directory (only for grasp tasks with sequence info).
     _has_seq = (
         hasattr(env_cfg, "trajectory_task")
@@ -696,9 +744,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _data_root = Path(
             env_cfg.hocap_data_dir if env_cfg.dataset == "hocap" else env_cfg.oakink_data_dir
         )
-        # Select output tree by task name — keeps Shadow Hand results separate
-        # from FFW-SH5 native-hand results (mirrors train_sequences_shadow.sh).
-        _robot_tree = "ffw_shadow" if "Shadow" in (args_cli.task or "") else "ffw_sh5"
+        # Select output tree by task name — keeps Shadow Hand results separate from
+        # FFW-SH5 native-hand results (mirrors train_sequences_shadow.sh). The RSI
+        # warm-start variant gets its own tree so it doesn't clobber plain-Shadow runs.
+        _task_name = args_cli.task or ""
+        if "Rsi" in _task_name:
+            _robot_tree = "ffw_shadow_rsi"
+        elif "Shadow" in _task_name:
+            _robot_tree = "ffw_shadow"
+        else:
+            _robot_tree = "ffw_sh5"
         _ckpt_dir = (
             _data_root / _robot_tree / "right"
             / env_cfg.trajectory_task
@@ -724,6 +779,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with open(_info_path, "w") as _f:
             json.dump(_task_info, _f, indent=2)
         print(f"[INFO] Task info saved → {_info_path}")
+
+        # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+        # Also drop the RSI pretrain cache into the data-tree checkpoint dir so a manual
+        # train run with --checkpoint <_ckpt_dir>/pretrain.pt finds the sibling npz.
+        if _pretrain_cache_payload is not None:
+            import numpy as _np
+
+            _ckpt_cache_path = _ckpt_dir / "pretrain_state_cache.npz"
+            _np.savez(_ckpt_cache_path, **_pretrain_cache_payload)
+            print(f"[pretrain-cache-warmstart] saved pretrain state cache → {_ckpt_cache_path}")
+        # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
 
     # close the simulator
     env.close()

@@ -71,7 +71,7 @@ agent:
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "robotis_shadow_grasp"
+    directory: "robotis_shadow_grasp_rsi"
     experiment_name: "default"
     write_interval: 10
     checkpoint_interval: 1000

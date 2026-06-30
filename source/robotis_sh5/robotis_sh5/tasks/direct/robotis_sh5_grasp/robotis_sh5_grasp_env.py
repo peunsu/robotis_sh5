@@ -818,6 +818,40 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions = default_normalized.unsqueeze(0).expand(B, -1).clone()
 
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Integrated arm position target (rad) + EMA'd delta-command buffer.
+        # _arm_target seeds at the default arm pose; the delta EMA starts at rest.
+        # These are only used when cfg.arm_delta_action is True. (Cheap to keep
+        # allocated unconditionally — a few KB.)
+        self._arm_target = (
+            self.robot.data.default_joint_pos[:1, self._arm_r_joint_ids].expand(B, -1).clone()
+        )
+        self._arm_delta_ema = torch.zeros(B, self.cfg.num_arm_r_dofs, device=self.device)
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
+
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Integrated finger position target (rad) + EMA'd delta-command buffer.
+        # _hand_target seeds at the default finger pose; the delta EMA starts at rest.
+        # Only used when cfg.hand_delta_action is True (cheap to keep allocated).
+        self._hand_target = (
+            self.robot.data.default_joint_pos[:1, self._finger_joint_ids].expand(B, -1).clone()
+        )
+        self._hand_delta_ema = torch.zeros(B, self.cfg.num_hand_dofs, device=self.device)
+        # Per-joint delta scale (N_f,): hand_delta_scale everywhere, hand_delta_scale_dip on
+        # the DIP joints. Resolved by joint NAME → position in _finger_joint_ids (robust to
+        # articulation DOF ordering). Broadcast over the batch in _pre_physics_step.
+        self._hand_delta_scale_vec = torch.full(
+            (self.cfg.num_hand_dofs,), self.cfg.hand_delta_scale, device=self.device
+        )
+        if self.cfg.hand_delta_dip_joint_names:
+            dip_ids, dip_names = self.robot.find_joints(list(self.cfg.hand_delta_dip_joint_names))
+            dip_positions = [self._finger_joint_ids.index(j) for j in dip_ids]
+            for pos in dip_positions:
+                self._hand_delta_scale_vec[pos] = self.cfg.hand_delta_scale_dip
+            print(f"[hand-delta] DIP joints {dip_names} at finger slots {dip_positions} "
+                  f"→ scale {self.cfg.hand_delta_scale_dip} (others {self.cfg.hand_delta_scale})")
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
+
         # Mass-as-an-action: stores the last mass action dim per env
         # Initialize to mu_m = -0.25 (paper Section 3.2: corresponds to ≈ 0.4 × mmax).
         self._current_mass_action = torch.full((B,), -0.25, device=self.device)
@@ -1127,16 +1161,70 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         joint_actions = self.actions[:, :-1]  # (B, 27)
         a_h = self.cfg.action_smoothing
         a_a = self.cfg.arm_action_smoothing
-        self._smoothed_actions[:, :20] = a_h * joint_actions[:, :20] + (1.0 - a_h) * self._smoothed_actions[:, :20]
-        self._smoothed_actions[:, 20:] = a_a * joint_actions[:, 20:] + (1.0 - a_a) * self._smoothed_actions[:, 20:]
+        N_f = self.cfg.num_hand_dofs  # 20 (FFW-SH5 native hand)
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Integrate the fingers here (once per control step). Mirrors the arm delta
+        # scheme below: raw action is a per-step VELOCITY command, EMA'd on the delta,
+        # integrated + clamped to finger joint limits (accumulator clamp = windup guard).
+        if self.cfg.hand_delta_action:
+            hand_delta_cmd = joint_actions[:, :N_f] * self._hand_delta_scale_vec
+            a_hd = self.cfg.hand_delta_smoothing
+            self._hand_delta_ema = a_hd * hand_delta_cmd + (1.0 - a_hd) * self._hand_delta_ema
+            self._hand_target = (self._hand_target + self._hand_delta_ema).clamp(
+                self._ctrl_lower[:N_f], self._ctrl_upper[:N_f]
+            )
+        else:
+            # Original absolute EMA scheme on the finger slice.
+            self._smoothed_actions[:, :N_f] = (
+                a_h * joint_actions[:, :N_f] + (1.0 - a_h) * self._smoothed_actions[:, :N_f]
+            )
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
+
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Integrate the arm here (once per control step, NOT in _apply_action which
+        # runs `decimation`× per step — integrating there would multiply the delta).
+        if self.cfg.arm_delta_action:
+            # raw arm action ∈ [-1,1] → per-step delta command in rad (±arm_delta_scale).
+            arm_delta_cmd = joint_actions[:, N_f:] * self.cfg.arm_delta_scale
+            # EMA on the DELTA command (velocity). NOTE: smoothing the integrated
+            # target instead degenerates to `prev + α·delta` (mere range scaling, no
+            # actual smoothing) — so the EMA MUST sit on the delta, not the target.
+            a_d = self.cfg.arm_delta_smoothing
+            self._arm_delta_ema = a_d * arm_delta_cmd + (1.0 - a_d) * self._arm_delta_ema
+            # Integrate + clamp accumulator to joint limits (clamping the accumulator,
+            # not just the output, prevents integral windup past the limits).
+            self._arm_target = (self._arm_target + self._arm_delta_ema).clamp(
+                self._ctrl_lower[N_f:], self._ctrl_upper[N_f:]
+            )
+        else:
+            # Original absolute EMA scheme on the arm slice.
+            prev_arm = self._smoothed_actions[:, N_f:]
+            self._smoothed_actions[:, N_f:] = a_a * joint_actions[:, N_f:] + (1.0 - a_a) * prev_arm
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
 
     def _apply_action(self) -> None:
         N_f = self.cfg.num_hand_dofs
         N_a = self.cfg.num_arm_r_dofs
         # Scale EMA-smoothed normalized actions to full joint range (action joints only).
         targets = self._scale(self._smoothed_actions).clamp(self._ctrl_lower, self._ctrl_upper)
-        self.robot.set_joint_position_target(targets[:, :N_f],          joint_ids=self._finger_joint_ids)
-        self.robot.set_joint_position_target(targets[:, N_f:N_f+N_a],  joint_ids=self._arm_r_joint_ids)
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Delta mode: finger targets come from the integrated accumulator (_hand_target,
+        # already rad + joint-clamped in _pre_physics_step); targets[:, :N_f] is unused.
+        if self.cfg.hand_delta_action:
+            finger_targets = self._hand_target
+        else:
+            finger_targets = targets[:, :N_f]
+        self.robot.set_joint_position_target(finger_targets, joint_ids=self._finger_joint_ids)
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Delta mode: arm targets come from the integrated accumulator (_arm_target,
+        # already rad + joint-clamped in _pre_physics_step); targets[:, N_f:] is unused.
+        if self.cfg.arm_delta_action:
+            arm_targets = self._arm_target
+        else:
+            arm_targets = targets[:, N_f:N_f+N_a]
+        self.robot.set_joint_position_target(arm_targets, joint_ids=self._arm_r_joint_ids)
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
         # Lift is held at a fixed target every step (NOT in action). PD target alone
         # leaves residual trembling under reaction forces from arm/hand motion, so we
         # ALSO forcibly write joint state every physics sub-step → lift effectively
@@ -1262,6 +1350,35 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         # New +6 vs prior 291: elbow_pos +3 → elbow+link7 (3+3); delta_elbow +3 → delta_elbow+delta_link7 (3+3).
 
         self._prev_action = self.actions.clone()
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # In delta mode the raw arm action is a VELOCITY command, semantically
+        # different from the finger slice (absolute normalized target). Overwrite the
+        # arm slice of the action history with the normalized integrated arm TARGET so
+        # the arm obs carries the SAME absolute-target meaning as the fingers (and
+        # exposes the integrator's hidden state). Timing (lag-1) and reset (zeroed in
+        # _reset_idx) then match the fingers automatically — obs cat line is unchanged.
+        if self.cfg.arm_delta_action:
+            N_f = self.cfg.num_hand_dofs
+            N_a = self.cfg.num_arm_r_dofs
+            al = self._ctrl_lower[N_f:]
+            au = self._ctrl_upper[N_f:]
+            self._prev_action[:, N_f:N_f + N_a] = (
+                (2.0 * self._arm_target - au - al) / (au - al).clamp(min=1e-6)
+            )
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Same rationale as the arm: in delta mode the raw finger action is a VELOCITY
+        # command. Overwrite the finger slice of the action history with the normalized
+        # integrated finger TARGET so the obs carries an absolute-target meaning and
+        # exposes the integrator's hidden state (Markovianity).
+        if self.cfg.hand_delta_action:
+            N_f = self.cfg.num_hand_dofs
+            fl = self._ctrl_lower[:N_f]
+            fu = self._ctrl_upper[:N_f]
+            self._prev_action[:, :N_f] = (
+                (2.0 * self._hand_target - fu - fl) / (fu - fl).clamp(min=1e-6)
+            )
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
 
         if self.cfg.debug_vis:
             ref_wrist_pos = self._ref_wrist_pos[traj, frame] + env_orig         # (B, 3)
@@ -1750,6 +1867,23 @@ class RobotisSh5GraspEnv(DirectRLEnv):
         ], dim=-1)
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions[env_ids] = torch.where(cache_mask, cached_sa, default_normalized)
+
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Seed the integrated arm target at the ACTUAL reset arm pose (cache/IK/default,
+        # already baked into joint_pos_reset) and zero the delta EMA so each episode
+        # starts integrating from rest. Without seeding, the accumulator would carry the
+        # previous episode's target into the new one.
+        if self.cfg.arm_delta_action:
+            self._arm_target[env_ids] = joint_pos_reset[:, self._arm_r_joint_ids]
+            self._arm_delta_ema[env_ids] = 0.0
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Seed the integrated finger target at the ACTUAL reset finger pose and zero
+        # the delta EMA so each episode starts integrating from rest.
+        if self.cfg.hand_delta_action:
+            self._hand_target[env_ids] = joint_pos_reset[:, self._finger_joint_ids]
+            self._hand_delta_ema[env_ids] = 0.0
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
 
         self.robot.write_joint_state_to_sim(joint_pos_reset, joint_vel_reset, None, env_ids)
 

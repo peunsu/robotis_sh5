@@ -6,7 +6,7 @@ All object-related inputs (position, rotation, contact targets) come from the pr
 reference trajectory — no physics object exists in the scene. Object tracking rewards are
 excluded; only fingertip and wrist tracking rewards are used.
 
-Once pretrain is complete, the checkpoint transfers to RobotisShadowGraspEnv for full
+Once pretrain is complete, the checkpoint transfers to RobotisShadowGraspRsiEnv for full
 dexterous manipulation with real object physics.
 """
 
@@ -27,8 +27,8 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_conjugate, quat_mul
 
-from .robotis_shadow_grasp_env import _NUM_KPTS
-from .robotis_shadow_grasp_pretrain_env_cfg import RobotisShadowGraspPretrainEnvCfg
+from .robotis_shadow_grasp_rsi_env import _NUM_KPTS
+from .robotis_shadow_grasp_rsi_pretrain_env_cfg import RobotisShadowGraspRsiPretrainEnvCfg
 
 
 def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
@@ -80,12 +80,12 @@ _FINGERTIP_PAD_NORMALS: dict[str, list[float]] = {
 }
 
 
-class RobotisShadowGraspPretrainEnv(DirectRLEnv):
+class RobotisShadowGraspRsiPretrainEnv(DirectRLEnv):
     """Pretrain environment: track reference hand pose with a frozen (teleported) object."""
 
-    cfg: RobotisShadowGraspPretrainEnvCfg
+    cfg: RobotisShadowGraspRsiPretrainEnvCfg
 
-    def __init__(self, cfg: RobotisShadowGraspPretrainEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: RobotisShadowGraspRsiPretrainEnvCfg, render_mode: str | None = None, **kwargs):
         self._load_reference_trajectories(cfg)
         # Episode length matches train env: chunked to `episode_length_s × action_fps` frames
         # when adaptive_sampling=True (TJ-style 5s chunks); full trajectory in rollout mode.
@@ -105,7 +105,7 @@ class RobotisShadowGraspPretrainEnv(DirectRLEnv):
     # Data loading  (identical to main grasp env)
     # ------------------------------------------------------------------
 
-    def _load_reference_trajectories(self, cfg: RobotisShadowGraspPretrainEnvCfg) -> None:
+    def _load_reference_trajectories(self, cfg: RobotisShadowGraspRsiPretrainEnvCfg) -> None:
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
         data_dir = _data_root / "mano" / "right"
 
@@ -522,7 +522,7 @@ class RobotisShadowGraspPretrainEnv(DirectRLEnv):
         )
 
         # Elbow position: arm_r_link3 + URDF joint4 offset (stable across joint4 rotation).
-        from .robotis_shadow_grasp_env import _ELBOW_OFFSET_IN_LINK3_LOCAL
+        from .robotis_shadow_grasp_rsi_env import _ELBOW_OFFSET_IN_LINK3_LOCAL
         link3_ids, _ = self.robot.find_bodies("arm_r_link3")
         self._link3_body_id: int | None = link3_ids[0] if link3_ids else None
         if self._link3_body_id is None:
@@ -532,7 +532,7 @@ class RobotisShadowGraspPretrainEnv(DirectRLEnv):
         )
 
         # Resolve body IDs for all 16 non-fingertip MANO keypoints
-        from .robotis_shadow_grasp_env import _MANO_NON_FT_BODY_NAMES, _MANO_FT_INDICES
+        from .robotis_shadow_grasp_rsi_env import _MANO_NON_FT_BODY_NAMES, _MANO_FT_INDICES
         _kpt_mano_indices, _kpt_body_ids = [], []
         for mano_idx, body_name in _MANO_NON_FT_BODY_NAMES:
             body_ids, _ = self.robot.find_bodies(body_name)

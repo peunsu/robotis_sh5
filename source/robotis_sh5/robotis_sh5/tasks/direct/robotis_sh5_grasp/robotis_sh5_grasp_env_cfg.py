@@ -31,6 +31,8 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=True,   # position control; gravity compensation handled by stiffness
+            linear_damping=2.0,
+            angular_damping=4.0,
             max_depenetration_velocity=5.0,
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(
@@ -57,14 +59,15 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
             "lift_joint": 0.0,
             # Left arm (unused, zero)
             **{f"arm_l_joint{i + 1}": 0.0 for i in range(7)},
-            # Right arm: pre-grasp pose matching pick_and_place env
-            "arm_r_joint1": 0.0,
-            "arm_r_joint2": -1.162,
-            "arm_r_joint3": 0.291,
-            "arm_r_joint4": -1.876,
-            "arm_r_joint5": -0.609,
-            "arm_r_joint6": 0.335,
-            "arm_r_joint7": -0.368,
+            # Right arm: pre-grasp pose adopted from the Shadow Hand variant.
+            # Original sh5 pose (matching pick_and_place env) kept in comments:
+            "arm_r_joint1": 0.00,    # was 0.0
+            "arm_r_joint2": -1.13,   # was -1.162
+            "arm_r_joint3": 0.03,    # was 0.291
+            "arm_r_joint4": -2.1,    # was -1.876
+            "arm_r_joint5": -1.44,   # was -0.609
+            "arm_r_joint6": 0.43,    # was 0.335
+            "arm_r_joint7": -0.65,   # was -0.368
             # Fingers (both hands, zero = open)
             **{f"finger_l_joint{i + 1}": 0.0 for i in range(20)},
             **{f"finger_r_joint{i + 1}": 0.0 for i in range(20)},
@@ -96,30 +99,30 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         "DY_80": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[1-3]", "arm_r_joint[1-3]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=100,  # 61.4,
-            stiffness=600.0,
-            damping=90.0  # default: 30.0
+            effort_limit_sim=61.4,  # 61.4,
+            stiffness=200.0,
+            damping=40.0  # default: 30.0
         ),
         "DY_70": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint[4-6]", "arm_r_joint[4-6]"],
             velocity_limit_sim=15.0,
-            effort_limit_sim=100,  # 31.7,
-            stiffness=600.0,
-            damping=60.0  # default: 20.0
+            effort_limit_sim=31.7,  # 31.7,
+            stiffness=160.0,
+            damping=30.0  # default: 20.0
         ),
         "DP_42": ImplicitActuatorCfg(
             joint_names_expr=["arm_l_joint7", "arm_r_joint7"],
             velocity_limit_sim=6.0,
-            effort_limit_sim=100,  # 5.1,
-            stiffness=200.0,
-            damping=25.0  # default: 3.0
+            effort_limit_sim=5.1,  # 5.1,
+            stiffness=30.0,
+            damping=5.0  # default: 3.0
         ),
         "hand": ImplicitActuatorCfg(
             joint_names_expr=["finger_l_joint.*", "finger_r_joint.*"],
-            velocity_limit_sim=2.2,
-            effort_limit_sim=10,  # 2.0,
-            stiffness=200.0,
-            damping=5.0,  # default: 1.0
+            velocity_limit_sim=15.0,
+            effort_limit_sim=3.09,  # 2.0,
+            stiffness=1.0,
+            damping=0.2,  # default: 1.0
         ),
         "head": ImplicitActuatorCfg(
             joint_names_expr=["head_joint1", "head_joint2"],
@@ -169,13 +172,21 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
         mass dim [-1,1] → [object_mass_min, object_mass_max] applied at episode start.
     """
 
-    # Viewer: positioned in front of and to the right of the table, elevated, looking
-    # at the table surface (z=1.0) where the robot hand approaches from behind.
-    # Robot base is at env-local (0.65, 0.60); table top is at (0.3, 0.0, 1.0).
+    # Viewer: front-left/elevated angled view of the table with the robot reaching
+    # in from the back-right. Camera coords are ENV-LOCAL (origin_type="env")
+    # so the camera stays anchored to env 0's contents regardless of num_envs
+    # (default origin_type="world" caused the camera-to-table relationship to
+    # shift when the GridCloner placed env 0 at different world positions for
+    # different num_envs).
+    # Scene layout (env-local):
+    #   Table top center: (0.3, 0.0, 1.0); table extends ±0.3 m in X/Y, height 1.0
+    #   Robot base:       (0.65, 0.65, 0.0); right arm reaches toward the table
     viewer: ViewerCfg = ViewerCfg(
-        eye=(0.2, 0.15, 2.2),
-        lookat=(-0.2, 0.5, 2.0),
+        eye=(-0.4, -0.6, 1.8),       # front-left of the table, elevated
+        lookat=(0.4, 0.2, 1.0),      # table top, slightly biased toward robot side
         resolution=(1280, 720),
+        origin_type="env",
+        env_index=0,
     )
 
     # Simulation
@@ -299,7 +310,58 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     action_smoothing: float = 0.5   # finger EMA α — higher = more responsive
     # Arm-only EMA alpha (overrides action_smoothing for arm_r slice [20:27]).
     # Lower α = stronger smoothing → less wrist tremor; hand keeps action_smoothing.
+    # NOTE: ignored for the arm while arm_delta_action is True (see below).
     arm_action_smoothing: float = 0.2
+
+    # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ─────────────────────────
+    # When True, the ARM action output is interpreted as a per-control-step DELTA
+    # (residual) instead of an absolute target. Pipeline (per control step):
+    #     raw_arm ∈ [-1,1]  →  delta_cmd = raw_arm * arm_delta_scale            (rad)
+    #     delta_ema = α·delta_cmd + (1-α)·delta_ema   (EMA on the VELOCITY command)
+    #     arm_target = clamp(arm_target + delta_ema, joint_limits)   (integrate + windup clamp)
+    # Integration acts as a low-pass filter on action noise → smoother wrist motion
+    # (de-tremor). Fingers + mass are UNAFFECTED (still absolute EMA). While True,
+    # arm_action_smoothing is unused. Set arm_delta_action = False to fully restore
+    # the original absolute-action arm (no other change needed).
+    arm_delta_action: bool = True
+    arm_delta_scale: float = 0.25      # rad — max |delta| per control step at raw=±1
+    arm_delta_smoothing: float = 1.0   # EMA α on the delta command (higher = more responsive)
+    # ── END ARM DELTA-ACTION ──────────────────────────────────────────────────
+
+    # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ───────────────────────
+    # When True, the FINGER action output is interpreted as a per-control-step DELTA
+    # (residual) instead of an absolute target — identical pipeline to the arm delta
+    # above, on the finger slice. Motivation: make the action semantics CONSISTENT
+    # (arm + fingers both velocity/residual), and low-pass-filter finger action noise.
+    #     raw_hand ∈ [-1,1]  →  delta_cmd = raw_hand * hand_delta_scale            (rad)
+    #     delta_ema = α·delta_cmd + (1-α)·delta_ema   (EMA on the VELOCITY command)
+    #     hand_target = clamp(hand_target + delta_ema, joint_limits)   (integrate + windup clamp)
+    # NOTE: when True, `rew_hand_action_reg` (sum of squared raw finger actions) becomes
+    # a finger VELOCITY penalty rather than a flexion penalty — tune accordingly.
+    # Also note delta=0 means HOLD (not "go to mid-range"), and zero-mean action noise
+    # random-walks the target around the open reset pose, so contact-force exploration is
+    # weaker than absolute mode — may need lower rew_hand_action_reg / higher σ.
+    # While True, action_smoothing is unused for the finger slice. Set
+    # hand_delta_action = False to fully restore the original absolute-action fingers.
+    # Changing this flips finger action semantics → BOTH phases must be re-pretrained.
+    hand_delta_action: bool = True
+    hand_delta_scale: float = 0.40      # rad — max |delta| per control step at raw=±1
+    hand_delta_smoothing: float = 1.0  # EMA α on the delta command (higher = more responsive)
+    # Per-joint override for the DISTAL (DIP) finger joints. Unlike the Shadow Hand
+    # (where each finger's DIP=J0 is tendon-coupled to PIP=J1 and NOT independently
+    # driven), sh5 drives all 20 finger joints independently AND its DIP joints have a
+    # wide range → a single global hand_delta_scale over-curls the fingertips. Apply a
+    # SMALLER delta scale to only the DIP joints. Mapping is by joint NAME (robust to
+    # articulation DOF ordering); positions are resolved at runtime in _post_init_buffers.
+    # finger_r_jointN drives finger_r_linkN; DIP bodies are link4/8/12/16/20 → DIP joints
+    # are joint4/8/12/16/20. Set hand_delta_dip_joint_names = () to disable (all fingers
+    # then use hand_delta_scale).
+    hand_delta_dip_joint_names: tuple[str, ...] = (
+        "finger_r_joint4", "finger_r_joint8", "finger_r_joint12",
+        "finger_r_joint16", "finger_r_joint20",
+    )
+    hand_delta_scale_dip: float = 0.25  # rad — smaller per-step delta for DIP joints
+    # ── END HAND DELTA-ACTION ─────────────────────────────────────────────────
 
     # Reward scales (GR env: 1.5*alive - clamp(4.26*pos + 1.0*rot + 5.2*ft + 1.76*kpts, 1.5) + force + reg)
     # `rew_kpts` averages over 21 MANO keypoints (includes wrist as kpt 0).
@@ -307,7 +369,7 @@ class RobotisSh5GraspEnvCfg(DirectRLEnvCfg):
     #   elbow (kpt 21), arm_r_link7 (kpt 22). link7 is the last revolute arm link before
     #   the FIXED wrist mount; tracking it adds a positional constraint that indirectly
     #   constrains wrist orientation (compensates for no rew_wrist_rot signal).
-    rew_alive: float = 1.6
+    rew_alive: float = 1.5
     rew_kpts: float = -1.76           # mean Z-weighted L2 over 21 MANO keypoints
     rew_arm_pos: float = -0.44          # mean Z-weighted L2 over (wrist, elbow, link7)
     rew_obj_pos: float = -4.26        # GR env: 4.26

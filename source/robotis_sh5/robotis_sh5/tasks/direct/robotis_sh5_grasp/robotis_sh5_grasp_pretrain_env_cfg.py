@@ -67,11 +67,15 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     Action space (28): [fingers(20) | arm_r(7) | lift(1)] delta from default pose.
     """
 
-    # Viewer: same viewpoint as train env — front-right of table, elevated.
+    # Viewer: same viewpoint as train env — front-left/elevated angled view, camera
+    # coords ENV-LOCAL (origin_type="env") so framing stays anchored to env 0
+    # regardless of num_envs.
     viewer: ViewerCfg = ViewerCfg(
-        eye=(0.2, 0.15, 2.2),
-        lookat=(-0.2, 0.5, 2.0),
+        eye=(-0.4, -0.6, 1.8),       # front-left of the table, elevated
+        lookat=(0.4, 0.2, 1.0),      # table top, slightly biased toward robot side
         resolution=(1280, 720),
+        origin_type="env",
+        env_index=0,
     )
 
     # Simulation
@@ -176,14 +180,49 @@ class RobotisSh5GraspPretrainEnvCfg(DirectRLEnvCfg):
     action_smoothing: float = 0.5   # finger EMA α — higher = more responsive
     # Arm-only EMA alpha (overrides action_smoothing for arm_r slice [20:27]).
     # Lower α = stronger smoothing → less wrist tremor; hand keeps action_smoothing.
+    # NOTE: ignored for the arm while arm_delta_action is True (see below).
     arm_action_smoothing: float = 0.2
+
+    # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ─────────────────────────
+    # When True, the ARM action output is interpreted as a per-control-step DELTA
+    # (residual) instead of an absolute target. Pipeline (per control step):
+    #     raw_arm ∈ [-1,1]  →  delta_cmd = raw_arm * arm_delta_scale            (rad)
+    #     delta_ema = α·delta_cmd + (1-α)·delta_ema   (EMA on the VELOCITY command)
+    #     arm_target = clamp(arm_target + delta_ema, joint_limits)   (integrate + windup clamp)
+    # Fingers + mass UNAFFECTED. arm_action_smoothing unused while True. Mirror the
+    # TRAIN cfg values so pretrain→train ckpt transfer keeps matching action dynamics.
+    arm_delta_action: bool = True
+    arm_delta_scale: float = 0.25      # rad — max |delta| per control step at raw=±1
+    arm_delta_smoothing: float = 1.0   # EMA α on the delta command (higher = more responsive)
+    # ── END ARM DELTA-ACTION ──────────────────────────────────────────────────
+
+    # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ───────────────────────
+    # When True, the FINGER action output is interpreted as a per-control-step DELTA
+    # (residual) instead of an absolute target — same scheme on the finger slice, for
+    # action-semantics consistency (arm + fingers both velocity/residual).
+    #     raw_hand ∈ [-1,1]  →  delta_cmd = raw_hand * hand_delta_scale            (rad)
+    #     delta_ema = α·delta_cmd + (1-α)·delta_ema   (EMA on the VELOCITY command)
+    #     hand_target = clamp(hand_target + delta_ema, joint_limits)   (integrate + windup clamp)
+    # action_smoothing unused for fingers while True. Mirror the TRAIN cfg values.
+    # Changing this flips finger action semantics → BOTH phases must be re-pretrained.
+    hand_delta_action: bool = True
+    hand_delta_scale: float = 0.40      # rad — max |delta| per control step at raw=±1
+    hand_delta_smoothing: float = 1.0  # EMA α on the delta command (higher = more responsive)
+    # Per-joint override for the DISTAL (DIP) finger joints — see train cfg for rationale.
+    # Mirror the TRAIN cfg values so pretrain→train ckpt transfer keeps matching dynamics.
+    hand_delta_dip_joint_names: tuple[str, ...] = (
+        "finger_r_joint4", "finger_r_joint8", "finger_r_joint12",
+        "finger_r_joint16", "finger_r_joint20",
+    )
+    hand_delta_scale_dip: float = 0.25  # rad — smaller per-step delta for DIP joints
+    # ── END HAND DELTA-ACTION ─────────────────────────────────────────────────
 
     # Reward scales (GR pretrain: 1.5*alive - clamp(1.76*kpts + 12.5*ft, 1.5) + reg)
     # `rew_kpts` averages over 21 MANO keypoints (includes wrist as kpt 0).
     # `rew_arm_pos` supervises the 3 arm endpoints (wrist + elbow + arm_r_link7) under
     # a single weight. link7 indirectly constrains wrist orientation (compensates for
     # the missing rew_wrist_rot signal).
-    rew_alive: float = 1.6
+    rew_alive: float = 1.5
     rew_kpts: float = -1.76           # mean Z-weighted L2 over 21 MANO keypoints
     rew_arm_pos: float = -0.44          # mean Z-weighted L2 over (wrist, elbow, link7)
     rew_fingertip: float = -12.5      # GR pretrain: 12.5

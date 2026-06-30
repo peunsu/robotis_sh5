@@ -576,6 +576,39 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         default_normalized = self._unscale(default_ctrl)  # (27,) in [-1, 1]
         self._smoothed_actions = default_normalized.unsqueeze(0).expand(B, -1).clone()
 
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Integrated arm position target (rad) + EMA'd delta-command buffer.
+        # Mirrors the train env so pretrain→train ckpt transfer keeps action dynamics.
+        # Only used when cfg.arm_delta_action is True.
+        self._arm_target = (
+            self.robot.data.default_joint_pos[:1, self._arm_r_joint_ids].expand(B, -1).clone()
+        )
+        self._arm_delta_ema = torch.zeros(B, self.cfg.num_arm_r_dofs, device=self.device)
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
+
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Integrated finger position target (rad) + EMA'd delta-command buffer.
+        # Mirrors the train env so pretrain→train ckpt transfer keeps action dynamics.
+        # Only used when cfg.hand_delta_action is True.
+        self._hand_target = (
+            self.robot.data.default_joint_pos[:1, self._finger_joint_ids].expand(B, -1).clone()
+        )
+        self._hand_delta_ema = torch.zeros(B, self.cfg.num_hand_dofs, device=self.device)
+        # Per-joint delta scale (N_f,): hand_delta_scale everywhere, hand_delta_scale_dip on
+        # the DIP joints. Resolved by joint NAME → position in _finger_joint_ids (robust to
+        # articulation DOF ordering). Mirror of the train env.
+        self._hand_delta_scale_vec = torch.full(
+            (self.cfg.num_hand_dofs,), self.cfg.hand_delta_scale, device=self.device
+        )
+        if self.cfg.hand_delta_dip_joint_names:
+            dip_ids, dip_names = self.robot.find_joints(list(self.cfg.hand_delta_dip_joint_names))
+            dip_positions = [self._finger_joint_ids.index(j) for j in dip_ids]
+            for pos in dip_positions:
+                self._hand_delta_scale_vec[pos] = self.cfg.hand_delta_scale_dip
+            print(f"[hand-delta] DIP joints {dip_names} at finger slots {dip_positions} "
+                  f"→ scale {self.cfg.hand_delta_scale_dip} (others {self.cfg.hand_delta_scale})")
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
+
         # ── WARMUP ────────────────────────────────────────────────────────────
         # Per-env warm-up flag. Pretrain has no state cache, so the robot always
         # starts from the default pose and always needs warm-up to reach frame 0.
@@ -786,8 +819,40 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # Split α: hand uses action_smoothing, arm uses arm_action_smoothing (stronger smoothing → less wrist tremor).
         a_h = self.cfg.action_smoothing
         a_a = self.cfg.arm_action_smoothing
-        self._smoothed_actions[:, :20] = a_h * self.actions[:, :20] + (1.0 - a_h) * self._smoothed_actions[:, :20]
-        self._smoothed_actions[:, 20:] = a_a * self.actions[:, 20:] + (1.0 - a_a) * self._smoothed_actions[:, 20:]
+        N_f = self.cfg.num_hand_dofs   # 20 (FFW-SH5 native hand)
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Integrate the fingers once per control step (see train env for rationale).
+        # (Pretrain action has NO mass dim → use self.actions directly.)
+        if self.cfg.hand_delta_action:
+            hand_delta_cmd = self.actions[:, :N_f] * self._hand_delta_scale_vec
+            a_hd = self.cfg.hand_delta_smoothing
+            self._hand_delta_ema = a_hd * hand_delta_cmd + (1.0 - a_hd) * self._hand_delta_ema
+            self._hand_target = (self._hand_target + self._hand_delta_ema).clamp(
+                self._ctrl_lower[:N_f], self._ctrl_upper[:N_f]
+            )
+        else:
+            # Original absolute EMA scheme on the finger slice.
+            self._smoothed_actions[:, :N_f] = (
+                a_h * self.actions[:, :N_f] + (1.0 - a_h) * self._smoothed_actions[:, :N_f]
+            )
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
+
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Integrate the arm once per control step (see train env for rationale).
+        if self.cfg.arm_delta_action:
+            arm_delta_cmd = self.actions[:, N_f:] * self.cfg.arm_delta_scale
+            # EMA on the DELTA command (velocity), NOT the integrated target.
+            a_d = self.cfg.arm_delta_smoothing
+            self._arm_delta_ema = a_d * arm_delta_cmd + (1.0 - a_d) * self._arm_delta_ema
+            # Integrate + clamp accumulator to joint limits (windup prevention).
+            self._arm_target = (self._arm_target + self._arm_delta_ema).clamp(
+                self._ctrl_lower[N_f:], self._ctrl_upper[N_f:]
+            )
+        else:
+            # Original absolute EMA scheme on the arm slice.
+            prev_arm = self._smoothed_actions[:, N_f:]
+            self._smoothed_actions[:, N_f:] = a_a * self.actions[:, N_f:] + (1.0 - a_a) * prev_arm
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
 
     def _apply_action(self) -> None:
         N_f = self.cfg.num_hand_dofs   # 20
@@ -796,8 +861,24 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # Map smoothed actions from [-1, 1] to full joint limit range (action joints only).
         targets = self._scale(self._smoothed_actions).clamp(self._ctrl_lower, self._ctrl_upper)
 
-        self.robot.set_joint_position_target(targets[:, :N_f],         joint_ids=self._finger_joint_ids)
-        self.robot.set_joint_position_target(targets[:, N_f:N_f+N_a],  joint_ids=self._arm_r_joint_ids)
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Delta mode: finger targets come from the integrated accumulator (already rad +
+        # joint-clamped in _pre_physics_step); targets[:, :N_f] is unused in that mode.
+        if self.cfg.hand_delta_action:
+            finger_targets = self._hand_target
+        else:
+            finger_targets = targets[:, :N_f]
+        self.robot.set_joint_position_target(finger_targets, joint_ids=self._finger_joint_ids)
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Delta mode: arm targets come from the integrated accumulator (already rad +
+        # joint-clamped in _pre_physics_step); targets[:, N_f:] is unused in that mode.
+        if self.cfg.arm_delta_action:
+            arm_targets = self._arm_target
+        else:
+            arm_targets = targets[:, N_f:N_f+N_a]
+        self.robot.set_joint_position_target(arm_targets, joint_ids=self._arm_r_joint_ids)
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
         # Lift held at fixed target every step (NOT in action). PD target alone leaves
         # residual trembling under reaction forces from arm/hand motion, so we ALSO
         # forcibly write joint state every physics sub-step → lift effectively kinematic
@@ -920,6 +1001,30 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         # Total: 63+3+3+6+3+3+15+28+28+3+6+3+3+63+3+3+15+3+6+5+27+5 = 297
 
         self._prev_action = self.actions.clone()
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Overwrite the arm slice of the action history with the normalized integrated
+        # arm TARGET so the arm obs has the same absolute-target meaning as the fingers
+        # (mirror of the train env; keeps pretrain→train obs semantics consistent).
+        if self.cfg.arm_delta_action:
+            N_f = self.cfg.num_hand_dofs
+            N_a = self.cfg.num_arm_r_dofs
+            al = self._ctrl_lower[N_f:]
+            au = self._ctrl_upper[N_f:]
+            self._prev_action[:, N_f:N_f + N_a] = (
+                (2.0 * self._arm_target - au - al) / (au - al).clamp(min=1e-6)
+            )
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Overwrite the finger slice of the action history with the normalized integrated
+        # finger TARGET so the obs carries an absolute-target meaning (mirror of train env).
+        if self.cfg.hand_delta_action:
+            N_f = self.cfg.num_hand_dofs
+            fl = self._ctrl_lower[:N_f]
+            fu = self._ctrl_upper[:N_f]
+            self._prev_action[:, :N_f] = (
+                (2.0 * self._hand_target - fu - fl) / (fu - fl).clamp(min=1e-6)
+            )
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
 
         if self.cfg.debug_vis:
             ref_wrist_pos_vis = self._ref_wrist_pos[traj, frame] + env_orig
@@ -1306,6 +1411,21 @@ class RobotisSh5GraspPretrainEnv(DirectRLEnv):
         ], dim=-1)
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions[env_ids] = torch.where(cache_mask, cached_sa, default_normalized)
+
+        # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
+        # Seed the integrated arm target at the actual reset arm pose and zero the
+        # delta EMA so each episode integrates from rest.
+        if self.cfg.arm_delta_action:
+            self._arm_target[env_ids] = joint_pos_reset[:, self._arm_r_joint_ids]
+            self._arm_delta_ema[env_ids] = 0.0
+        # ── END ARM DELTA-ACTION ───────────────────────────────────────────────
+        # ── HAND DELTA-ACTION [ROLLBACK MARKER: hand-delta] ────────────────────
+        # Seed the integrated finger target at the actual reset finger pose and zero
+        # the delta EMA so each episode integrates from rest.
+        if self.cfg.hand_delta_action:
+            self._hand_target[env_ids] = joint_pos_reset[:, self._finger_joint_ids]
+            self._hand_delta_ema[env_ids] = 0.0
+        # ── END HAND DELTA-ACTION ──────────────────────────────────────────────
 
         # ── WARMUP ────────────────────────────────────────────────────────────
         # Cache-hit envs are already in a physically reasonable state → no warmup.

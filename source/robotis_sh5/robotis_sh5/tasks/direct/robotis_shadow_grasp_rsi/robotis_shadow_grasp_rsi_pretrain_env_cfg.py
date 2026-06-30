@@ -22,7 +22,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.utils import configclass
 
-from .robotis_shadow_grasp_env_cfg import FFW_SH5_DEX_CFG
+from .robotis_shadow_grasp_rsi_env_cfg import FFW_SH5_DEX_CFG
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
 _OAKINK_DATA_DIR = str(_DATA_DIR / "processed" / "oakink")
@@ -30,7 +30,7 @@ _HOCAP_DATA_DIR = str(_DATA_DIR / "processed" / "hocap")
 
 
 @configclass
-class RobotisShadowGraspPretrainEnvCfg(DirectRLEnvCfg):
+class RobotisShadowGraspRsiPretrainEnvCfg(DirectRLEnvCfg):
     """Configuration for Shadow-Hand grasping pretrain (kinematic-only, no object).
 
     Robot: FFW-SH5 arm + Shadow Dexterous Hand (fix_root_link=True).
@@ -100,9 +100,9 @@ class RobotisShadowGraspPretrainEnvCfg(DirectRLEnvCfg):
         physx=sim_utils.PhysxCfg(
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=1024 * 1024,
-            friction_correlation_distance=0.00625,
-            friction_offset_threshold=0.04,
-            bounce_threshold_velocity=0.01,
+            # friction_correlation_distance=0.00625,
+            # friction_offset_threshold=0.04,
+            # bounce_threshold_velocity=0.01,
             gpu_max_rigid_patch_count=4096 * 4096,
         ),
     )
@@ -199,7 +199,7 @@ class RobotisShadowGraspPretrainEnvCfg(DirectRLEnvCfg):
     #     hand_target = clamp(hand_target + delta_ema, joint_limits)   (integrate + windup clamp)
     # NOTE: when True, `rew_hand_action_reg` becomes a finger VELOCITY penalty. Set
     # hand_delta_action = False to restore the original absolute-action fingers.
-    hand_delta_action: bool = True
+    hand_delta_action: bool = False
     hand_delta_scale: float = 0.40      # rad — max |delta| per control step at raw=±1
     hand_delta_smoothing: float = 1.0  # EMA α on the delta command (higher = more responsive)
     # ── END HAND DELTA-ACTION ─────────────────────────────────────────────────

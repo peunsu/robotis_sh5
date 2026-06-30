@@ -74,11 +74,11 @@ def convert_object(assets_dir: Path, obj_id: str, mass: float, friction: float) 
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(
             collision_enabled=True,
-            # Bake collision offsets into the object's USD so spawn-time
-            # `collision_props` overrides aren't needed (Isaac Lab's
-            # `modify_collision_properties` is a no-op on instanced prims).
-            contact_offset=0.005,
-            rest_offset=0.0,
+            # Use Isaac Sim / PhysX default collision offsets (custom 0.005 / 0.0 values
+            # commented out). These bake into the object's USD, so re-run this converter
+            # with --overwrite for the change to take effect on existing visual.usd files.
+            # contact_offset=0.005,
+            # rest_offset=0.0,
         ),
         mesh_collision_props=mesh_collider,
     )

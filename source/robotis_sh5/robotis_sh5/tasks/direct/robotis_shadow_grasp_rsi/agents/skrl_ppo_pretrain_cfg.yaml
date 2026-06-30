@@ -60,7 +60,7 @@ agent:
   rewards_shaper_scale: 0.1
   time_limit_bootstrap: False
   experiment:
-    directory: "robotis_shadow_grasp_pretrain"
+    directory: "robotis_shadow_grasp_rsi_pretrain"
     experiment_name: "default"
     write_interval: 10
     checkpoint_interval: 1000

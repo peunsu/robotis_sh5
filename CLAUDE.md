@@ -71,6 +71,21 @@ python scripts/skrl/train.py --task=Robotis-Shadow-Grasp-Direct-v0 --num_envs=20
 VIDEO=1 bash scripts/benchmark/hocap/train_sequences_shadow.sh
 ```
 
+**Train / evaluate — Shadow Hand RSI warm-start variant:**
+```bash
+# Same data assets as the shadow variant; results land in a SEPARATE ffw_shadow_rsi tree.
+# Pretrain saves pretrain_state_cache.npz next to pretrain.pt; train loads it as a sibling.
+bash scripts/benchmark/hocap/train_sequences_shadow_rsi.sh
+bash scripts/benchmark/hocap/evaluate_sequences_shadow_rsi.sh   # → ffw_shadow_rsi_method{1,2,3}.csv
+
+# Manual single sequence (pretrain → train):
+python scripts/skrl/train.py --task=Robotis-Shadow-Grasp-Rsi-Pretrain-Direct-v0 --num_envs=4096 --headless \
+    --dataset hocap --object_id G10_1 --trajectory_task subject_1-20231025_170231-G10_1
+python scripts/skrl/train.py --task=Robotis-Shadow-Grasp-Rsi-Direct-v0 --num_envs=2048 --headless \
+    --dataset hocap --object_id G10_1 --trajectory_task subject_1-20231025_170231-G10_1 \
+    --checkpoint <PRETRAIN_CKPT>   # sibling pretrain_state_cache.npz is auto-loaded
+```
+
 **Rollout / evaluation:**
 ```bash
 # Single-agent
@@ -139,6 +154,8 @@ pre-commit run --all-files
 | `Robotis-Sh5-Grasp-Marl-Pretrain-Direct-v0` | same shapes | same shapes | MARL pretrain (no object) — ckpt shape-compatible with train |
 | `Robotis-Shadow-Grasp-Direct-v0` | 26D | 291D | Same scheme as sh5 but with Shadow Hand (18 actuated fingers + 7 arm + 1 mass). USD: `FFW_SH5_shadow_instanced.usd` |
 | `Robotis-Shadow-Grasp-Pretrain-Direct-v0` | 25D | 291D | Shadow Hand kinematic-only pretrain (no mass) |
+| `Robotis-Shadow-Grasp-Rsi-Direct-v0` | 26D | 291D | Shadow Hand + **pretrain-cache RSI warm-start** (copy of shadow grasp; see "Shadow Hand RSI Warm-Start Variant"). Separate `ffw_shadow_rsi` tree |
+| `Robotis-Shadow-Grasp-Rsi-Pretrain-Direct-v0` | 25D | 291D | RSI variant pretrain — dumps `pretrain_state_cache.npz` for the train phase to warm-start from |
 | `Template-Robotis-Sh5-Direct-v0` | — | — | Single-agent direct RL template |
 | `Template-Robotis-Sh5-Marl-Direct-v0` | — | — | Multi-agent variant |
 | `Robotis-SH5-Pick-and-Place-v0` | — | — | Manager-based dexterous manipulation |
@@ -165,6 +182,10 @@ source/robotis_sh5/robotis_sh5/
 │   ├── robotis_shadow_grasp_env.py / _cfg.py             ← train env (action 26D, obs 291D)
 │   ├── robotis_shadow_grasp_pretrain_env.py / _cfg.py    ← pretrain env (action 25D, obs 291D)
 │   └── agents/                                            ← reuses MassDexMimicPolicy + skrl PPO yaml
+├── tasks/direct/robotis_shadow_grasp_rsi/  ← Shadow Hand + pretrain-cache RSI warm-start
+│   ├── robotis_shadow_grasp_rsi_env.py / _cfg.py          ← copy of shadow grasp + warm-start logic
+│   ├── robotis_shadow_grasp_rsi_pretrain_env.py / _cfg.py ← saves state cache at end of pretrain
+│   └── agents/                                            ← own log tree (robotis_shadow_grasp_rsi{,_pretrain})
 ├── tasks/direct/robotis_sh5*/        ← template tasks
 ├── tasks/manager_based/              ← pick-and-place, reach, navigation
 └── data/
@@ -241,6 +262,16 @@ make the PPO ratio non-trivial for mass (clipping restrains σ growth).
 - Patches `record_transition` to write `is_reached_end` into `sigma_grad_flg`.
 - Replaces `agent._update` to apply per-mini-batch: `entropy_scale = base * (1 - sw) - 0.002 * sw`
   where `sw = sampled_sigma[0].item()`.
+
+**`_load_partial_checkpoint`** (pretrain → train transfer; always used for grasp-train):
+copies policy/value network weights by shape (partial top-left copy on dim mismatch) and
+skips `log_std_parameter` (TJ-style σ reset). Preprocessors (`observation_preprocessor` /
+`value_preprocessor` RunningStandardScaler) are **deliberately NOT transferred** — the scaler
+re-learns the train obs distribution from scratch. Transferring them is actively harmful: the
+pretrain stats are frozen (`current_count` ~3e7 → train batches carry ~0 weight) and have
+near-zero variance on the object velocity/force/contact dims (those obs are zero in the
+no-object pretrain), so real train physics values get divided by ~√1e-8 → exploding inputs that
+never correct. Same rationale as the MARL loader's deliberate reset.
 
 ### MARL Architecture (`robotis_sh5_grasp_marl_env.py` + `train_marl.py`)
 
@@ -365,12 +396,15 @@ data/processed/<dataset>/              # oakink or hocap
 │   └── evaluation_ep_le_<N>/metrics.csv
 ├── ffw_sh5_marl/right/<task>/<id>/    # MARL checkpoints (parallel tree)
 │   └── (same structure)
-└── ffw_shadow/right/<task>/<id>/      # Shadow Hand variant (parallel tree)
-    └── (same structure)
+├── ffw_shadow/right/<task>/<id>/      # Shadow Hand variant (parallel tree)
+│   └── (same structure)
+└── ffw_shadow_rsi/right/<task>/<id>/  # Shadow Hand RSI warm-start variant (parallel tree)
+    └── (same structure) + pretrain_state_cache.npz   # saved at pretrain, loaded at train
 ```
 
-`evaluate.bash` automatically iterates over all `ffw_sh5*/` subdirectories under `data/processed/<dataset>/`
-and produces per-model aggregate CSVs (`ffw_sh5_method{1,2,3}.csv`, `ffw_sh5_marl_method{1,2,3}.csv`).
+`evaluate.bash` automatically iterates over every subdirectory under `data/processed/<dataset>/` that
+contains a `metrics.csv` (e.g. `ffw_sh5/`, `ffw_sh5_marl/`, `ffw_shadow/`, `ffw_shadow_rsi/`) and
+produces per-model aggregate CSVs (`<model>_method{1,2,3}.csv`).
 
 ### Robot Platform: FFW-SH5
 
@@ -435,6 +469,86 @@ two-phase pretrain → train workflow as sh5. Notable differences:
 - **Viewer**: both shadow cfgs use `origin_type="env"`, `env_index=0` so camera coords are
   env-local and the framing is stable regardless of `num_envs` (default `"world"` made the
   GridCloner shift env 0's world position with grid size).
+
+- **Arm delta-action** (`arm_delta_action=True`, both train + pretrain env/cfg; finger + mass
+  unaffected): the ARM action is a per-control-step *residual* rather than an absolute target.
+  Per control step in `_pre_physics_step`: `delta_cmd = raw_arm * arm_delta_scale` (rad, raw ∈
+  [-1,1]) → `delta_ema = α·delta_cmd + (1-α)·delta_ema` (EMA α=`arm_delta_smoothing` on the
+  *delta/velocity*, **not** the integrated target — smoothing the target degenerates to
+  `prev + α·delta`) → `arm_target = clamp(arm_target + delta_ema, joint_limits)` (accumulator
+  clamped → no integral windup). `_apply_action` then writes `_arm_target` directly for the arm.
+  Integration low-pass-filters action noise → suppresses wrist tremor that the absolute-action
+  scheme + `arm_action_smoothing` could not. Buffers `_arm_target`/`_arm_delta_ema` are seeded in
+  `_reset_idx` (target = actual reset arm pose, delta EMA = 0). **Obs**: the arm slice of the
+  action-history obs (`_prev_action[:, N_f:N_f+N_a]`) is overwritten with the *normalized
+  integrated target* (not the raw delta) so it carries the same absolute-target meaning as the
+  finger slice and exposes the integrator's hidden state; done at the `_prev_action` capture site
+  so obs dim, lag-1 timing, and reset-to-zero stay identical to the fingers. Defaults: `arm_delta_scale=0.25`,
+  `arm_delta_smoothing=0.5`; `arm_action_smoothing` is unused while enabled. **Rollback**: set
+  `arm_delta_action=False` (restores the absolute EMA arm with zero other changes). All code sites
+  are bracketed by `[ROLLBACK MARKER: arm-delta]` comment blocks. Mirror values across BOTH cfgs
+  so pretrain→train checkpoint transfer keeps matching action dynamics.
+- **Hand delta-action** (`hand_delta_action=True`, both train + pretrain env/cfg; arm + mass
+  unaffected): identical residual scheme applied to the FINGER slice, for action-semantics
+  consistency (arm + fingers both velocity/residual). Per control step: `delta_cmd =
+  raw_hand * hand_delta_scale` → `delta_ema = α·delta_cmd + (1-α)·delta_ema`
+  (α=`hand_delta_smoothing`) → `hand_target = clamp(hand_target + delta_ema, joint_limits)`.
+  `_apply_action` writes `_hand_target` directly for fingers. Buffers `_hand_target`/
+  `_hand_delta_ema` seeded in `_reset_idx` (target = actual reset finger pose, EMA = 0).
+  **Obs**: `_prev_action[:, :N_f]` is overwritten with the *normalized integrated finger target*
+  (same treatment as the arm slice). Defaults: `hand_delta_scale=0.5`, `hand_delta_smoothing=1.0`;
+  `action_smoothing` is unused for the finger slice while enabled. **Caveats**: (1) in delta mode
+  `rew_hand_action_reg` (Σ raw finger action²) becomes a finger *velocity* penalty, not a flexion
+  penalty; (2) delta=0 means HOLD (not "go to mid-range") and zero-mean action noise random-walks
+  the target around the open reset pose, so contact-force exploration is weaker than absolute mode
+  (observed: fingertip forces drop) — may need lower `rew_hand_action_reg` / higher exploration σ.
+  **Re-pretrain required** when toggling (finger action semantics change). **Rollback**: set
+  `hand_delta_action=False` (restores absolute EMA fingers). All code sites are bracketed by
+  `[ROLLBACK MARKER: hand-delta]` comment blocks. Mirror values across BOTH cfgs for ckpt transfer.
+
+### Shadow Hand RSI Warm-Start Variant (`tasks/direct/robotis_shadow_grasp_rsi/`)
+
+A copy of the Shadow Hand task (`Robotis-Shadow-Grasp-Rsi-{,Pretrain-}Direct-v0`) that warm-starts
+the train phase's Reference-State-Initialization (RSI) cache from the **pretrain phase's state
+cache**. Motivation: the train cache normally starts EMPTY, so `_reached_frame` crawls from 0 and
+the policy can only start near frame 0 until the cache fills (cold start). The pretrain phase already
+visited ALL frames under physics, so its per-frame robot states are physically-valid init poses
+(object-free) — reusing them lets the train phase sample/start across the whole trajectory from step 0.
+All code sites are bracketed by `[ROLLBACK MARKER: pretrain-cache-warmstart]`.
+
+- **Cache save (pretrain)**: `scripts/skrl/train.py`, after `runner.run()` for an RSI *pretrain* task,
+  dumps `env.unwrapped._state_cache` + `_init_flg` + `_reached_frame` to `pretrain_state_cache.npz`
+  in BOTH the run `log_dir` and the data-tree `_ckpt_dir`. The benchmark script also copies it next
+  to `pretrain.pt`.
+- **Cache load (train)**: `train.py` looks for `pretrain_state_cache.npz` as a **sibling of
+  `--checkpoint`**; if present, calls `env.unwrapped.set_pretrain_cache(path)` (validates trajectory
+  length). No cfg path field — convention only.
+- **Concurrent read+write RSI** (`_reset_idx`): with the pretrain cache loaded, every reset
+  (1) samples a start frame ONLY among frames present in the **train OR pretrain** cache (drops the
+  `_reached_frame` gate; failure-weighted, ≈uniform early; rewound `_adaptive_back_frames` for run-up,
+  with a safeguard snapping back to the sampled frame if the rewound one is uncovered), and
+  (2) restores the robot from the **train cache if that frame has one, else the pretrain cache**
+  (object always from the reference trajectory on a train cache-miss). The "fixed home pose +
+  frame-0 IK" cold fallback is therefore never reached on this path. The train cache is read AND
+  written from step 0; as it fills, the pretrain fallback self-deprecates (watch
+  `Curriculum / pretrain_fallback_ratio` → 0, `Curriculum / cache_coverage` → 1).
+- **Cache write gate**: while the pretrain cache is loaded, `_save_state_cache` requires
+  `episode_length_buf >= 3` before writing (pretrain poses are object-free → restoring with the object
+  can interpenetrate and terminate in 1–2 steps; this keeps those bad states out of the train cache).
+  The reference is NEVER rewritten and the pretrain reward column is never compared (pretrain cache is
+  read-only) — no reward-scale mixing.
+- **init-save fix**: the TJ-style first-reset frame-0 seed (`_state_cache[0]`) now copies from an env
+  that *actually* started at frame 0 (was a bug: warm-start samples arbitrary start frames, so the old
+  hard-coded local-env-0 wrote a grasp-frame state into the frame-0 slot → grasp-pose-vs-table-reference
+  mismatch → spurious early termination).
+- **Separate tree**: `train.py` routes any task containing `"Rsi"` to `ffw_shadow_rsi` (checkpoints,
+  task_info, cache, metrics) and the agents YAML log dir to `robotis_shadow_grasp_rsi{,_pretrain}` so
+  RSI runs never clobber plain-Shadow results. `evaluate.bash` auto-discovers the new tree.
+- **Rollback / baseline**: set `pretrain_cache_warmstart=False` (cfg) → all warm-start logic is
+  gated off and the env behaves IDENTICALLY to the original `robotis_shadow_grasp` (empty train cache,
+  `_reached_frame` gate, fixed-home-pose fallback). Clean A/B baseline. `rollout.py` never arms the
+  warm-start, so evaluation runs the same protocol as the other variants.
+- Benchmark: `scripts/benchmark/hocap/{train,evaluate}_sequences_shadow_rsi.sh`.
 
 ## Key Config Fields
 

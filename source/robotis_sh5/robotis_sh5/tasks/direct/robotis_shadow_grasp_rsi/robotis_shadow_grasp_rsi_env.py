@@ -31,7 +31,7 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_conjugate, quat_mul
 
-from .robotis_shadow_grasp_env_cfg import RobotisShadowGraspEnvCfg
+from .robotis_shadow_grasp_rsi_env_cfg import RobotisShadowGraspRsiEnvCfg
 
 
 def quat_to_6d(quat: torch.Tensor) -> torch.Tensor:
@@ -136,12 +136,12 @@ _MANO_FT_INDICES = [4, 8, 12, 16, 20]  # tip MANO indices → ft_pos[:, 0:5]
 _NUM_KPTS = 23  # 21 MANO + elbow (21) + arm_r_link7 (22)
 
 
-class RobotisShadowGraspEnv(DirectRLEnv):
+class RobotisShadowGraspRsiEnv(DirectRLEnv):
     """Dexterous grasping with FFW-SH5 using OakInk kinematic references."""
 
-    cfg: RobotisShadowGraspEnvCfg
+    cfg: RobotisShadowGraspRsiEnvCfg
 
-    def __init__(self, cfg: RobotisShadowGraspEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: RobotisShadowGraspRsiEnvCfg, render_mode: str | None = None, **kwargs):
         self._load_reference_trajectories(cfg)
         self._apply_object_mass_from_json(cfg)
         self._object_cfg = self._build_object_cfg(cfg)
@@ -164,7 +164,7 @@ class RobotisShadowGraspEnv(DirectRLEnv):
     # Data loading
     # ------------------------------------------------------------------
 
-    def _load_reference_trajectories(self, cfg: RobotisShadowGraspEnvCfg) -> None:
+    def _load_reference_trajectories(self, cfg: RobotisShadowGraspRsiEnvCfg) -> None:
         """Load trajectory_keypoints.npz file(s) for the configured object and trajectory."""
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
         data_dir = _data_root / "mano" / "right"
@@ -388,12 +388,24 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         #   (b) delta_ft_obj obs: contact fingers target nearest vertex (not ref fingertip)
         #   (c) fingertip reward: contact fingers target nearest vertex
         contact_vertex_local_list: list[np.ndarray] = []
+        # ── CONTACT-MAP REWARD [ROLLBACK MARKER: contact-map-reward] ───────────────
+        # Per (frame, fingertip) grounded force-projection DIRECTION (object-local).
+        # Default (cfg.use_fingertip_to_vertex_dir): unit (ref fingertip − nearest
+        # contact vertex) ≈ outward surface normal, auto-pointing to the finger side.
+        # Else: the object mesh vertex normal at the contact vertex. Parallel to
+        # contact_vertex_local; rotated to world + used as the force-projection
+        # direction in the reward. Zeros when no mesh (→ pad-normal fallback at runtime).
+        contact_normal_local_list: list[np.ndarray] = []
+        # ── END CONTACT-MAP REWARD ────────────────────────────────────────────────
         _action_fps_cv = round(1.0 / (cfg.sim.dt * cfg.decimation))
         if mesh_path.exists():
             _verts = np.array(_mesh.vertices, dtype=np.float32)  # (V, 3) object-local frame
+            # [contact-map-reward] per-vertex outward surface normals (object-local).
+            _vnorm = np.array(_mesh.vertex_normals, dtype=np.float32)  # (V, 3)
             for i in range(len(obj_pos_list)):
                 N_i = obj_pos_list[i].shape[0]
                 cv_local = np.zeros((N_i, 5, 3), dtype=np.float32)
+                cn_local = np.zeros((N_i, 5, 3), dtype=np.float32)  # [contact-map-reward]
                 cv_dist  = np.zeros((N_i, 5),    dtype=np.float32)
                 for t in range(N_i):
                     op = obj_pos_list[i][t]    # (3,) world
@@ -413,6 +425,17 @@ class RobotisShadowGraspEnv(DirectRLEnv):
                     idxs  = np.argmin(dists, axis=0)                    # (5,)
                     cv_local[t] = _verts[idxs]                          # (5, 3)
                     cv_dist[t]  = dists[idxs, np.arange(5)]            # (5,)
+                    # [contact-map-reward] grounded force-projection direction (object-local).
+                    if cfg.use_fingertip_to_vertex_dir:
+                        # fingertip - nearest vertex = vector from the surface toward the
+                        # finger ≈ OUTWARD surface normal, auto-pointing to the finger side
+                        # (no sign ambiguity). Degenerate when the fingertip sits on the
+                        # surface (‖·‖→0); fall back to the mesh vertex normal there.
+                        dvec = fp_local - cv_local[t]                   # (5, 3) vertex→fingertip
+                        dnrm = np.linalg.norm(dvec, axis=-1, keepdims=True)  # (5, 1)
+                        cn_local[t] = np.where(dnrm > 5e-3, dvec / np.clip(dnrm, 1e-6, None), _vnorm[idxs])
+                    else:
+                        cn_local[t] = _vnorm[idxs]                      # (5, 3) mesh surface normal
                 # Recompute future_contact using relative vertex distance (GR method):
                 #   contact iff (linvel>0.05 m/s OR angvel>0.25 rad/s) AND (cv_dist - min_cv_dist < 0.015)
                 op_arr = obj_pos_list[i]
@@ -429,10 +452,14 @@ class RobotisShadowGraspEnv(DirectRLEnv):
                 near_vtx = (cv_dist - cv_min) < 0.015                    # (N, 5)
                 future_contact_list[i] = (vel_cond[:, None] & near_vtx).astype(np.float32)
                 contact_vertex_local_list.append(cv_local)
+                contact_normal_local_list.append(cn_local)  # [contact-map-reward]
         else:
             print("[grasp] visual.obj not found; contact vertex data unavailable; using centroid fallback.")
             for i in range(len(obj_pos_list)):
                 contact_vertex_local_list.append(
+                    np.zeros((obj_pos_list[i].shape[0], 5, 3), dtype=np.float32)
+                )
+                contact_normal_local_list.append(  # [contact-map-reward] zeros → pad-normal fallback
                     np.zeros((obj_pos_list[i].shape[0], 5, 3), dtype=np.float32)
                 )
 
@@ -454,6 +481,9 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         self._ref_obj_quat = torch.from_numpy(_pad(obj_quat_list, (4,)))
         self._future_contact = torch.from_numpy(_pad(future_contact_list, (5,)))
         self._ref_contact_vertex_local = torch.from_numpy(_pad(contact_vertex_local_list, (5, 3)))
+        # [contact-map-reward] grounded force-projection direction at each contact vertex
+        # (object-local): fingertip→vertex direction or mesh normal, per cfg toggle.
+        self._ref_contact_normal_local = torch.from_numpy(_pad(contact_normal_local_list, (5, 3)))
         self._ref_mano_kpts = torch.from_numpy(_pad(mano_kpts_list, (_NUM_KPTS, 3)))
         self._traj_lengths = torch.tensor([a.shape[0] for a in wrist_pos_list], dtype=torch.long)
         self._max_traj_len = max_len
@@ -480,7 +510,7 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         print(f"[grasp] Loaded {n_traj} trajectories for '{cfg.object_id}', max_len={max_len}")
 
     @staticmethod
-    def _apply_object_mass_from_json(cfg: RobotisShadowGraspEnvCfg) -> None:
+    def _apply_object_mass_from_json(cfg: RobotisShadowGraspRsiEnvCfg) -> None:
         """Override cfg.object_mass_min/max from the per-object mass JSON if available."""
         # Resolve dataset-aware path: each dataset uses its own
         # data/processed/<dataset>/object_mass.json by default. ``cfg.object_mass_json``
@@ -513,7 +543,7 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         cfg.object_mass_min = lo
         cfg.object_mass_max = hi
 
-    def _build_object_cfg(self, cfg: RobotisShadowGraspEnvCfg) -> RigidObjectCfg:
+    def _build_object_cfg(self, cfg: RobotisShadowGraspRsiEnvCfg) -> RigidObjectCfg:
         _data_root = Path(cfg.hocap_data_dir if cfg.dataset == "hocap" else cfg.oakink_data_dir)
         usd_path = _data_root / "assets" / "objects" / cfg.object_id / "visual.usd"
         if not usd_path.exists():
@@ -688,7 +718,7 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         for attr in (
             "_ref_wrist_pos", "_ref_wrist_quat", "_ref_ft_pos",
             "_ref_obj_pos", "_ref_obj_quat", "_future_contact",
-            "_ref_contact_vertex_local", "_ref_mano_kpts", "_traj_lengths",
+            "_ref_contact_vertex_local", "_ref_contact_normal_local", "_ref_mano_kpts", "_traj_lengths",
         ):
             setattr(self, attr, getattr(self, attr).to(self.device))
 
@@ -870,6 +900,25 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         self._reached_frame: int = 0  # furthest frame with sustained good tracking
         # TJ-style: force-save frame 0 cache once on first reset so subsequent resets reuse the IK-lifted pose.
         self._init_save_done: bool = False
+
+        # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+        # Read-only pretrain state cache (78-dim layout) + populated-frame mask,
+        # injected by scripts/skrl/train.py via set_pretrain_cache() when a sibling
+        # pretrain_state_cache.npz exists next to the loaded checkpoint. When loaded,
+        # _reset_idx (a) restricts start-frame sampling to frames present in the train
+        # OR pretrain cache and (b) restores the robot from the pretrain cache on a
+        # train cache-miss. Stays None when no cache is provided → original behavior.
+        self._pretrain_cache: torch.Tensor | None = None        # (max_traj_len, 78)
+        self._pretrain_init_flg: torch.Tensor | None = None     # (max_traj_len,) bool; False = populated
+        self._last_pretrain_fallback_ratio: float = 0.0         # logging: pretrain-restored frac of last reset
+        self._sampling_step_count: int = 0                      # control steps seen (for uniform_sampling_steps)
+        # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
+        # ── OBJECT FRICTION CURRICULUM [ROLLBACK MARKER: friction-curriculum] ──────
+        self._friction_step_count: int = 0                      # control steps seen (for friction decay)
+        self._last_friction_mean: float = float(self.cfg.friction_max_init)  # logging
+        self._last_friction_max: float = float(self.cfg.friction_max_init)   # logging
+        # ── END OBJECT FRICTION CURRICULUM ────────────────────────────────────────
 
         # Per-episode tracking quality (for enough_idx and reached_frame update)
         self._enough_continued = torch.ones(B, dtype=torch.bool, device=self.device)
@@ -1106,6 +1155,74 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         # Reference arm_r_link7 position: n yellow spheres
         self._vis_ref_link7.visualize(translations=ref_link7_pos[:n])
 
+    # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+    def set_pretrain_cache(self, npz_path: str) -> bool:
+        """Load a pretrain state cache (78-dim) from disk and arm the warm-start.
+
+        Called by scripts/skrl/train.py when a `pretrain_state_cache.npz` sibling of
+        the loaded checkpoint exists. Returns True if the cache was accepted. Validates
+        that the cache trajectory length matches this env's; on any mismatch/error the
+        warm-start stays disabled (vanilla behavior).
+        """
+        import numpy as np
+
+        if not self.cfg.pretrain_cache_warmstart:
+            print("[pretrain-cache-warmstart] disabled by cfg; ignoring cache.")
+            return False
+        try:
+            data = np.load(npz_path)
+            cache = torch.as_tensor(data["state_cache"], dtype=torch.float32, device=self.device)
+            init_flg = torch.as_tensor(data["init_flg"], dtype=torch.bool, device=self.device)
+        except Exception as e:
+            print(f"[pretrain-cache-warmstart] failed to load {npz_path}: {e}")
+            return False
+        if cache.shape[0] != self._max_traj_len:
+            print(
+                f"[pretrain-cache-warmstart] traj len mismatch "
+                f"(cache={cache.shape[0]} vs env={self._max_traj_len}); ignoring."
+            )
+            return False
+        n_pop = int((~init_flg).sum().item())
+        self._pretrain_cache = cache
+        self._pretrain_init_flg = init_flg
+        print(
+            f"[pretrain-cache-warmstart] loaded {npz_path}: {n_pop}/{self._max_traj_len} "
+            f"frames populated; train resets will fall back to the pretrain cache on "
+            f"train cache-miss until the train cache fills."
+        )
+        return True
+    # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
+    # ── OBJECT FRICTION CURRICULUM [ROLLBACK MARKER: friction-curriculum] ──────
+    def _apply_object_friction(self, env_ids) -> None:
+        """Sample per-episode object friction and apply it (static = dynamic) to the
+        object material for `env_ids`. Sampled uniformly from [friction_min,
+        friction_max(t)], where friction_max(t) decays LINEARLY from friction_max_init
+        to friction_min over cfg.friction_decay_steps control steps. No-op when the
+        curriculum is disabled. Wrapped in try/except since root_physx_view may not be
+        ready on the very first reset (called from __init__)."""
+        if not self.cfg.friction_curriculum:
+            return
+        fmin = self.cfg.friction_min
+        decay = max(1, self.cfg.friction_decay_steps)
+        frac = min(self._friction_step_count / decay, 1.0)
+        fmax = self.cfg.friction_max_init + (fmin - self.cfg.friction_max_init) * frac  # init → min
+        self._last_friction_max = float(fmax)
+        try:
+            if isinstance(env_ids, torch.Tensor):
+                eids = env_ids.detach().to(dtype=torch.long, device="cpu")
+            else:
+                eids = torch.as_tensor(list(env_ids), dtype=torch.long, device="cpu")
+            fr = fmin + (fmax - fmin) * torch.rand(eids.numel())          # (n,) cpu in [fmin, fmax]
+            materials = self.object.root_physx_view.get_material_properties()  # (num_envs, num_shapes, 3) cpu
+            materials[eids, :, 0] = fr.unsqueeze(-1)                       # static friction
+            materials[eids, :, 1] = fr.unsqueeze(-1)                       # dynamic friction (= static)
+            self.object.root_physx_view.set_material_properties(materials, eids)
+            self._last_friction_mean = float(fr.mean().item())
+        except Exception as e:
+            print(f"[friction-curriculum] skip apply (view not ready?): {e}")
+    # ── END OBJECT FRICTION CURRICULUM ────────────────────────────────────────
+
     # ------------------------------------------------------------------
     # Step methods
     # ------------------------------------------------------------------
@@ -1148,6 +1265,16 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         else:
             self._frame_idx = new_frame
         # ── END WARMUP ────────────────────────────────────────────────────────
+
+        # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+        # Count control steps to drive the initial uniform-sampling window (see
+        # cfg.uniform_sampling_steps). Global training-progress counter (not per-env).
+        self._sampling_step_count += 1
+        # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
+        # ── OBJECT FRICTION CURRICULUM [ROLLBACK MARKER: friction-curriculum] ──────
+        self._friction_step_count += 1  # drives friction_max(t) linear decay
+        # ── END OBJECT FRICTION CURRICULUM ────────────────────────────────────────
 
         # EMA smoothing on joint actions (dims 0–26 = 20 fingers + 7 arm);
         # mass dim (27) is not smoothed. Lift is NOT in the action.
@@ -1389,14 +1516,16 @@ class RobotisShadowGraspEnv(DirectRLEnv):
 
         return {"policy": obs}
 
-    def _get_fingertip_forces(self) -> torch.Tensor:
-        """Return per-fingertip compressive contact force (N), projected onto pad-inward direction.
+    def _get_fingertip_forces(self, direction_w: torch.Tensor | None = None) -> torch.Tensor:
+        """Return per-fingertip compressive contact force (N), projected onto a direction.
 
         Uses `force_matrix_w` (per-filter-object contact force) — only counts contact
         with the Object (filter target), NOT self-collision or table contacts.
-        Mirrors TJ's projection:
-            force_along_pad = (force_w * -pad_normal_w).sum(-1).clamp_min(0)
-        where `pad_normal_w` is the pad-OUTWARD unit normal in world frame.
+            force_along_dir = (force_w * direction_w).sum(-1).clamp_min(0)
+        `direction_w` is a (B, 5, 3) per-finger unit direction in world frame pointing
+        in the COMPRESSIVE (pressing) sense. When None (default — used for the obs
+        term), it falls back to pad-INWARD (= -pad_normal_w), the original TJ behavior.
+        The contact-map reward passes the grounded object-surface normal here instead.
 
         [THUMB-RADIUS-FILTER]: the thumb's force is additionally gated by the
         distance between the avg contact position and the actual thumb-tip
@@ -1404,7 +1533,9 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         """
         B = self.num_envs
         forces = torch.zeros(B, 5, device=self.device)
-        pad_normals_w = self._compute_fingertip_pad_normals_w()   # (B, 5, 3) pad-OUTWARD
+        if direction_w is None:
+            pad_normals_w = self._compute_fingertip_pad_normals_w()   # (B, 5, 3) pad-OUTWARD
+            direction_w = -pad_normals_w                              # (B, 5, 3) pad-inward
         # [THUMB-RADIUS-FILTER] Precompute world-frame tip positions for the
         # thumb-only spatial gate below. Cheap (one quat_apply over 5 links).
         ft_pos_w = self._compute_fingertip_positions()             # (B, 5, 3)
@@ -1417,8 +1548,8 @@ class RobotisShadowGraspEnv(DirectRLEnv):
                 # force_matrix_w: (B, num_bodies=1, num_filter=1, 3) — contact force with Object only.
                 fmat = sensor.data.force_matrix_w
                 force_vec = fmat[:, 0, 0, :]          # (B, 3) force on fingertip from object
-                inward = -pad_normals_w[:, i, :]      # (B, 3) pad-inward (into finger body)
-                f = (force_vec * inward).sum(dim=-1).clamp(min=0.0)   # (B,)
+                d = direction_w[:, i, :]              # (B, 3) compressive direction
+                f = (force_vec * d).sum(dim=-1).clamp(min=0.0)       # (B,)
 
                 # ── [THUMB-RADIUS-FILTER] ─────────────────────────────────
                 # Thumb tip link is much longer than the other fingers — PhysX
@@ -1453,6 +1584,29 @@ class RobotisShadowGraspEnv(DirectRLEnv):
             except Exception:
                 pass
         return forces
+
+    # ── CONTACT-MAP REWARD [ROLLBACK MARKER: contact-map-reward] ───────────────
+    def _get_fingertip_contact_pos_w(self) -> torch.Tensor:
+        """Per-fingertip ACTUAL contact position (world frame), (B, 5, 3).
+
+        From the contact sensor's `contact_pos_w` (avg contact point per body/filter,
+        requires track_contact_points=True — already set). Entries are NaN where the
+        finger has no contact with the object; callers must NaN-guard.
+        """
+        B = self.num_envs
+        cpos = torch.full((B, 5, 3), float("nan"), device=self.device)
+        for i, name in enumerate(self.cfg.fingertip_body_names):
+            sensor = self._contact_sensors.get(name)
+            if sensor is None:
+                continue
+            try:
+                cp = sensor.data.contact_pos_w
+                if cp is not None:
+                    cpos[:, i, :] = cp[:, 0, 0, :]    # (B, 3); NaN when no contact
+            except Exception:
+                pass
+        return cpos
+    # ── END CONTACT-MAP REWARD ────────────────────────────────────────────────
 
     def _get_arm_table_force(self) -> torch.Tensor:
         """Return per-env contact force magnitude (N) between any arm_r_link3..link7 and the table.
@@ -1589,8 +1743,35 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         self._last_ft_raw_err = ft_err_raw
 
         # Contact force reward (mirrors GR train env).
-        raw_forces = self._get_fingertip_forces()                              # (B, 5)
-        contact_condition = (ft_err_per_finger < 0.03).float()                # (B, 5)
+        # ── CONTACT-MAP REWARD [ROLLBACK MARKER: contact-map-reward] ───────────────
+        # (i) Projection direction = grounded object-surface normal at the contact
+        #     vertex (world), sign-aligned to the pad's compressive sense so it never
+        #     points opposite the finger. Falls back to pad-inward where the normal is
+        #     degenerate (no mesh) or when use_grounded_normal is off.
+        pad_inward = -self._compute_fingertip_pad_normals_w()                  # (B,5,3) compressive sense
+        if self.cfg.use_grounded_normal:
+            ref_normal_local = self._ref_contact_normal_local[traj, frame]     # (B,5,3) obj-local outward
+            gn = quat_apply(obj_quat_exp_r, ref_normal_local.reshape(B * 5, 3)).reshape(B, 5, 3)
+            gn_norm = torch.norm(gn, dim=-1, keepdim=True)
+            gn_unit = gn / gn_norm.clamp(min=1e-6)
+            sgn = torch.sign((gn_unit * pad_inward).sum(dim=-1, keepdim=True))  # align to pad-inward
+            sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
+            gn_unit = gn_unit * sgn
+            force_dir = torch.where(gn_norm > 1e-6, gn_unit, pad_inward)        # degenerate → pad fallback
+        else:
+            force_dir = pad_inward
+        raw_forces = self._get_fingertip_forces(direction_w=force_dir)         # (B, 5)
+
+        # (ii) Contact gate: ACTUAL contact position near the prescribed contact vertex
+        #      (replaces the fingertip-position proximity gate `ft_err < 0.03`).
+        if self.cfg.use_contact_point_gate:
+            cp = self._get_fingertip_contact_pos_w()                           # (B,5,3) NaN where no contact
+            cp_dist = torch.norm(cp - ref_vertex_world, dim=-1)                # (B,5)
+            contact_condition = (cp_dist < self.cfg.contact_match_dist).float()
+            contact_condition = torch.nan_to_num(contact_condition, nan=0.0)   # no contact → 0
+        else:
+            contact_condition = (ft_err_per_finger < 0.03).float()            # (B, 5)
+        # ── END CONTACT-MAP REWARD ────────────────────────────────────────────────
         fforce_contact = raw_forces * contact_flag_gated * contact_condition   # (B, 5)
         n_contacts = contact_flag_gated.sum(dim=-1, keepdim=True)             # (B, 1)
         clamped = torch.clamp(fforce_contact, 0.0, 0.5) / (n_contacts + 1e-6) / 1.5
@@ -1714,6 +1895,22 @@ class RobotisShadowGraspEnv(DirectRLEnv):
             # Curriculum state
             "Curriculum / reached_frame":  torch.tensor(float(self._reached_frame), device=self.device),
             "Curriculum / warmup_ratio":   self._is_warming_up.float().mean(),
+            # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+            # cache_coverage: fraction of trajectory frames now populated in the TRAIN cache.
+            # pretrain_fallback_ratio: fraction of envs in the LAST reset batch that were
+            #   restored from the pretrain cache (train cache-miss) — trends to 0 as the
+            #   train cache fills. Stays 0 when no pretrain cache is loaded.
+            "Curriculum / cache_coverage": (~self._init_flg).float().mean(),
+            "Curriculum / pretrain_fallback_ratio": torch.tensor(
+                self._last_pretrain_fallback_ratio, device=self.device
+            ),
+            # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+            # ── OBJECT FRICTION CURRICULUM [ROLLBACK MARKER: friction-curriculum] ──────
+            # friction_max: current upper bound of the sampling range (decays → friction_min).
+            # friction_mean: mean object friction applied in the last reset batch.
+            "Curriculum / friction_max": torch.tensor(self._last_friction_max, device=self.device),
+            "Curriculum / friction_mean": torch.tensor(self._last_friction_mean, device=self.device),
+            # ── END OBJECT FRICTION CURRICULUM ────────────────────────────────────────
             # Mass-as-action: actual object mass in kg (unnormalized from cached mass action)
             "mass/mean":  self._current_mass_action.mean(),
             "mass/std":   self._current_mass_action.std(),
@@ -1786,7 +1983,49 @@ class RobotisShadowGraspEnv(DirectRLEnv):
             self._traj_idx[env_ids] = torch.randint(0, self._n_trajs, (n,), device=self.device)
 
         # --- Start frame sampling ---
-        if self.cfg.adaptive_sampling and self._reached_frame > 0:
+        # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+        # With the pretrain cache loaded, pick a TARGET frame to practice from frames
+        # that have a saved state in the TRAIN or PRETRAIN cache (the pretrain cache
+        # covers ~all frames, so this is the whole trajectory — no reached_frame gate),
+        # then rewind a fixed window for run-up and clamp the START into [0, upper] so
+        # the episode still has num_frame_chunk frames of room.
+        # IMPORTANT: the target frame ranges over the FULL trajectory, NOT [0, upper].
+        # Capping the target at `upper` would (after the rewind) cap every start at
+        # `upper - back`, so episodes could never reach the last ~back frames and
+        # `reached_frame` would plateau at max_traj_len - back - 1 (never the end).
+        # Mirrors vanilla: sample target → rewind → clamp start to upper.
+        if self._pretrain_cache is not None:
+            upper = max(0, self._max_traj_len - self._num_frame_chunk)
+            cand = (~self._init_flg) | (~self._pretrain_init_flg)            # (max_traj_len,) full-range candidates
+            if cand.any():
+                cand_f = cand.float()
+                # Force pure-uniform for the first uniform_sampling_steps control steps
+                # so the cache populates broadly before failure-weighting concentrates.
+                use_fw = self.cfg.failure_weighted_sampling and (
+                    self._sampling_step_count >= self.cfg.uniform_sampling_steps
+                )
+                if use_fw:
+                    counts = self._failure_count * cand_f                    # zero out non-candidates
+                    fail_probs = counts / (counts.sum() + 1e-8)
+                    ur = self.cfg.adaptive_uniform_ratio
+                    uniform = cand_f / cand_f.sum()                          # uniform over candidates only
+                    probs = (fail_probs + ur * uniform) / (1.0 + ur)         # 0 on non-candidates → never sampled
+                    sampled = torch.multinomial(probs.unsqueeze(0).expand(n, -1), 1).squeeze(-1)
+                else:
+                    cand_idx = cand.nonzero(as_tuple=True)[0]
+                    sampled = cand_idx[torch.randint(0, cand_idx.numel(), (n,), device=self.device)]
+                # Rewind for run-up, then clamp the START into [0, upper] (room for a full chunk).
+                start_frames = (sampled - self._adaptive_back_frames).clamp(min=0).clamp(max=upper)
+                # Safeguard: the start must have a saved state to restore from. The pretrain
+                # cache covers [0, upper] densely, but if a start is somehow uncovered, snap
+                # to frame 0 (covered by the pretrain cache / init-save) rather than cold-start.
+                start_cov = (~self._init_flg[start_frames]) | (~self._pretrain_init_flg[start_frames])
+                if (~start_cov).any():
+                    start_frames = torch.where(start_cov, start_frames, torch.zeros_like(start_frames))
+            else:
+                start_frames = torch.zeros(n, dtype=torch.long, device=self.device)
+        # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+        elif self.cfg.adaptive_sampling and self._reached_frame > 0:
             valid_len = min(self._reached_frame + 1, self._max_traj_len)
             if self.cfg.failure_weighted_sampling:
                 # TJ formula: p = (fail_probs + ur/N) / (1 + ur) — add uniform then renormalize.
@@ -1823,8 +2062,8 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         traj = self._traj_idx[env_ids]
         env_orig = self.scene.env_origins[env_ids]
 
-        cached = self._state_cache[start_frames]          # (n, 98) — zeros for unpopulated frames
-        has_cache = ~self._init_flg[start_frames]         # (n,) bool
+        cached = self._state_cache[start_frames]          # (n, 91) — zeros for unpopulated frames
+        has_cache = ~self._init_flg[start_frames]         # (n,) bool — TRAIN cache present at start frame
         cache_mask = has_cache.unsqueeze(-1)              # (n, 1) for broadcasting
 
         # ── WARMUP ────────────────────────────────────────────────────────────
@@ -1876,6 +2115,32 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         default_normalized = self._unscale(default_ctrl)
         self._smoothed_actions[env_ids] = torch.where(cache_mask, cached_sa, default_normalized)
 
+        # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+        # 2-tier restore: TRAIN cache wins (handled above via cache_mask). For frames
+        # MISSING from the train cache but PRESENT in the pretrain cache, override the
+        # robot joints + smoothed actions FROM the physically-valid pretrain state
+        # (78-dim: jp[1:27], jv[27:53], sa[53:78]). The object stays on the reference
+        # trajectory (handled below as a train cache-miss). Runs after the default/IK
+        # restore so pretrain values win there; the delta-action seeds below then read
+        # the pretrain pose. Train-hit envs are untouched (object-consistent state).
+        if self._pretrain_cache is not None:
+            pre_has = ~self._pretrain_init_flg[start_frames]          # (n,) pretrain present
+            use_pre_flat = (~has_cache) & pre_has                     # train-miss AND pretrain-present
+            self._last_pretrain_fallback_ratio = use_pre_flat.float().mean().item()
+            use_pre = use_pre_flat.unsqueeze(-1)
+            if use_pre.any():
+                pj = self._pretrain_cache[start_frames]              # (n, 78)
+                joint_pos_reset[:, self._all_joint_ids] = torch.where(
+                    use_pre, pj[:, 1:27], joint_pos_reset[:, self._all_joint_ids])
+                joint_vel_reset[:, self._all_joint_ids] = torch.where(
+                    use_pre, pj[:, 27:53], joint_vel_reset[:, self._all_joint_ids])
+                self._smoothed_actions[env_ids] = torch.where(
+                    use_pre, pj[:, 53:78], self._smoothed_actions[env_ids])
+                # Lift is never policy-actioned — keep it pinned to the fixed target.
+                joint_pos_reset[:, self._lift_joint_ids] = self.cfg.fixed_lift_target
+                joint_vel_reset[:, self._lift_joint_ids] = 0.0
+        # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
         # ── ARM DELTA-ACTION [ROLLBACK MARKER: arm-delta] ──────────────────────
         # Seed the integrated arm target at the ACTUAL reset arm pose (cache/IK/default,
         # already baked into joint_pos_reset) and zero the delta EMA so each episode
@@ -1918,22 +2183,39 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         self.object.write_root_pose_to_sim(torch.cat([obj_pos_reset, obj_quat_reset], dim=-1), env_ids)
         self.object.write_root_velocity_to_sim(obj_vel_reset, env_ids)
 
+        # ── OBJECT FRICTION CURRICULUM [ROLLBACK MARKER: friction-curriculum] ──────
+        # Resample + apply per-episode object friction for the reset envs (curriculum
+        # range anneals over training). No policy dependency, so applied directly here.
+        self._apply_object_friction(env_ids)
+        # ── END OBJECT FRICTION CURRICULUM ────────────────────────────────────────
+
         # --- TJ-style init save: on the very first reset, force-write frame 0 cache so
         # subsequent resets at frame 0 reuse the IK-lifted pose instead of re-applying IK. ---
+        # IMPORTANT: must copy from an env that ACTUALLY started at frame 0. The original
+        # code hard-coded local index 0, which is correct only when every env starts at
+        # frame 0 (the vanilla first reset, _reached_frame == 0). The pretrain-cache
+        # warm-start samples start frames uniformly, so local env 0 may start at a grasp
+        # frame — writing its (grasp) state into the frame-0 cache slot then makes any
+        # later start_frame==0 reset restore a grasp pose while the reference shows the
+        # table frame → kpts error spike → spurious early termination. Pick a frame-0 env
+        # if present; otherwise defer (frame 0 gets populated normally by _save_state_cache).
         if not self._init_save_done:
-            init_state = torch.cat([
-                torch.zeros(1, 1, device=self.device),                       # reward placeholder
-                obj_pos_reset[0:1] - env_orig[0:1],                          # (1, 3)  obj_pos env-local
-                obj_quat_reset[0:1],                                         # (1, 4)
-                obj_vel_reset[0:1, :3],                                      # (1, 3)  obj_linvel
-                obj_vel_reset[0:1, 3:],                                      # (1, 3)  obj_angvel
-                joint_pos_reset[0:1, self._all_joint_ids],                   # (1, 28)
-                joint_vel_reset[0:1, self._all_joint_ids],                   # (1, 28)
-                self._smoothed_actions[env_ids_t[0:1]],                      # (1, 27)
-            ], dim=-1).squeeze(0)                                            # (97,)
-            self._state_cache[0] = init_state
-            self._init_flg[0] = False
-            self._init_save_done = True
+            _zero_local = (start_frames == 0).nonzero(as_tuple=True)[0]
+            if _zero_local.numel() > 0:
+                e0 = int(_zero_local[0].item())   # local batch index of an env that started at frame 0
+                init_state = torch.cat([
+                    torch.zeros(1, 1, device=self.device),                       # reward placeholder
+                    obj_pos_reset[e0:e0 + 1] - env_orig[e0:e0 + 1],              # (1, 3)  obj_pos env-local
+                    obj_quat_reset[e0:e0 + 1],                                   # (1, 4)
+                    obj_vel_reset[e0:e0 + 1, :3],                                # (1, 3)  obj_linvel
+                    obj_vel_reset[e0:e0 + 1, 3:],                                # (1, 3)  obj_angvel
+                    joint_pos_reset[e0:e0 + 1, self._all_joint_ids],             # (1, 26)
+                    joint_vel_reset[e0:e0 + 1, self._all_joint_ids],             # (1, 26)
+                    self._smoothed_actions[env_ids_t[e0:e0 + 1]],                # (1, 25)
+                ], dim=-1).squeeze(0)                                            # (91,)
+                self._state_cache[0] = init_state
+                self._init_flg[0] = False
+                self._init_save_done = True
 
         # --- Mass-as-an-action: deferred to next _pre_physics_step ---
         # We store the reset env ids here. By the time _pre_physics_step is called next,
@@ -2013,6 +2295,17 @@ class RobotisShadowGraspEnv(DirectRLEnv):
         # For frames with multiple eligible envs, write the one with highest reward.
         better_reward = reward > self._state_cache[frame, 0]   # compare vs stored reward
         update_mask = self._enough_continued & better_reward    # (B,) bool
+
+        # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+        # While the pretrain cache is loaded, only write states from episodes that have
+        # survived >= 3 steps. Pretrain poses are object-free, so restoring them with
+        # the object present can interpenetrate / be unstable and terminate in 1-2
+        # steps; gating on episode length keeps those bad states (and spurious
+        # _reached_frame advances) out of the train cache. (Train-cache-initialized
+        # episodes survive this trivially, so the gate only filters pretrain-init dropouts.)
+        if self._pretrain_cache is not None:
+            update_mask = update_mask & (self.episode_length_buf >= 3)
+        # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
 
         if update_mask.any():
             unique_frames = torch.unique(frame[update_mask])

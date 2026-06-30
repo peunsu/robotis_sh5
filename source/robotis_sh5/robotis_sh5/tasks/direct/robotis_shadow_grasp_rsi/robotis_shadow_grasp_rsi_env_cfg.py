@@ -44,8 +44,13 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(
             collision_enabled=True,
-            contact_offset=0.005,
-            rest_offset=0.0,
+            # Use Isaac Sim / PhysX default collision offsets (commented out to revert
+            # the custom 0.005 / 0.0 values). NOTE: this robot USD is instanced, so
+            # spawn-time collision_props may be a no-op — the effective offsets live in
+            # FFW_SH5_shadow_instanced.usd (baked by make_robot_usd_instanceable.py,
+            # which uses PhysX defaults unless --contact_offset/--rest_offset are passed).
+            # contact_offset=0.005,
+            # rest_offset=0.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=True,
@@ -176,7 +181,7 @@ FFW_SH5_DEX_CFG = ArticulationCfg(
 
 
 @configclass
-class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
+class RobotisShadowGraspRsiEnvCfg(DirectRLEnvCfg):
     """Configuration for dexterous grasping with Shadow Hand mounted on FFW-SH5 arm.
 
     Robot: FFW-SH5 full-body with Shadow Dexterous Hand replacing the right hand
@@ -263,9 +268,9 @@ class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
         physx=sim_utils.PhysxCfg(
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=1024 * 1024,
-            friction_correlation_distance=0.00625,
-            friction_offset_threshold=0.04,
-            bounce_threshold_velocity=0.01,
+            # friction_correlation_distance=0.00625,
+            # friction_offset_threshold=0.04,
+            # bounce_threshold_velocity=0.01,
             gpu_max_rigid_patch_count=4096 * 4096,
         ),
     )
@@ -342,6 +347,22 @@ class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
     object_dynamic_friction: float = 1.0
     object_restitution: float = 0.1
 
+    # ── OBJECT FRICTION CURRICULUM [ROLLBACK MARKER: friction-curriculum] ──────
+    # Per-episode object friction is sampled from [friction_min, friction_max(t)],
+    # where friction_max(t) decays LINEARLY from friction_max_init to friction_min
+    # over `friction_decay_steps` control steps. Easy→hard: high friction early
+    # (objects don't slip) → anneal to the realistic min (firm-pinch required).
+    # After decay_steps the range collapses to [friction_min, friction_min] (fixed).
+    # Static = dynamic = sampled value (set on the OBJECT material at reset via
+    # root_physx_view.set_material_properties). Set friction_curriculum=False to
+    # leave object friction at its baked value (no per-episode sampling).
+    friction_curriculum: bool = True
+    friction_min: float = 1.0            # range lower bound + final fixed value
+    friction_max_init: float = 3.0       # initial range upper bound (decays to friction_min)
+    friction_decay_steps: int = 24000    # control steps over which friction_max → friction_min
+    # Object dynamic friction is set EQUAL to static friction (no separate ratio).
+    # ── END OBJECT FRICTION CURRICULUM ────────────────────────────────────────
+
     # Contact threshold for future_contact precomputation
     contact_dist_threshold: float = 0.05  # m
 
@@ -406,6 +427,28 @@ class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
     rew_obj_rot: float = -1.0         # GR env: 1.0
     rew_fingertip: float = -5.2       # GR env: 5.2
     rew_fingertip_force: float = 1.0  # GR env: 1.0 (slightly different normalization)
+    # ── CONTACT-MAP REWARD [ROLLBACK MARKER: contact-map-reward] ──────────────
+    # Two upgrades to the fingertip-force reward (both toggleable for A/B vs the
+    # original fingertip-position-gated, pad-normal-projected force):
+    #   use_contact_point_gate: gate the force by the distance between the ACTUAL
+    #     contact point (contact_pos_w) and the prescribed contact vertex, instead
+    #     of by fingertip-position proximity (ft_err < 0.03). contact_match_dist is
+    #     the threshold (m); surface↔surface so smaller than the 3cm fingertip gate.
+    #   use_grounded_normal: project the contact force onto the OBJECT-SURFACE NORMAL
+    #     at the contact vertex (sign-aligned to the pad's compressive direction so it
+    #     never points opposite the finger), instead of the fixed finger pad normal.
+    #     Falls back to pad-inward where the surface normal is degenerate (no mesh).
+    use_contact_point_gate: bool = True
+    contact_match_dist: float = 0.02
+    use_grounded_normal: bool = True
+    # Grounded direction source (only used when use_grounded_normal=True):
+    #   True  → (reference fingertip − nearest contact vertex): points surface→finger,
+    #           ≈ outward normal, AUTO-correct sign (finger is outside the object), no
+    #           dependence on mesh vertex normals; falls back to the mesh normal where
+    #           the fingertip sits on the surface (degenerate).
+    #   False → object mesh vertex normal at the contact vertex (sign-aligned at runtime).
+    use_fingertip_to_vertex_dir: bool = True
+    # ── END CONTACT-MAP REWARD ────────────────────────────────────────────────
     # Arm table-contact penalty (anti-cheating: arm_r_link3..link7 — including the wrist
     # camera at link7 — are otherwise free to rest on the table for grasp stability).
     # Soft per-N penalty only (auto-clamped); strong press is NOT a termination condition.
@@ -450,6 +493,33 @@ class RobotisShadowGraspEnvCfg(DirectRLEnvCfg):
     adaptive_alpha: float = 0.001            # EMA coefficient — matches GR env (slow, stable update)
     adaptive_uniform_ratio: float = 0.1      # uniform mixing ratio (used only if failure_weighted_sampling=True)
     adaptive_back_seconds: float = 1.2       # rewind window in seconds; frames = int(action_fps × this). Matches TJ `int(fps × 1.2)`.
+
+    # ── PRETRAIN-CACHE WARM-START [ROLLBACK MARKER: pretrain-cache-warmstart] ──
+    # Warm-start the train RSI state cache from the pretrain phase's state cache.
+    # The pretrain cache (saved to disk as a sibling of pretrain.pt) visited ALL
+    # frames under physics, so its per-frame robot states are physically valid init
+    # poses (object-free). With it loaded, every reset:
+    #   - samples a start frame ONLY among frames present in the train OR pretrain
+    #     cache (so a reset never lands on a frame with no saved state),
+    #   - restores the robot from the TRAIN cache if that frame has one, else from
+    #     the PRETRAIN cache (object comes from the reference trajectory on a train
+    #     cache-miss).
+    # The train cache is read AND written from the first step; as it fills, the
+    # pretrain fallback is used less and less (self-deprecating). While the pretrain
+    # cache is loaded, cache writes require episode length >= 3 to filter out
+    # immediately-failing (penetration / unstable) pretrain-initialized poses.
+    # Set pretrain_cache_warmstart = False to fully restore the original (no-warm-
+    # start) behavior. Loaded by scripts/skrl/train.py from the checkpoint sibling.
+    pretrain_cache_warmstart: bool = True
+    # Pure-uniform start-frame sampling for the first `uniform_sampling_steps` control
+    # steps (only on the warm-start path). Failure-weighting becomes ~91% of the
+    # sampling mass as soon as ANY per-frame failures are recorded (fail_probs is
+    # normalized), which would prematurely concentrate before the train cache is
+    # broadly populated. Forcing uniform first lets the cache fill across the whole
+    # trajectory and failure_count stabilize before concentrating. 0 = disable.
+    uniform_sampling_steps: int = 2000
+    # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
     # Note: episode chunk length (TJ's ``num_frame_chunk``) is auto-derived at runtime as
     # ``round(episode_length_s * action_fps)`` — see env __init__. With default
     # ``episode_length_s = 5.0`` and ``action_fps = 30`` this gives 150 frames (TJ exact).
