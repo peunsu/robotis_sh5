@@ -68,7 +68,9 @@ CHECKPOINT_BASE="${DATA_BASE}/ffw_shadow_rsi/right"
 FORCE="${FORCE:-0}"
 # Set VIDEO=1 to record an mp4 of env 0's rollout into <OUT_DIR>/videos/
 VIDEO="${VIDEO:-0}"
-VIDEO_LENGTH="${VIDEO_LENGTH:-300}"
+# 0 (default) → rollout.py auto-fits the clip to the full sequence length
+# (max_episode_length). Set a positive value to force a fixed number of steps.
+VIDEO_LENGTH="${VIDEO_LENGTH:-0}"
 
 # ── Parse sequence key → (object_id, trajectory_task, data_id) ───────────────
 # HO-Cap key format: subject_{N}-{DATE_TIME}-{G_OBJECT_ID}

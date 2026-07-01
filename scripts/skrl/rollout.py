@@ -37,8 +37,10 @@ parser.add_argument("--stochastic", action="store_true", default=False,
 # Video recording
 parser.add_argument("--video", action="store_true", default=False,
                     help="Record a video of the rollout into <output_dir>/videos/.")
-parser.add_argument("--video_length", type=int, default=200,
-                    help="Length of the recorded video (in steps).")
+parser.add_argument("--video_length", type=int, default=0,
+                    help="Length of the recorded video (in steps). <=0 (default) auto-fits to the "
+                         "full sequence length (env.max_episode_length), so the clip covers the "
+                         "whole trajectory instead of a fixed duration.")
 # Dataset / sequence overrides
 parser.add_argument("--dataset", type=str, default=None)
 parser.add_argument("--object_id", type=str, default=None)
@@ -174,13 +176,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.video:
         video_folder = os.path.join(args_cli.output_dir, "videos")
         os.makedirs(video_folder, exist_ok=True)
+        # Default (video_length <= 0): fit the clip to the full sequence. In eval
+        # (adaptive_sampling=False) the episode runs the whole trajectory, so
+        # max_episode_length == _max_traj_len == sequence length in control steps.
+        # A fixed value (e.g. 300 @ 30 Hz = 10 s) would truncate/pad regardless of
+        # sequence length — this makes the video exactly one full sequence.
+        if args_cli.video_length > 0:
+            video_length = args_cli.video_length
+        else:
+            video_length = int(env.unwrapped.max_episode_length)
         video_kwargs = {
             "video_folder": video_folder,
             "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
+            "video_length": video_length,
             "disable_logger": True,
         }
-        print(f"[rollout] Recording video to {video_folder} (length={args_cli.video_length}).")
+        print(f"[rollout] Recording video to {video_folder} (length={video_length} steps"
+              f"{' = full sequence' if args_cli.video_length <= 0 else ''}).")
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     env = SkrlVecEnvWrapper(env, ml_framework="torch")

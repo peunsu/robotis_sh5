@@ -45,10 +45,10 @@ VIDEO_INTERVAL="${VIDEO_INTERVAL:-1000}"
 # Sequence keys — format matches mano/right folder names: subject_{N}-{DATE_TIME}-{G_OBJECT_ID}
 # Default: same subset as train_sequences_shadow.sh.
 SEQUENCES=(
-    # "subject_1-20231025_170231-G10_1"
-    # "subject_1-20231025_170231-G10_2"
-    # "subject_1-20231025_170231-G10_3"
-    # "subject_1-20231025_170231-G10_4"
+    "subject_1-20231025_170231-G10_1"
+    "subject_1-20231025_170231-G10_2"
+    "subject_1-20231025_170231-G10_3"
+    "subject_1-20231025_170231-G10_4"
     "subject_6-20231025_111357-G06_1"
     "subject_6-20231025_111357-G06_2"
     "subject_6-20231025_111357-G06_3"

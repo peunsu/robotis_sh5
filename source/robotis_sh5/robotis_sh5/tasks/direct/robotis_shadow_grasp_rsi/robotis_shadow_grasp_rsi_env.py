@@ -1744,20 +1744,21 @@ class RobotisShadowGraspRsiEnv(DirectRLEnv):
 
         # Contact force reward (mirrors GR train env).
         # ── CONTACT-MAP REWARD [ROLLBACK MARKER: contact-map-reward] ───────────────
-        # (i) Projection direction = grounded object-surface normal at the contact
-        #     vertex (world), sign-aligned to the pad's compressive sense so it never
-        #     points opposite the finger. Falls back to pad-inward where the normal is
-        #     degenerate (no mesh) or when use_grounded_normal is off.
-        pad_inward = -self._compute_fingertip_pad_normals_w()                  # (B,5,3) compressive sense
+        # (i) Projection direction = grounded object-surface normal at the contact vertex
+        #     (world). `gn` is the OUTWARD surface normal (vertex→fingertip): it points from
+        #     the object surface toward the finger — the SAME hemisphere as `pad_inward` (the
+        #     proven original projection direction) and as the sensed contact force on the
+        #     finger (the object's reaction pushes the finger away from the surface, outward).
+        #     So gn is used DIRECTLY, no sign flip: the old runtime sign(gn·pad_inward) align
+        #     resolved to +1 here (gn already agrees with pad_inward), so we just drop it.
+        #     Falls back to pad-inward where the normal is degenerate (no mesh) or off.
+        pad_inward = -self._compute_fingertip_pad_normals_w()                  # (B,5,3) toward finger (force sense)
         if self.cfg.use_grounded_normal:
             ref_normal_local = self._ref_contact_normal_local[traj, frame]     # (B,5,3) obj-local outward
             gn = quat_apply(obj_quat_exp_r, ref_normal_local.reshape(B * 5, 3)).reshape(B, 5, 3)
             gn_norm = torch.norm(gn, dim=-1, keepdim=True)
             gn_unit = gn / gn_norm.clamp(min=1e-6)
-            sgn = torch.sign((gn_unit * pad_inward).sum(dim=-1, keepdim=True))  # align to pad-inward
-            sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
-            gn_unit = gn_unit * sgn
-            force_dir = torch.where(gn_norm > 1e-6, gn_unit, pad_inward)        # degenerate → pad fallback
+            force_dir = torch.where(gn_norm > 1e-6, gn_unit, pad_inward)        # gn ∥ pad_inward; degenerate→pad
         else:
             force_dir = pad_inward
         raw_forces = self._get_fingertip_forces(direction_w=force_dir)         # (B, 5)

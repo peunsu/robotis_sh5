@@ -435,9 +435,10 @@ class RobotisShadowGraspRsiEnvCfg(DirectRLEnvCfg):
     #     of by fingertip-position proximity (ft_err < 0.03). contact_match_dist is
     #     the threshold (m); surface↔surface so smaller than the 3cm fingertip gate.
     #   use_grounded_normal: project the contact force onto the OBJECT-SURFACE NORMAL
-    #     at the contact vertex (sign-aligned to the pad's compressive direction so it
-    #     never points opposite the finger), instead of the fixed finger pad normal.
-    #     Falls back to pad-inward where the surface normal is degenerate (no mesh).
+    #     at the contact vertex (the outward surface normal, which already points the
+    #     same way as the sensed reaction force, so it is used directly), instead of
+    #     the fixed finger pad normal. Falls back to pad-inward where the surface
+    #     normal is degenerate (no mesh).
     use_contact_point_gate: bool = True
     contact_match_dist: float = 0.02
     use_grounded_normal: bool = True
