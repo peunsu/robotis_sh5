@@ -14,7 +14,7 @@ geometry-bearing subtrees. Re-importing from URDF would regenerate the file
 from scratch and would lose any post-import edits.
 
 Usage:
-    python scripts/process_dataset/make_robot_usd_instanceable.py \
+    python scripts/process_dataset/assets/make_robot_usd_instanceable.py \
         <input.usd> <output.usd> [--root-prim /ffw_sh5_follower]
 
 Then update env_cfg.py to point at the new instanceable USD.

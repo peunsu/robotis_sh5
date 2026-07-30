@@ -139,7 +139,7 @@ for key in "${SEQUENCES[@]}"; do
     # ── Step 2: Arm reference pipeline (elbow + per-frame IK + video) ─────────
     echo ""
     echo "[train-marl] Step 2/4 — Arm pipeline: ${TRAJECTORY_TASK} / ${DATA_ID}"
-    python scripts/process_dataset/process_arm_pipeline.py \
+    python scripts/process_dataset/retarget/process_arm_pipeline.py \
         --dataset "${DATASET}" \
         --task    "${TRAJECTORY_TASK}" \
         --data_id "${DATA_ID}"

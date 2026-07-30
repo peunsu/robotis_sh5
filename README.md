@@ -169,7 +169,7 @@ source/robotis_sh5/data/raw/oakink/image/
 ##### 2. Process OakInk → SPIDER format
 
 ```bash
-python scripts/process_dataset/oakink.py
+python scripts/process_dataset/dataset/oakink.py
 ```
 
 Output:
@@ -182,16 +182,16 @@ Must be run inside the Isaac Lab Python environment:
 
 ```bash
 # Convert a single object (default --dataset oakink)
-isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --object-id A01001
+isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py --object-id A01001
 
 # Convert all objects
-isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py
+isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py
 
 # Re-convert (overwrite existing USD)
-isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --overwrite
+isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py --overwrite
 
 # Custom mass / friction
-isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --mass 0.15 --friction 0.9
+isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py --mass 0.15 --friction 0.9
 ```
 
 Converted USD files are written to `data/processed/oakink/assets/objects/{obj_id}/visual.usd`.
@@ -216,10 +216,10 @@ To regenerate the table using the Claude Vision API (requires `pip install anthr
 
 ```bash
 # Estimate mass for all objects (skips already-processed entries)
-python scripts/process_dataset/estimate_object_mass.py --resume
+python scripts/process_dataset/dataset/estimate_object_mass.py --resume
 
 # Force re-estimation of all objects
-python scripts/process_dataset/estimate_object_mass.py
+python scripts/process_dataset/dataset/estimate_object_mass.py
 ```
 
 #### HO-Cap dataset
@@ -235,7 +235,7 @@ source/robotis_sh5/data/raw/hocap/
 ##### 2. Process HO-Cap → SPIDER format
 
 ```bash
-python scripts/process_dataset/hocap.py
+python scripts/process_dataset/dataset/hocap.py
 ```
 
 Output mirrors the OakInk layout under `data/processed/hocap/`.
@@ -243,7 +243,7 @@ Output mirrors the OakInk layout under `data/processed/hocap/`.
 ##### 3. Convert object meshes to USD
 
 ```bash
-isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py --dataset hocap
+isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py --dataset hocap
 ```
 
 Place or symlink the HO-Cap object meshes under `data/processed/hocap/assets/objects/` first.
@@ -261,7 +261,7 @@ To enable USD-level instancing, run the post-processing script once to extract e
 geometry into separate layers and add `instanceable=True` references back to the main USD:
 
 ```bash
-python scripts/process_dataset/make_robot_usd_instanceable.py \
+python scripts/process_dataset/assets/make_robot_usd_instanceable.py \
     source/robotis_sh5/data/robots/FFW/FFW_SH5_simplified_dex.usd \
     source/robotis_sh5/data/robots/FFW/FFW_SH5_simplified_dex_instanced.usd
 ```
@@ -431,7 +431,7 @@ Each `train_sequences*.sh` runs **four steps per sequence** in order:
 | Step | Action | Skip condition |
 |---|---|---|
 | 1. Data check | Verify `mano/right/<task>/` exists | Error if missing |
-| 2. Arm reference pipeline | `scripts/process_dataset/process_arm_pipeline.py --dataset <DATASET>` | `arm_joint_pos.npy` exists |
+| 2. Arm reference pipeline | `scripts/process_dataset/retarget/process_arm_pipeline.py --dataset <DATASET>` | `arm_joint_pos.npy` exists |
 | 3. Pretrain | `<TASK_PRETRAIN>` for `PRETRAIN_TIMESTEPS` env steps | `pretrain.pt` exists |
 | 4. Train | `<TASK>` for `TIMESTEPS` env steps, loading pretrain.pt | `agent.pt` exists |
 
@@ -458,11 +458,11 @@ You can also run individual steps manually for a single sequence:
 
 ```bash
 # Step 1: dataset processing (run once before training)
-python scripts/process_dataset/oakink.py \
+python scripts/process_dataset/dataset/oakink.py \
     --seq-id-ts "C11001_0001_0007/2021-10-03-14-32-01"
 
 # Step 2: arm reference pipeline (canonicalize + SMPL fit + per-frame IK + video)
-python scripts/process_dataset/process_arm_pipeline.py \
+python scripts/process_dataset/retarget/process_arm_pipeline.py \
     --dataset oakink --task C11001-0001-0007 --data_id 0
 
 # Step 3: pretrain (single-agent)

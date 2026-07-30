@@ -14,13 +14,13 @@ Task naming: {subject_id}-{timestamp}-{obj_id}
   e.g.  subject_1-20231025_170231-G10_4
 
 Run (all configs):
-    python scripts/process_dataset/hocap.py
+    python scripts/process_dataset/dataset/hocap.py
 
 Run (single config by index):
-    python scripts/process_dataset/hocap.py --config-index 0
+    python scripts/process_dataset/dataset/hocap.py --config-index 0
 
 Run (single config by task name):
-    python scripts/process_dataset/hocap.py --task subject_1-20231025_170231-G10_4
+    python scripts/process_dataset/dataset/hocap.py --task subject_1-20231025_170231-G10_4
 """
 
 import argparse
@@ -36,7 +36,7 @@ from scipy.spatial.transform import Rotation, Slerp
 FINGERTIP_INDICES = [4, 8, 12, 16, 20]
 REF_DT = 1.0 / 30.0  # HO-Cap is annotated at 30 FPS
 
-_SCRIPT_DIR = Path(__file__).resolve().parents[2]
+_SCRIPT_DIR = Path(__file__).resolve().parents[3]
 _DATA_DIR = _SCRIPT_DIR / "source" / "robotis_sh5" / "data"
 _HOCAP_RAW = _DATA_DIR / "raw" / "hocap"
 _HOCAP_OUT = _DATA_DIR / "processed" / "hocap"

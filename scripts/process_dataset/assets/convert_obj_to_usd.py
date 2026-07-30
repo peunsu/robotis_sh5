@@ -1,7 +1,7 @@
 """Convert centered object meshes (.obj) to USD for Isaac Sim.
 
 Must be run inside the Isaac Lab Python environment:
-    isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap] [--object-id G10_1]
+    isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py [--dataset hocap] [--object-id G10_1]
 
 Reads : data/processed/{dataset}/assets/objects/{obj_id}/visual.obj
 Writes: data/processed/{dataset}/assets/objects/{obj_id}/visual.usd
@@ -10,7 +10,7 @@ Writes: data/processed/{dataset}/assets/objects/{obj_id}/visual.usd
 import argparse
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "source" / "robotis_sh5" / "data"
+DATA_DIR = Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data"
 
 # Per-object collision approximation overrides. Default is ConvexHull.
 # Add object IDs that benefit from a simpler / more stable collider here.

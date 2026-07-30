@@ -129,7 +129,7 @@ for key in "${SEQUENCES[@]}"; do
     # ── Step 2: Arm reference pipeline (Shadow Hand IK target) ────────────────
     echo ""
     echo "[shadow-rsi] Step 2/4 — Arm pipeline (shadow): ${TRAJECTORY_TASK} / ${DATA_ID}"
-    python scripts/process_dataset/process_arm_pipeline.py \
+    python scripts/process_dataset/retarget/process_arm_pipeline.py \
         --dataset "${DATASET}" \
         --task    "${TRAJECTORY_TASK}" \
         --data_id "${DATA_ID}" \

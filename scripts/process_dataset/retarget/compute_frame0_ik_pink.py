@@ -15,8 +15,8 @@ from this script's output. Helpers in this module (`_build_arm_only_model`,
 `_canonicalize_trajectory`, `_env_pose_to_base`, etc.) are imported by process_arm_pipeline.py.
 
 Run:
-    python scripts/process_dataset/compute_frame0_ik_pink.py
-    python scripts/process_dataset/compute_frame0_ik_pink.py --dataset hocap --overwrite
+    python scripts/process_dataset/retarget/compute_frame0_ik_pink.py
+    python scripts/process_dataset/retarget/compute_frame0_ik_pink.py --dataset hocap --overwrite
 
 Notes:
   - Coordinates: canonicalization is done in env-local frame; we transform the resulting
@@ -44,7 +44,7 @@ from pink.tasks import FrameTask, PostureTask
 # Paths and constants (must mirror env_cfg defaults)
 # ────────────────────────────────────────────────────────────────────────────
 
-_SCRIPT_DIR = Path(__file__).resolve().parents[2]
+_SCRIPT_DIR = Path(__file__).resolve().parents[3]
 _ROBOT_DIR = _SCRIPT_DIR / "source" / "robotis_sh5" / "data" / "robots" / "FFW"
 _URDF_PATH = _ROBOT_DIR / "urdf" / "ffw_sh5_follower_copy.urdf"
 _MESH_DIR = _ROBOT_DIR / "meshes"

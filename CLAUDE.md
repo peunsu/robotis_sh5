@@ -58,7 +58,7 @@ python scripts/skrl/train_marl.py --task=Robotis-Sh5-Grasp-Marl-Direct-v0 --num_
 **Train — Shadow Hand variant:**
 ```bash
 # Generate Shadow-Hand-specific arm references first (writes _shadow-suffixed files)
-python scripts/process_dataset/process_arm_pipeline.py --dataset hocap --robot shadow --overwrite
+python scripts/process_dataset/retarget/process_arm_pipeline.py --dataset hocap --robot shadow --overwrite
 
 # Pretrain → train
 python scripts/skrl/train.py --task=Robotis-Shadow-Grasp-Pretrain-Direct-v0 --num_envs=4096 --headless \
@@ -123,20 +123,39 @@ HO-Cap mirrors OakInk: `scripts/benchmark/hocap/train_sequences{,_marl}.sh`, etc
 
 **Dataset preprocessing:**
 ```bash
-python scripts/process_dataset/oakink.py
-python scripts/process_dataset/hocap.py
-isaaclab.sh -p scripts/process_dataset/convert_obj_to_usd.py [--dataset hocap]   # requires Isaac Lab env
+python scripts/process_dataset/dataset/oakink.py
+python scripts/process_dataset/dataset/hocap.py
+isaaclab.sh -p scripts/process_dataset/assets/convert_obj_to_usd.py [--dataset hocap]   # requires Isaac Lab env
 
 # Full-trajectory arm reference pipeline (PRIMARY entry point).
 # Canonicalize + VPoser SMPL fit with robot-bone rescaling + per-frame pink IK + mp4 visualization.
 # Outputs per trajectory: arm_keypoints.npz, arm_joint_pos.npy (N,7), vposer_ik_video.mp4.
 # --robot sh5 (default) targets hx5_d20_right_base; --robot shadow targets a virtual
 # robot0_palm frame registered at the Shadow Hand mount offset, and writes *_shadow.npy/.npz/.mp4.
-python scripts/process_dataset/process_arm_pipeline.py --dataset hocap --robot {sh5|shadow} --overwrite
+python scripts/process_dataset/retarget/process_arm_pipeline.py --dataset hocap --robot {sh5|shadow} --overwrite
 
 # (standalone) Frame-0-only arm IK — pink QP on pinocchio. Not used by env/benchmark anymore;
 # kept as a diagnostic / single-frame solver, and provides helpers imported by process_arm_pipeline.
-python scripts/process_dataset/compute_frame0_ik_pink.py --dataset oakink --overwrite
+python scripts/process_dataset/retarget/compute_frame0_ik_pink.py --dataset oakink --overwrite
+
+# ── ParaHome (whole-body loco-manipulation; SMPL-X + articulated/multi objects) ──
+# raw/parahome symlinks the ParaHome repo (207 long multi-object activity seqs @30 FPS).
+# Sequences are segmented by text_annotation into per-ACTION clips and classified by the
+# objects each clip actually MANIPULATES (motion-detected: rigid/articulated base translation
+# OR joint-DOF change) — whole sequences are ~all multi-mixed so class is only meaningful
+# per-segment. Human = SMPL-X params (smplx_seq/); objects+articulation = custom stream
+# (object_transformations / joint_states / joint_info). Meshes are in data/scan; SMPL-X model
+# at models_smplx_v1_1/models. parahome.py runs SMPL-X FK for fingertip PAD vertices, so run it
+# in env_isaaclab (`smplx` pkg + torch; CUDA used if present): /home/peunsu/anaconda3/envs/env_isaaclab/bin/python
+python scripts/process_dataset/dataset/parahome.py                          # (run via env_isaaclab python) → processed/parahome/smplx/{class}/{clip}/0/trajectory.npz (+task_info.json, index.json, splits.json)
+python scripts/process_dataset/assets/parahome_build_articulation_spec.py  # → processed/parahome/assets/objects/articulation_spec.json (unit joint axis/pivot/rest, in BASE frame)
+isaaclab.sh -p scripts/process_dataset/assets/parahome_convert_obj_to_usd.py  # meshes→USD: rigid (convex-decomp collider) + articulated (base+parts w/ revolute/prismatic joints). NEEDS Isaac Lab.
+# class ∈ single_{rigid,articulated} / multi_{rigid,mixed,articulated} / loco; splits.json is
+# SUBJECT-disjoint (metadata.json) train/val/test. clip npz = SMPL-X (body/hand pose, betas,
+# gender) + manip-object 6-DoF traj (+articulated: part traj, joint DOF, axis/pivot/type) +
+# aux joint_positions/root + fingertip_pad_pos(F,10,3) = SMPL-X hand pad-vertex fingertips
+# (smplx built-in vertex ids, LEFT[th,ff,mf,rf,lf] then RIGHT; ~5mm from ParaHome tips, same
+# world frame) — contact-accurate fingertip targets for retargeting/reward. Quats wxyz; ref_dt=1/30.
 ```
 
 **Code formatting:**
@@ -156,6 +175,8 @@ pre-commit run --all-files
 | `Robotis-Shadow-Grasp-Pretrain-Direct-v0` | 25D | 291D | Shadow Hand kinematic-only pretrain (no mass) |
 | `Robotis-Shadow-Grasp-Rsi-Direct-v0` | 26D | 291D | Shadow Hand + **pretrain-cache RSI warm-start** (copy of shadow grasp; see "Shadow Hand RSI Warm-Start Variant"). Separate `ffw_shadow_rsi` tree |
 | `Robotis-Shadow-Grasp-Rsi-Pretrain-Direct-v0` | 25D | 291D | RSI variant pretrain — dumps `pretrain_state_cache.npz` for the train phase to warm-start from |
+| `Robotis-G1-Shadow-Locomanip-Direct-v0` | 65D | 621D | Unitree G1 + bimanual Shadow hands, **FLOATING base**, whole-body loco-manipulation tracking retargeted ParaHome SMPL-X motion. Plain GaussianMixin (no mass-action). RSI state cache 222D; pretrain-cache warm-start reuses the grasp RSI mechanism |
+| `Robotis-G1-Shadow-Locomanip-Pretrain-Direct-v0` | 65D | 621D | Kinematic-only pretrain (object never spawned → `_has_object=False`). Dumps a 209D `pretrain_state_cache.npz` (train 222D cache remapped, object block dropped) for the train phase to warm-start from |
 | `Template-Robotis-Sh5-Direct-v0` | — | — | Single-agent direct RL template |
 | `Template-Robotis-Sh5-Marl-Direct-v0` | — | — | Multi-agent variant |
 | `Robotis-SH5-Pick-and-Place-v0` | — | — | Manager-based dexterous manipulation |

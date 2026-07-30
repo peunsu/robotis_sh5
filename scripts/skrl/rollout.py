@@ -46,6 +46,46 @@ parser.add_argument("--dataset", type=str, default=None)
 parser.add_argument("--object_id", type=str, default=None)
 parser.add_argument("--trajectory_task", type=str, default=None)
 parser.add_argument("--trajectory_data_id", type=int, default=None)
+parser.add_argument("--clip_class", type=str, default=None, help="ParaHome clip class (g1 loco-manip).")
+parser.add_argument("--clip_name", type=str, default=None, help="ParaHome clip name (g1 loco-manip).")
+parser.add_argument("--debug_vis", action="store_true", help="Draw reference-keypoint markers (needs a viewer / not --headless).")
+# ── Recorded-video CAMERA ANGLE (video-only — never touches physics) ─────────────────────────
+# The g1 sonic/locomanip env recomputes cfg.viewer.eye/lookat from cfg.viewer_{yaw,elev,look_obj,
+# zoom} inside _load_reference_trajectories (g1_shadow_sonic_residual_env.py:361-389), which runs
+# BEFORE super().__init__ consumes cfg.viewer. Writing those fields here is the ONLY supported way
+# to change the recorded viewpoint: ViewportCameraController deep-copies cfg.viewer at construction
+# (isaaclab/envs/ui/viewport_camera_controller.py:54), so post-init cfg edits are dead.
+# Deliberately NOT done with an isaaclab.sensors.Camera: constructing one sets the PROCESS-GLOBAL
+# carb flag /isaaclab/render/rtx_sensors (camera.py:123), which flips `is_rendering`
+# (direct_rl_env.py:367) and moves the sole sim.render() from render() (:464) into the physics loop
+# (:381) — i.e. it would silently retime the frame of the pane that is supposed to be unchanged.
+parser.add_argument(
+    "--cam_preset", type=str, default=None, choices=("current", "old"),
+    help="Camera preset for the recorded video. 'old' = the pre-2026-07-22 view (yaw 45 deg / "
+         "elev 0 / aim at the ROOT centroid), the formula still live in "
+         "g1_shadow_locomanip_env.py:295-296. 'current' (and the default) is a deliberate NO-OP so "
+         "the canonical pass always follows whatever the cfg says.")
+parser.add_argument("--viewer_yaw", type=float, default=None,
+                    help="Override cfg.viewer_yaw (deg azimuth). Applied after --cam_preset.")
+parser.add_argument("--viewer_elev", type=float, default=None,
+                    help="Override cfg.viewer_elev (deg). NOTE elev<=0 selects the env's "
+                         "zoff=0.12*extent branch, not a literal 0 deg pitch.")
+parser.add_argument("--viewer_look_obj", type=int, default=None, choices=(0, 1),
+                    help="Override cfg.viewer_look_obj: 1 = aim at the object centroid, 0 = the root centroid.")
+parser.add_argument("--viewer_zoom", type=float, default=None, help="Override cfg.viewer_zoom.")
+parser.add_argument("--video_resolution", type=str, default=None,
+                    help="Recording resolution as WxH (sets cfg.viewer.resolution). Default: keep the "
+                         "cfg value (1280x720) so the mp4 stays comparable to archived videos. Lower it "
+                         "to cut render time and RecordVideo's in-RAM frame list. Keep both dims even.")
+parser.add_argument("--video_name_prefix", type=str, default="rl-video",
+                    help="RecordVideo name_prefix -> <output_dir>/videos/<prefix>-step-0.mp4. Give a "
+                         "second camera pass its own prefix so it does not overwrite the first pass.")
+parser.add_argument("--metrics_name", type=str, default="metrics.csv",
+                    help="Metrics CSV filename inside --output_dir. Keep the default for the canonical "
+                         "pass; a video-only second camera pass should use e.g. metrics_camold.csv. "
+                         "scripts/benchmark/evaluate.bash globs exactly '**/metrics.csv' (lines 31/51/99), "
+                         "so the extra file is invisible to aggregation, and byte-comparing the two files "
+                         "proves the two passes simulated the same rollout.")
 # Agent config entry point
 parser.add_argument(
     "--agent", type=str, default=None,
@@ -65,6 +105,7 @@ simulation_app = app_launcher.app
 
 import csv
 import itertools
+import json
 import math
 import os
 
@@ -143,8 +184,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Disable stochastic curriculum mechanisms for fair evaluation.
     env_cfg.adaptive_sampling = False   # always start at frame 0
-    env_cfg.enable_warmup = False
-    env_cfg.debug_vis = False
+    if hasattr(env_cfg, "enable_warmup"):
+        env_cfg.enable_warmup = False   # grasp-only cfg field; g1 has none
+    env_cfg.debug_vis = bool(args_cli.debug_vis)   # markers only when explicitly requested (needs a viewer)
     # Disable early termination so each rollout runs the full trajectory.
     # Paper E_t/E_r/E_j/E_ft are averaged over T (trajectory length); terminating
     # at frame 1-2 would average over near-zero initial errors and report
@@ -160,6 +202,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.trajectory_task = args_cli.trajectory_task
     if args_cli.trajectory_data_id is not None:
         env_cfg.trajectory_data_id = args_cli.trajectory_data_id
+    # ParaHome clip selection (g1 loco-manip)
+    if args_cli.clip_class is not None and hasattr(env_cfg, "clip_class"):
+        env_cfg.clip_class = args_cli.clip_class
+    if args_cli.clip_name is not None and hasattr(env_cfg, "clip_name"):
+        env_cfg.clip_name = args_cli.clip_name
+
+    # ── Recorded-camera overrides (video-only; see the argparse block above) ──
+    # hasattr-guarded, mirroring the clip_class/clip_name pattern: a silent no-op on tasks whose cfg
+    # has no viewer_* fields (g1_shadow_locomanip has only viewer_zoom — and its hardcoded formula
+    # already IS the 'old' view).
+    if args_cli.cam_preset == "old":
+        for _f, _v in (("viewer_yaw", 45.0), ("viewer_elev", 0.0), ("viewer_look_obj", False)):
+            if hasattr(env_cfg, _f):
+                setattr(env_cfg, _f, _v)
+    # NOTE: cam_preset == "current" (and None) writes NOTHING on purpose.
+    for _f, _v in (("viewer_yaw", args_cli.viewer_yaw), ("viewer_elev", args_cli.viewer_elev),
+                   ("viewer_zoom", args_cli.viewer_zoom)):
+        if _v is not None and hasattr(env_cfg, _f):
+            setattr(env_cfg, _f, float(_v))
+    if args_cli.viewer_look_obj is not None and hasattr(env_cfg, "viewer_look_obj"):
+        env_cfg.viewer_look_obj = bool(args_cli.viewer_look_obj)
+    if args_cli.video_resolution is not None and getattr(env_cfg, "viewer", None) is not None:
+        _vw, _vh = (int(v) for v in args_cli.video_resolution.lower().split("x"))
+        env_cfg.viewer.resolution = (_vw, _vh)   # sole source of the render-product size
+
+    # NO --deterministic FLAG, DELIBERATELY. The two-camera video path re-simulates the same rollout
+    # to render it from a second angle, so it is natural to reach for PhysX
+    # enable_enhanced_determinism + torch.use_deterministic_algorithms. Both were tried and rejected,
+    # MEASURED on this clip (s100_seg00_pan, seed 42, 251 steps):
+    #   * Bit-identity is unreachable. Two byte-identical invocations (SAME camera) already differ by
+    #     max 1.3e-1 relative at --n_rollouts 32 and 1.2e-3 at --n_rollouts 1. The GPU solver is not
+    #     reproducible across processes; enable_enhanced_determinism does not change that (it makes
+    #     results independent of OTHER actors in the scene, not of reduction order).
+    #   * It is also unnecessary. The camera-change pair diverges LESS (6.8e-2) than the same-camera
+    #     pair (1.3e-1), i.e. the camera contributes nothing, and the divergence does not GROW:
+    #     frame-wise pixel difference between two same-camera reruns is flat over the whole clip
+    #     (visibly-different pixels 5.3% -> 7.6% -> 6.5% across first/mid/last 10 frames at 32 envs;
+    #     1.4% -> 1.4% -> 1.0% at 1 env). The panes stay locked; they do not desync.
+    #   * torch.use_deterministic_algorithms(True) additionally CRASHES this env: the deterministic
+    #     index_put_ kernel does not broadcast a [n,1,D] value into a [n,10,D] masked slice, which is
+    #     what g1_shadow_sonic_residual_env.py:1103 (_sonic_hist[k][m] = rows[k][m].unsqueeze(1))
+    #     relies on. Fixing that means editing the env, which this video-only feature must not do.
+    # compose_side_by_side.py therefore checks a TOLERANCE against that measured noise floor plus the
+    # discrete success flags, instead of byte-equality.
 
     agent_cfg["seed"] = args_cli.seed
     agent_cfg["trainer"]["close_environment_at_exit"] = False
@@ -171,6 +257,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # ── Create env & runner ───────────────────────────────────────────────────
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Log + persist the RESOLVED viewer pose. env.unwrapped.cfg is the same object the env mutated
+    # (DirectRLEnv.__init__ does `self.cfg = cfg`, and gymnasium passes caller kwargs by reference),
+    # so this is the clip-adaptive override that _load_reference_trajectories actually computed —
+    # the ONLY place it is ever observable (train.py's params/env.yaml is dumped pre-construction
+    # and records only the dead cfg literal).
+    _vcfg = getattr(env.unwrapped.cfg, "viewer", None)
+    if _vcfg is not None:
+        _vmeta = {
+            "cam_preset": args_cli.cam_preset or "cfg",
+            "viewer_yaw": getattr(env.unwrapped.cfg, "viewer_yaw", None),
+            "viewer_elev": getattr(env.unwrapped.cfg, "viewer_elev", None),
+            "viewer_look_obj": getattr(env.unwrapped.cfg, "viewer_look_obj", None),
+            "viewer_zoom": getattr(env.unwrapped.cfg, "viewer_zoom", None),
+            "origin_type": _vcfg.origin_type, "env_index": int(_vcfg.env_index),
+            "resolution": [int(v) for v in _vcfg.resolution],
+            "eye_env_local": [round(float(v), 6) for v in _vcfg.eye],
+            "lookat_env_local": [round(float(v), 6) for v in _vcfg.lookat],
+            "video": (f"{args_cli.video_name_prefix}-step-0.mp4" if args_cli.video else None),
+            "metrics": args_cli.metrics_name, "seed": int(args_cli.seed),
+            "clip_class": getattr(env_cfg, "clip_class", None),
+            "clip_name": getattr(env_cfg, "clip_name", None),
+        }
+        print(f"[rollout] viewer: {_vmeta}")
+        os.makedirs(args_cli.output_dir, exist_ok=True)
+        with open(os.path.join(args_cli.output_dir,
+                               f"viewer_{args_cli.video_name_prefix}.json"), "w") as _f:
+            json.dump(_vmeta, _f, indent=2)
 
     # wrap for video recording (before skrl wrapper so RecordVideo sees raw gym API)
     if args_cli.video:
@@ -190,9 +304,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "step_trigger": lambda step: step == 0,
             "video_length": video_length,
             "disable_logger": True,
+            "name_prefix": args_cli.video_name_prefix,
         }
         print(f"[rollout] Recording video to {video_folder} (length={video_length} steps"
-              f"{' = full sequence' if args_cli.video_length <= 0 else ''}).")
+              f"{' = full sequence' if args_cli.video_length <= 0 else ''}) "
+              f"→ {args_cli.video_name_prefix}-step-0.mp4")
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     env = SkrlVecEnvWrapper(env, ml_framework="torch")
@@ -201,6 +317,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Replace policy with MassDexMimicPolicy before loading checkpoint (grasp task only).
     _is_grasp = "Grasp" in args_cli.task and "Pretrain" not in args_cli.task
+    # g1 loco-manip = plain GaussianMixin (no mass policy); metrics read from the _errs dict.
+    _is_g1 = "Locomanip" in (args_cli.task or "")
     if _is_grasp:
         _patch_mass_policy(runner.agent, agent_cfg["models"]["policy"], agent_cfg["agent"]["learning_rate"])
 
@@ -239,8 +357,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Capture trajectory metadata before any stepping.
     ref_start = int(actual_env._frame_idx[0].item())   # 0 with adaptive_sampling=False
-    n_frames  = int(actual_env._max_traj_len)
-    seq_name  = env_cfg.trajectory_task or env_cfg.object_id
+    n_frames  = int(getattr(actual_env, "_max_traj_len", None) or actual_env._ref_len)   # g1 uses _ref_len
+    seq_name  = (getattr(env_cfg, "trajectory_task", None) or getattr(env_cfg, "object_id", None)
+                 or getattr(env_cfg, "clip_name", None) or "clip")
 
     for _step in range(args_cli.max_steps):
         with torch.no_grad():
@@ -259,12 +378,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         done_cpu = done.cpu()
 
         # Accumulate per-step errors for envs still in their first episode.
+        # g1 loco-manip exposes errors via the _errs dict (obj_pos/obj_rot/body/ft); grasp exposes
+        # them as _last_*_err buffers. e_j (keypoint) uses g1's whole-body error.
+        if _is_g1:
+            _e = actual_env._errs
+            _ope, _ore, _kpe, _fte = _e["obj_pos"], _e["obj_rot"], _e["body"], _e["ft"]
+        else:
+            _ope, _ore = actual_env._last_obj_pos_err, actual_env._last_obj_rot_err
+            _kpe, _fte = actual_env._last_kpts_err_raw, actual_env._last_ft_raw_err
         for i in range(n):
             if not episode_done[i]:
-                obj_pos_bufs[i].append(actual_env._last_obj_pos_err[i].item())
-                obj_rot_bufs[i].append(actual_env._last_obj_rot_err[i].item())
-                kpts_bufs[i].append(actual_env._last_kpts_err_raw[i].item())
-                ft_bufs[i].append(actual_env._last_ft_raw_err[i].item())
+                obj_pos_bufs[i].append(_ope[i].item())
+                obj_rot_bufs[i].append(_ore[i].item())
+                kpts_bufs[i].append(_kpe[i].item())
+                ft_bufs[i].append(_fte[i].item())
                 r = rewards[i] if rewards.ndim == 1 else rewards[i, 0]
                 reward_sums[i] += float(r)
 
@@ -280,7 +407,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # ── Write metrics.csv ─────────────────────────────────────────────────────
     os.makedirs(args_cli.output_dir, exist_ok=True)
-    csv_path = os.path.join(args_cli.output_dir, "metrics.csv")
+    csv_path = os.path.join(args_cli.output_dir, args_cli.metrics_name)
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)

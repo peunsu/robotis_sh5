@@ -7,7 +7,7 @@ For each object, this script:
   4. Saves the results to data/processed/oakink/object_mass.json.
 
 Usage:
-    python scripts/process_dataset/estimate_object_mass.py
+    python scripts/process_dataset/dataset/estimate_object_mass.py
 
 Requires:
     pip install anthropic
@@ -33,7 +33,7 @@ import anthropic
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_PROJECT_DIR = _SCRIPT_DIR.parent.parent
+_PROJECT_DIR = _SCRIPT_DIR.parents[2]          # scripts/process_dataset/dataset/ → repo root
 _DATA_DIR = _PROJECT_DIR / "source" / "robotis_sh5" / "data"
 _STREAM_DIR = _DATA_DIR / "raw" / "oakink" / "image" / "stream_release_v2"
 _ASSETS_DIR = _DATA_DIR / "processed" / "oakink" / "assets" / "objects"

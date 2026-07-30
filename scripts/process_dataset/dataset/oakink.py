@@ -298,7 +298,7 @@ def main():
         "--data-dir",
         type=str,
         default=str(
-            Path(__file__).resolve().parents[2] / "source" / "robotis_sh5" / "data"
+            Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data"
         ),
         help="Root data directory (contains raw/ and processed/).",
     )

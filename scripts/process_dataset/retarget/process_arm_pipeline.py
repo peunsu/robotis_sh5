@@ -20,7 +20,7 @@ Outputs written to each trajectory directory:
     vposer_ik_video.mp4                        — visualization
 
 Run:
-    /home/peunsu/anaconda3/envs/env_isaaclab/bin/python scripts/process_dataset/process_arm_pipeline.py \\
+    /home/peunsu/anaconda3/envs/env_isaaclab/bin/python scripts/process_dataset/retarget/process_arm_pipeline.py \\
         --dataset hocap --overwrite
 """
 
@@ -45,8 +45,9 @@ from pink.barriers import PositionBarrier
 from pink.tasks import FrameTask, PostureTask
 from smplx.lbs import batch_rodrigues
 
-_SCRIPT_DIR = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_SCRIPT_DIR / "scripts" / "process_dataset"))
+_SCRIPT_DIR = Path(__file__).resolve().parents[3]          # repo root
+# compute_frame0_ik_pink.py is a sibling in scripts/process_dataset/retarget/
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Reuse stable helpers (transforms + reduced model builder)
 from compute_frame0_ik_pink import (
