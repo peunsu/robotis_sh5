@@ -11,7 +11,7 @@ models:
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 0.75 # 0.75
-    initial_log_std: -0.7  # -1.514
+    initial_log_std: -0.5  # -1.514
     network:
       - name: net
         input: OBSERVATIONS

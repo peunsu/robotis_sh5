@@ -662,6 +662,23 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._state_cache[:, 0] = -float("inf")                        # reward column
         self._init_flg = torch.ones(self._ref_len, device=dev, dtype=torch.bool)   # True = reference (no cache)
         self._reached_frame = 0
+        # [ROLLBACK MARKER: deferred-cache] staging buffer for the at-termination bulk commit.
+        # See cfg.cache_min_episode_length. Rows are written per step by _save_state_cache and are
+        # only merged into _state_cache by _flush_state_cache when the episode ENDS having lasted at
+        # least cache_min_episode_length steps. Sized for a full episode because an episode that runs
+        # to the end of the clip must still be committable. Allocated only when the feature is on.
+        self._pend_n = 0
+        if int(getattr(c, "cache_min_episode_length", 0)) > 0:
+            self._pend_cap = int(self.max_episode_length)
+            self._pend_state = torch.zeros(self.num_envs, self._pend_cap, self._STATE_DIM, device=dev)
+            self._pend_frame = torch.zeros(self.num_envs, self._pend_cap, device=dev, dtype=torch.long)
+            self._pend_valid = torch.zeros(self.num_envs, self._pend_cap, device=dev, dtype=torch.bool)
+            print(f"[cache] deferred (at-termination) commit ON: min_episode_length="
+                  f"{c.cache_min_episode_length}, staging buffer "
+                  f"{self.num_envs}x{self._pend_cap}x{self._STATE_DIM} fp32 = "
+                  f"{self.num_envs * self._pend_cap * self._STATE_DIM * 4 / 1024**2:.0f} MB")
+        else:
+            self._pend_state = self._pend_frame = self._pend_valid = None
         self._failure_count = torch.zeros(self._ref_len, device=dev)
         self._adaptive_back_frames = int(round(c.adaptive_back_seconds / c.ref_dt))
         self._sampling_step_count = 0
@@ -1373,7 +1390,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # training; do NOT add an obs nan_to_num (the reset ordering already cleans obs, and masking
         # obs would hide the true NaN origin during localization).
         reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
-        self._save_state_cache()                          # per-frame best-state RSI cache
+        self._save_state_cache(reward)                    # per-frame best-state RSI cache
         # per-term reward contributions (weighted) → the Episode_Reward Tensorboard group, which holds
         # ONE graph per reward TERM and nothing else. Tracking terms are logged PRE-clamp (individual
         # insight); the clamped group value + clamp_frac live in the "Diag /" tab, and the TOTAL is not
@@ -1532,6 +1549,12 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ reset
     def _reset_idx(self, env_ids) -> None:
+        # [ROLLBACK MARKER: deferred-cache] MUST run before super(), which zeroes episode_length_buf —
+        # the whole point of the deferral is to filter on how long the episode actually lasted.
+        # getattr, not a bare attribute: DirectRLEnv.__init__ resets every env, and that happens
+        # BEFORE _post_init_buffers allocates the staging tensors.
+        if getattr(self, "_pend_state", None) is not None:
+            self._flush_state_cache(env_ids, self.episode_length_buf[env_ids].clone())
         super()._reset_idx(env_ids)
         c = self.cfg
         n = len(env_ids)
@@ -1752,8 +1775,20 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._prev_action[env_ids] = self._smoothed_actions[env_ids]
 
     # -------------------------------------------------------- state cache write
-    def _save_state_cache(self) -> None:
+    def _save_state_cache(self, reward: torch.Tensor) -> None:
         """Store per-frame best (highest-reward) full-body state into the 222-D train cache.
+
+        `reward` is the ACTUAL step reward, exactly as grasp (robotis_sh5_grasp_env.py:1666 passes
+        its own `reward.clamp(min=0.0)`) and as TJ's original (gr_env.py:608 compares
+        `total_reward > state_cache[current_frame, 0]` and stores it at column 0). This env used to
+        recompute a local proxy `-(body + hand + root_pos)` instead — a porting slip, since `reward`
+        was already in scope one line above the call site. The proxy dropped `obj_pos`/`obj_rot`,
+        i.e. the object term, from the ranking of a loco-MANIPULATION task, and also dropped `ee`,
+        `ft_reward`, `root_rot`, contact force and feet-match, and ignored the per-term weights
+        (it summed three errors 1:1:1 while the reward weights them separately). The object was
+        still gated on (see `good` below), so the proxy only mis-ranked states that were already
+        object-acceptable — but `enough_obj_threshold` is loose, so within that band it could not
+        prefer the state whose object placement was actually better.
 
         Vectorized: build the full (E,222) state once, then scatter the highest-reward env
         into each UNIQUE frame it covers (loop is O(unique frames) << O(num_envs))."""
@@ -1775,7 +1810,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # reaches the end) — NO body/hand bars (grasp never gated on those). When has_object is False
         # the obj errs are 0 → the object phase is trivially satisfied → gate reduces to ft only.
         action_fps = round(1.0 / (c.sim.dt * c.decimation))
-        start_cutoff = action_fps * 2 // 3                                  # ~20 frames @30Hz
+        start_cutoff = action_fps * 2 // 3                                  # first 2/3 s = 33 frames @50Hz
         reached_end = self.is_reached_end                                   # python bool
         op, orr = e["obj_pos"], e["obj_rot"]
         start_c = (op < 0.10) & (orr < 0.50) & (fr <= start_cutoff)
@@ -1790,14 +1825,42 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._enough_idx = torch.where(still_good, fr, self._enough_idx)    # last good frame
         self._enough_continued = still_good
 
-        # reward proxy: negative total tracking error (higher = better)
-        r = -(e["body"] + e["hand"] + e["root_pos"])                        # (E,)
-        # write only when tracking is still good AND the new state beats the cached reward
-        better = r > self._state_cache[fr, 0]                               # (E,) fancy-index gather
+        # cache ranking key = the ACTUAL step reward (grasp / TJ convention; see the docstring).
+        r = reward                                                          # (E,)
+        # [ROLLBACK MARKER: deferred-cache] -------------------------------------------------------
+        # With the deferral on, `better` is NOT evaluated here — the comparison against the cache
+        # happens at commit time in _flush_state_cache, because the cache moves while the episode
+        # runs. Staging is gated on the per-frame quality streak only; the episode-length filter is
+        # applied at termination, which is the whole point (it needs hindsight).
+        if getattr(self, "_pend_state", None) is not None:
+            stage_mask = gate & self._enough_continued                     # (E,)
+            if stage_mask.any():
+                slot = self.episode_length_buf.clamp(max=self._pend_cap - 1)   # (E,)
+                rows = torch.nonzero(stage_mask, as_tuple=False).squeeze(-1)
+                self._pend_state[rows, slot[rows]] = self._build_cache_state(r, org)[rows]
+                self._pend_frame[rows, slot[rows]] = fr[rows]
+                self._pend_valid[rows, slot[rows]] = True
+            return
+        # [/ROLLBACK MARKER: deferred-cache] ------------------------------------------------------
+
+        # write only when tracking is still good AND the new state beats the cached reward.
+        # Computed HERE, after the deferral branch above returns, so the per-step fancy-index gather
+        # is not paid when the commit is deferred (there it happens once, at flush time).
+        better = r > self._state_cache[fr, 0]                              # (E,) fancy-index gather
         update_mask = gate & self._enough_continued & better               # (E,)
         if not update_mask.any():
             return
-        # build the full (E,222) state row once; only masked rows get written
+        state = self._build_cache_state(r, org)
+        for uf in torch.unique(fr[update_mask]):
+            m = (fr == uf) & update_mask
+            best_env = m.nonzero(as_tuple=True)[0][r[m].argmax()]
+            self._state_cache[uf] = state[best_env]
+            self._init_flg[uf] = False
+            self._reached_frame = max(self._reached_frame, int(uf.item()))
+
+    def _build_cache_state(self, r: torch.Tensor, org: torch.Tensor) -> torch.Tensor:
+        """(E,222) cache row for every env: [0] = the step reward (ranking key), rest = the full
+        restorable sim state. Column 0 must be the SAME quantity the `better` comparison uses."""
         state = torch.empty(self.num_envs, self._STATE_DIM, device=self.device)
         state[:, 0] = r
         state[:, 1:4] = self.robot.data.root_pos_w - org
@@ -1814,14 +1877,40 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         state[:, 27:92] = self.robot.data.joint_pos[:, self._action_joint_ids_t]
         state[:, 92:157] = self.robot.data.joint_vel[:, self._action_joint_ids_t]
         state[:, 157:222] = self._smoothed_actions
-        # per unique frame among updating envs, pick the highest-reward env (order-independent
-        # equivalent of the sequential loop's "keep best per frame > pre-existing cache")
-        for uf in torch.unique(fr[update_mask]):
-            m = (fr == uf) & update_mask
-            best_env = m.nonzero(as_tuple=True)[0][r[m].argmax()]
-            self._state_cache[uf] = state[best_env]
-            self._init_flg[uf] = False
-            self._reached_frame = max(self._reached_frame, int(uf.item()))
+        return state
+
+    # [ROLLBACK MARKER: deferred-cache] -----------------------------------------------------------
+    def _flush_state_cache(self, env_ids: torch.Tensor, ep_len: torch.Tensor) -> None:
+        """Commit the staged states of TERMINATING envs, in bulk (see cfg.cache_min_episode_length).
+
+        Called from _reset_idx BEFORE `super()._reset_idx()` zeroes `episode_length_buf`, so `ep_len`
+        must be captured by the caller. Only envs whose episode lasted >= cache_min_episode_length
+        contribute anything — that hindsight filter is the reason the commit is deferred at all.
+        For every (env, slot) still marked valid we keep the highest-reward candidate per frame and
+        write it only if it beats what the cache holds NOW (the cache moved while the episode ran).
+        """
+        if self._pend_state is None or len(env_ids) == 0:
+            return
+        keep = ep_len >= int(self.cfg.cache_min_episode_length)
+        rows = env_ids[keep]
+        if len(rows):
+            valid = self._pend_valid[rows]                                   # (R, cap)
+            if valid.any():
+                sel = torch.nonzero(valid, as_tuple=False)                   # (K,2) [row, slot]
+                cand_state = self._pend_state[rows[sel[:, 0]], sel[:, 1]]    # (K,222)
+                cand_frame = self._pend_frame[rows[sel[:, 0]], sel[:, 1]]    # (K,)
+                cand_r = cand_state[:, 0]
+                # per frame: best candidate in this flush, then the usual "only if better" vs cache
+                for uf in torch.unique(cand_frame):
+                    m = cand_frame == uf
+                    best = cand_state[m][cand_r[m].argmax()]
+                    if best[0] > self._state_cache[uf, 0]:
+                        self._state_cache[uf] = best
+                        self._init_flg[uf] = False
+                        self._reached_frame = max(self._reached_frame, int(uf.item()))
+        # clear staging for ALL terminating envs (kept or dropped) so the next episode starts clean
+        self._pend_valid[env_ids] = False
+    # [/ROLLBACK MARKER: deferred-cache] ----------------------------------------------------------
 
     # ---------------------------------------------------- pretrain-cache warm-start
     def set_pretrain_cache(self, npz_path: str) -> bool:

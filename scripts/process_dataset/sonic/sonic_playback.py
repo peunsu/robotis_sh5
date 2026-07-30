@@ -25,6 +25,12 @@ parser.add_argument("--free_base", action="store_true")
 parser.add_argument("--hold", action="store_true", help="freeze SMPL ref at frame 0 (can-it-stand)")
 parser.add_argument("--ref_reset", action="store_true",
                     help="reset robot to the retarget reference pose (g1_joint_pos[0]) instead of SONIC standing default (faithful RSI; needed for crouch clips)")
+parser.add_argument("--reverse", action="store_true",
+                    help="play the reference BACKWARD in time (RePHO's reverse_time: flip the whole "
+                         "SMPL/kpt reference at load, so the tokenizer's 10-frame 'future' window "
+                         "walks backward through the original motion). Diagnostic for whether the "
+                         "FROZEN SONIC prior — trained on forward human motion — can drive a "
+                         "time-reversed reference at all. Writes sonic_<clip>_rev.mp4.")
 parser.add_argument("--out_dir", default="")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -107,6 +113,18 @@ def load_clip(clip, cls):
     t_src, t_tgt = np.arange(F) / SRC_FPS, np.linspace(0.0, (F - 1) / SRC_FPS, N)
     d["human_kpts"] = torch.tensor(_lerp_np(hk, t_src, t_tgt).reshape(N, len(BK_PARA), 3), device=device)  # (N,16,3)
     d["N"] = N
+    if args.reverse:
+        # RePHO's reverse_time (intermimic.py:290-292): flip the reference at LOAD, so every
+        # downstream index — including the tokenizer's 10-frame "future" window — walks backward
+        # through the original motion with no other code change. The frame-0 seeds must come from
+        # the ORIGINAL last frame, which is the reversed sequence's first.
+        for k in ("smpl_joints_local", "root_q_zb", "wrist_ref", "human_kpts"):
+            d[k] = torch.flip(d[k], dims=[0]).contiguous()
+        d["ref_q"] = torch.tensor(rt["g1_joint_pos"][-1], device=device)
+        if "g1_root_pose" in rt.files:
+            d["ref_root_z"] = float(rt["g1_root_pose"][-1, 2])
+            d["g1_root_quat0"] = tuple(float(x) for x in rt["g1_root_pose"][-1, 3:7])
+        print(f"  [reverse] reference flipped: {N} frames played last->first")
     return d
 
 
@@ -212,7 +230,7 @@ def main():
             return tok
 
         import imageio
-        out = os.path.join(out_dir, f"sonic_{clip}.mp4")
+        out = os.path.join(out_dir, f"sonic_{clip}{'_rev' if args.reverse else ''}.mp4")
         writer = imageio.get_writer(out, fps=args.fps, macro_block_size=1)
         errs, arm_errs, root_zs = [], [], []
         for f in range(N):

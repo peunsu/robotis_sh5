@@ -611,6 +611,27 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     use_rsi: bool = True
     adaptive_sampling: bool = True
     failure_weighted_sampling: bool = True   # TRAIN: True (failure-weighted). PRETRAIN overrides → False (uniform).
+    # [ROLLBACK MARKER: deferred-cache] ----------------------------------------------------------
+    # Commit the RSI state cache in BULK AT TERMINATION instead of per-step.
+    #
+    # Today `_save_state_cache` runs inside `_get_rewards`, i.e. EVERY control step, and writes the
+    # env's CURRENT frame immediately. The only quality filter is `_enough_continued` (tracking has
+    # been continuously good since reset) — which a born-dead episode PASSES for its first few steps,
+    # because at reset the state IS the reference/cache so the errors are still small. Such an episode
+    # therefore writes states that lead to death into frames whose cache was empty or worse, and those
+    # states are then restored by later resets.
+    #
+    # With this > 0 the writes are held per-env and only committed when the episode ENDS, and only if
+    # it lasted at least this many control steps. Episodes that die sooner contribute nothing. The
+    # per-frame quality gate and the "keep the higher reward" rule are unchanged — this adds a
+    # hindsight filter on top of them.
+    #
+    # COST: a (num_envs, max_episode_length, 222) fp32 staging buffer. 2048 envs x 251 frames =
+    # 442 MB; 4096 x 501 = 1.76 GB. If that is too much, lowering it does NOT shrink the buffer (the
+    # buffer must span a whole episode) — cap `episode_length_s` or reduce num_envs instead.
+    # 0 disables the deferral entirely and restores the per-step write, byte-identical to before.
+    cache_min_episode_length: int = 10
+    # [/ROLLBACK MARKER: deferred-cache] ---------------------------------------------------------
     adaptive_alpha: float = 0.001
     adaptive_uniform_ratio: float = 0.1
     adaptive_back_seconds: float = 0.8       # run-up before the sampled target frame (= 50 frames @50 fps)
