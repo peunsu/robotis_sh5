@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--class", dest="cls", default="single_rigid")
     ap.add_argument("--gamma", type=float, default=0.015, help="object-vertex→nearest-hand-vertex contact dist (m)")
     ap.add_argument("--num-contacts", type=int, default=50, help="farthest-point-subsample cap per frame")
+    ap.add_argument("--normal-source", choices=("surface", "to-hand"), default="surface",
+                    help="접촉 방향을 물체 메시의 표면 법선에서 얻을지(surface, 기본), "
+                         "표면점→손 정점 방향에서 얻을지(to-hand, 이전 동작).")
     ap.add_argument("--use-velocity-gate", action="store_true",
                     help="also require the object to be moving (old behavior); default OFF (DexMachina geometric-only)")
     args = ap.parse_args()
@@ -137,6 +140,7 @@ def main():
     vel = (spd > _OBJ_LINVEL_TH) | (ang > _OBJ_ANGVEL_TH)
     mesh = trimesh.load(str(_RAW_SCAN / obj_name / "simplified" / "base.obj"), process=False, force="mesh")
     V = np.asarray(mesh.vertices, np.float64)
+    VN = np.asarray(mesh.vertex_normals, np.float64)                # (n_objv,3) object-LOCAL outward normals
 
     from scipy.spatial import cKDTree
     L = len(link_names)
@@ -155,11 +159,20 @@ def main():
             continue
         cw = Vw[keep]                                              # (M,3) world contact points (object surface)
         clink = hand_v_link[paired[keep]]                          # (M,) link via the paired HAND vertex
-        # per-contact REACTION-FORCE direction = object surface → paired hand vertex (auto-signed toward the
-        # hand ⇒ the direction the object pushes the link). Stored object-LOCAL (pose-invariant) via `@ R`.
-        nrm_w = verts[t][paired[keep]] - cw                        # (M,3) world, surface→hand
-        nrm_w /= np.clip(np.linalg.norm(nrm_w, axis=1, keepdims=True), 1e-9, None)
-        nrm_l = nrm_w @ R                                          # (M,3) object-local (world→local dir)
+        # per-contact direction, object-LOCAL (pose-invariant), pointing OUT of the object surface.
+        # "surface": the mesh's own outward normal at the contact vertex. This is the axis of the
+        #   friction cone, which is what the contact-wrench reward needs, and it is already in object
+        #   coordinates so no rotation is involved.
+        # "to-hand": the previous behaviour — direction from the object surface point to the paired
+        #   HAND vertex. It approximates the surface normal only while the hand sits directly above
+        #   the surface; where the nearest hand vertex is off to the side it tilts away from it.
+        # Both point outward, so downstream consumers see the same sign convention either way.
+        if args.normal_source == "surface":
+            nrm_l = VN[keep]
+        else:
+            nrm_w = verts[t][paired[keep]] - cw                    # (M,3) world, surface→hand
+            nrm_w /= np.clip(np.linalg.norm(nrm_w, axis=1, keepdims=True), 1e-9, None)
+            nrm_l = nrm_w @ R                                      # (M,3) object-local (world→local dir)
         # DexMachina step 2 (FPS): spatially subsample to <= num_contacts (keep link/normal aligned).
         fps = _farthest_point_sample(cw, args.num_contacts)
         cw = cw[fps]; clink = clink[fps]; nrm_l = nrm_l[fps]
@@ -174,8 +187,10 @@ def main():
                 normal[t, li] = nl / max(float(np.linalg.norm(nl)), 1e-9)
 
     out = clip_dir / "0" / "hand_contact.npz"
+    # normal_source is recorded so a consumer can tell which convention a file was written with.
     np.savez(out, link_names=np.array(link_names), mask=mask,
-             target=target.astype(np.float32), normal=normal.astype(np.float32))
+             target=target.astype(np.float32), normal=normal.astype(np.float32),
+             normal_source=np.array(args.normal_source))
     nfire = (mask.sum(0) > 0)
     active = n_contacts_log[n_contacts_log > 0]
     print(f"[hand-contact/OptionA] {args.clip}: obj={obj_name}  gamma={args.gamma}  vel_gate={args.use_velocity_gate}")

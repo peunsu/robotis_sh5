@@ -244,7 +244,17 @@ G1_SHADOW_CFG = ArticulationCfg(
             angular_damping=0.0,
             max_linear_velocity=1000.0,
             max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
+            # Kept at 1.0. Lowering it (0.5, then 0.1) was tried to damp the impulse produced by the
+            # reference's hand-inside-countertop overlap, and it does work for that: spawn-time link
+            # speed p99 fell 1.17 -> 0.60 -> 0.18 m/s. It was chasing the wrong fault, though —
+            # robots ending up below the floor happen at 1.0 too, and the feet never penetrate.
+            # Measured in sim at the reference pose, the sole sits +0.63 cm above ground (median;
+            # min -0.55, only 10/501 frames below zero). What looks like sinking is the LEGS BUCKLING:
+            # hold the joint PD at the reference and the robot collapses 48 cm in 0.8 s while both
+            # soles stay above ground, because a floating-base humanoid cannot stand on frozen joint
+            # targets at these gains (hip/knee stiffness 99 Nm/rad). Standing is SONIC's job, done by
+            # moving the targets every step. Nothing here is a depenetration problem.
+            max_depenetration_velocity=10.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             # Match G1_29DOF locomotion setup. Self-collision off (full humanoid + 2 hands is
@@ -311,7 +321,7 @@ G1_SHADOW_CFG = ArticulationCfg(
 
 
 @configclass
-class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
+class G1ShadowRephoEnvCfg(DirectRLEnvCfg):
     # --- Robot -----------------------------------------------------------------
     # Composite G1 + bimanual Shadow (validated). FLOATING base (fix_root_link=False in
     # G1_SHADOW_CFG.spawn.articulation_props) for locomotion.
@@ -333,6 +343,36 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # (user-locked): a_hand ∈ [-1,1] maps DIRECTLY to the Shadow joint range (EMA-smoothed), NOT a
     # residual/delta. (Body ACTION_DIM=65 constant kept for the joint-group machinery.)
     sonic_action_dim: int = 64          # z_res latent residual width (SONIC max_num_tokens×token_dim = 2×32)
+    # [ROLLBACK MARKER: sonic-encoder-g1] ----------------------------------------------------------
+    # Which of the checkpoint's tokenizer encoders conditions the frozen prior. Encoders are
+    # ['g1', 'teleop', 'smpl'] and encoder_index (tokenizer slot [0:3]) is the selector.
+    #
+    #   "smpl"  smpl_joints_multi_future_local_nonflat (10,72) = 24 human joints x 3, pelvis-local
+    #           joint_pos_multi_future_wrist_for_smpl  (10,6)   <- WRIST-SPECIFIC input
+    #           smpl_root_ori_b_multi_future           (10,6)
+    #   "g1"    command_multi_future_nonflat           (10,58) = [dof_pos(29), dof_vel(29)] ABSOLUTE
+    #           motion_anchor_ori_b_mf_nonflat         (10,6)
+    #           driven from the pyroki retarget, so the human->G1 morphology mapping is already
+    #           solved by IK against G1's real kinematics instead of inferred by SONIC.
+    #
+    # Frozen-prior playback on s101_seg12_knife (scripts/process_dataset/sonic/sonic_playback_g1.py,
+    # identical camera/object, --free_base) says g1 is NOT a free win:
+    #                 body_err  arm_err  wrist  wrist_L  wrist_R  nearest wrist->object
+    #     smpl          7.2 cm   7.5 cm  5.61     4.40     6.81   1.2 cm  (frame 142)
+    #     g1            7.3 cm   7.4 cm  8.90    10.40     7.40   5.0 cm  (frame 385)
+    # The whole-body means tie; the manipulation-relevant terms are 1.6-4x worse. Per-keypoint, g1
+    # tracks the ELBOWS much better (left 8.91 -> 2.57 cm) and the WRISTS much worse — consistent
+    # with commanding joint angles (accurate joints, error accumulating down the chain) and with the
+    # smpl encoder having a wrist-specific input that the g1 encoder does not.
+    #
+    # NOTE both the tokenizer's encoder_index AND sonic_prior.encode_latent(encoder=...) must be set
+    # together. encode_latent takes the encoder NAME, so flipping only encoder_index would leave the
+    # env silently on smpl while looking switched. (sonic_playback uses SP.act, which routes off
+    # encoder_index alone — that is why the playback comparison above was valid.)
+    sonic_encoder: str = "smpl"         # "smpl" | "g1"
+    # [/ROLLBACK MARKER: sonic-encoder-g1] ---------------------------------------------------------
+
+    # [/ROLLBACK MARKER: obj-guidance] -------------------------------------------------------------
     hand_action_dim: int = 36           # bimanual Shadow finger action (ABSOLUTE, EMA-smoothed α=0.5)
     action_space: int = 64 + 36         # 100
     # --- SONIC-mode DELTA-ACTION switches (default OFF = the absolute/raw behavior above) --------------
@@ -341,8 +381,63 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # per experiment. (Distinct from the non-SONIC group *_delta_action switches, which are bypassed here.)
     #   hand:  integrate a_hand·scale (rad/step) into the hand JOINT target, clamped to joint limits.
     #   latent: integrate z_res_raw·scale into the SONIC latent residual, clamped to ±clip (anti-windup).
+    # [ROLLBACK MARKER: hand-residual] -----------------------------------------------------------
+    # Drive the 36 finger joints as a RESIDUAL on the retargeted hand pose instead of as an absolute
+    # command over the full joint range: target = clamp(ref_joints[frame] + residual_scale_hands *
+    # a_hand, limits), stateless (no EMA). a_hand=0 reproduces the retarget exactly.
+    # Why: under the absolute mapping the hand was the only part of the robot with no reference
+    # anchor (the body has one, via SONIC's tokenizer conditioning), and the policy saturated it —
+    # Diag/hand_clamp_frac 0.446, i.e. 45% of finger dims pinned to a limit at any instant, so the
+    # hand approached the knife already closed. Requires the retarget joint order fix
+    # (remap_ref_joint_order): before it, the reference hand had MFJ1 fed by the thumb's value.
+    # Also switches two regularisers to match the parameterisation — rew_action_reg_hands to the
+    # commanded residual, rew_pose_reg_hands to the realised deviation FROM THE REFERENCE (it
+    # anchors to the neutral pose when this is False). False restores the absolute mapping exactly.
+    sonic_hand_residual: bool = False
+    # [/ROLLBACK MARKER: hand-residual] ----------------------------------------------------------
+    # [ROLLBACK MARKER: hist-seed-zero-vel] ------------------------------------------------------
+    # At an RSI reset SONIC's 10-frame proprio history does not exist, so one row is copied into
+    # all 10 slots — which freezes joint POSITION across the window. Carrying the live joint
+    # VELOCITY into that window then asserts a state that cannot occur (positions unchanged while
+    # the joints move) and that the frozen decoder never saw. True zeroes the seeded velocity so
+    # the fabricated window reads as 'at rest for 10 frames'. It rewrites only the PAST: the robot
+    # keeps the velocity the cache restored, and the next step appends the real row.
+    # Warm-up was already consistent by accident (the reference reset path leaves jvel at 0), so
+    # this only changes the ADAPTIVE phase, where cache restores carry real velocity.
+    # [ROLLBACK MARKER: hist-from-reference] -----------------------------------------------------
+    # Seed SONIC's 10-frame proprio window from the REFERENCE's own last 10 frames (episode-frame
+    # indices clamped at 0, mapped through _canon_frame, velocities sign-flipped for backward)
+    # instead of replicating the current measured row. Two things change: the window becomes a
+    # real trajectory (positions/velocities/orientation mutually consistent, so the frozen-position
+    # contradiction disappears), and it becomes the SAME trajectory the tokenizer already feeds as
+    # the FUTURE — the past was the robot's state while the future was the reference, two stories.
+    # All 10 slots including the newest: keeping the newest measured would express the tracking
+    # error as a one-frame position jump the velocity channel contradicts.
+    # False falls back to the replicated row, and then sonic_hist_seed_zero_vel applies.
+    #
+    # ON since 2026-08-05: this removes the RSI reset discontinuity outright. Measured on
+    # s101_seg12_knife, 64 envs, zero action (Jerk/tgt_jump_reset = steps 1-3 of an episode,
+    # tgt_jump_run = steps >=10, both rad, largest single-joint step):
+    #     replicated row   reset 0.360  run 0.170  ratio 2.13     backward_ratio 0.5
+    #     replicated row   reset 0.356  run 0.147  ratio 2.42     backward_ratio 0.0
+    #     from reference   reset 0.171  run 0.171  ratio 1.00     backward_ratio 0.5
+    #     from reference   reset 0.163  run 0.172  ratio 0.95     backward_ratio 0.0
+    # Ratio 1.00 means a just-reset step is indistinguishable from a settled one. Backward rollouts
+    # are irrelevant to it (0.5 vs 0.0 agree), so this is the reset seeding alone.
+    # NOTE it does NOT lengthen episodes (ep_len 7.16 -> 7.35): those die on the obj_rot gate
+    # (79-81% of deaths), which is a separate defect. Judge this flag on reset continuity, not on
+    # episode length — an earlier read of root_v99 (0.806 -> 0.733) called it "secondary" because
+    # that statistic averages over whole episodes and dilutes a transient that flushes in 10 steps.
+    sonic_hist_from_reference: bool = True
+    # [/ROLLBACK MARKER: hist-from-reference] ----------------------------------------------------
+    sonic_hist_seed_zero_vel: bool = False
+    # [ROLLBACK MARKER: act-seed-from-pose] True restores our jpr/sonic_scale action seed ("the
+    # action that would command the pose the robot is in"). False is the GRAIL/IsaacLab
+    # equivalent: the action manager zeroes actions on reset, so CircularBuffer replicates 0.
+    sonic_act_seed_from_pose: bool = False
+    # [/ROLLBACK MARKER: hist-seed-zero-vel] -----------------------------------------------------
     sonic_hand_delta: bool = False
-    sonic_hand_delta_scale: float = 0.25        # rad/step at raw=1
+    sonic_hand_delta_scale: float = 0.4        # rad/step at raw=1
     sonic_hand_delta_smoothing: float = 1.0    # EMA α on the delta (1.0 = no smoothing)
     sonic_latent_delta: bool = False
     sonic_latent_delta_scale: float = 0.5      # latent-units/step at raw=1
@@ -375,7 +470,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #   emitted. The bounded copy is still used for the action_rate reward. See the block-C comment in
     #   _get_observations for the measurement, and note the real chain is the 100-D joint log-ratio
     #   feeding the `A<0` branch of PPO's `-min(A·r, A·clip(r))`, unbounded for r ≫ 1+ε.
-    observation_space: int = 766   # [backward-dir] +1 = 진행 방향 비트        # asserted in _get_observations. Per-link contact (Option A): the
+    observation_space: int = 766        # asserted in _get_observations. Per-link contact (Option A): the
     #   fingertip future_contact(10)+fingertip force(10) obs were REPLACED by per-link mask(32)+force(32) → +44.
     state_space: int = 0
 
@@ -387,10 +482,33 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
         dt=1.0 / 200.0,                 # 50 Hz control with decimation 4 (SONIC's native rate)
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.80665),
+        # Contact/friction settings copied from robotis_shadow_grasp, which runs 2048 envs stably.
+        # This env had NONE of them, so it inherited the IsaacLab defaults, and two of those are
+        # actively wrong here:
+        #   friction  — neither the robot USD nor the ground plane authors a physics material, so both
+        #               fall back to 0.5 and the foot<->ground pair averages to 0.5. The objects DO
+        #               author 1.0 (the converter's DEFAULT_FRICTION), so only the feet were slipping.
+        #               A floating-base humanoid leaning over a counter on mu=0.5 slides, and the slide
+        #               reads as the robot sagging.
+        #   bounce_threshold_velocity — default 0.5 m/s means any contact ABOVE that is resolved
+        #               elastically. Reset depenetration was measured throwing hand links at up to
+        #               5.3 m/s, i.e. far above it, so those contacts bounced, re-touched and bounced
+        #               again. 0.01 makes essentially every contact here inelastic.
+        #   friction_correlation_distance — default 0.025 m merges friction anchors within 2.5 cm;
+        #               Shadow finger links are closer together than that, so separate fingers' contacts
+        #               were being merged. 0.00625 keeps them distinct.
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
         physx=sim_utils.PhysxCfg(
+            gpu_found_lost_pairs_capacity=1024 * 1024 * 16,
             gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
             gpu_total_aggregate_pairs_capacity=1024 * 1024,
-            gpu_max_rigid_patch_count=1024 * 1024 * 4,
+            gpu_max_rigid_patch_count=1024 * 1024 * 16,
+            friction_correlation_distance=0.00625,
+            friction_offset_threshold=0.04,
+            bounce_threshold_velocity=0.01,
         ),
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=3.0)
@@ -466,24 +584,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     rew_body_kpts: float = -0.5        # mean over the 10 CORE body kpts (non-end-effector)
     rew_ee_kpts: float = -1.76          # mean over the 4 END-EFFECTOR kpts (L/R wrist + L/R ankle)
     rew_hand_kpts: float = -1.76        # mean over 40 finger-chain kpts (dexterity)
-    rew_fingertip: float = -6.0 # -5.2        # mean over 10 bimanual pads ≈ grasp -5.2 (both are means)
-    # ── [ROLLBACK MARKER: link-kpt] 손끝 외 wrap 링크의 접촉 목표 추종 ────────────────
-    # 손끝 외의 손가락 마디(뿌리/중간)도 제 위치를 지키게 하는 항입니다. 손끝 10개만으로는 손
-    # 방향이 거의 안 묶입니다 — 손목을 60도 돌려도 손끝을 목표 근처에 놓는 자세가 여럿이라 옆면
-    # 으로 잡는 자세가 허용됩니다. 뿌리/중간 마디는 한 방향에서만 자기 목표에 닿으므로 이 항이
-    # 실제로 자세의 자유도를 묶습니다.
-    # 목표는 "물체 기준 좌표로 기록해 둔 레퍼런스에서의 링크 위치"를 살아있는 물체 자세로 되돌린
-    # 점입니다(_solve_ref_link_local이 시작할 때 한 번 계산). 따라서 물체가 굴러가면 손이 따라가야
-    # 할 자세도 같이 돌아갑니다. 물체 표면의 접촉점을 목표로 쓰던 이전 방식은 물체가 회전해도
-    # 목표가 그대로여서 회전을 따라가지 못했습니다. 접촉 요구와 무관하게 매 프레임 정의되므로
-    # 접촉 마스크로도 걸지 않습니다. 어떤 링크를 셀지는 link_kpt_include_palm이 정합니다.
-    # 배점은 손끝(-6.0)의 절반 — 손끝이 여전히 주도해야 합니다.
-    rew_link_kpts: float = -3.0
-    # 목표가 물체 표면의 접촉점이던 시절에는 손바닥을 뺐습니다. 레퍼런스 자세에서조차 오른손바닥은
-    # 요구 프레임의 12.6%만 그 목표에 닿았고(측정값), 도달 불가능한 목표를 강제하면 정책이 손바닥을
-    # 물체로 밀어 넣어 관통을 만들기 때문입니다. 목표를 레퍼런스 링크 위치로 바꾼 뒤로는 손바닥
-    # 목표도 로봇이 실제로 취했던 자세라 도달 가능하므로 다시 포함합니다.
-    link_kpt_include_palm: bool = True
+    rew_fingertip: float = -5.2        # mean over 10 bimanual pads ≈ grasp -5.2 (both are means)
     # B. Locomotion / root — root_ori up-weighted over root_pos (GRAIL-aligned: orientation > position).
     rew_root_pos: float = -0.5         # was -2.5 (user 2026-07-20: de-emphasize root position)
     rew_root_ori: float = -0.5         # was -1.0 (user 2026-07-20: emphasize root orientation)
@@ -491,8 +592,8 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #   balance, so the residual policy has NO foot-contact obs/reward (no rew_foot_contact/foot_slip,
     #   foot_force_cap, foot_kpt_gate, foot flatness). Feet are still tracked as part of the 14-kpt body reward.
     # D. Object manipulation — reused from grasp (inside the clamped tracking_penalty)
-    rew_obj_pos: float = -5.0 # -4.26
-    rew_obj_rot: float = -1.2 # -1.0
+    rew_obj_pos: float = -4.26
+    rew_obj_rot: float = -1.0
     # (no rew_obj_artic: objects always spawn as a single rigid base, so the articulation-DOF error was
     #  identically zero — see the NOTE in _get_rewards. Re-add it with the live joint read.)
     # PER-LINK contact-force reward (Option A / DexMachina, extends the old fingertip-only force reward to
@@ -504,10 +605,6 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # contact_normal_gate_tol). Normalized ∈[0,1] over the active links.
     rew_contact_force: float = 0.7     # per-link contact-force reward weight (was rew_fingertip_force)
     contact_force_cap: float = 1.0     # N; per-link compressive force at/above this = full credit (saturates)
-    # [ROLLBACK MARKER: force-fingertip-only] 접촉력 보상을 손끝 10개로만 계산합니다. False면
-    # wrap 링크 32개 전체를 씁니다. 전체를 쓰면 분모(레퍼런스가 요구하는 링크 수)에 손바닥처럼
-    # 달성 불가능한 링크가 섞여 보상이 눌립니다(실측: 프레임당 7개 요구, 실제 접촉 3개).
-    contact_force_fingertip_only: bool = False
     force_obs_clip: float = 300.0      # N; OBS-side clip on per-link + foot contact forces (user 2026-07-23).
     #   Raw forces spike to ~hundreds of N (foot ≈ body weight; measured obs var ~7e5) → destabilize the
     #   RunningStandardScaler. Clip the OBS copy only (reward uses contact_force_cap). Stabilizes scaling.
@@ -519,43 +616,12 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # ~62–80% yet still culls clearly-wrong faces. The force is already projected on the link's own inward
     # normal, so back-of-palm contact (reaction ≈ +palmar-outward) yields ≤0 compressive force regardless —
     # this gate is the secondary orientation filter, hence kept lenient.
-    contact_normal_gate_tol: float = 1.00
+    contact_normal_gate_tol: float = 1.25
     # E. Alive / regularization
     # rew_alive sets the tracking_penalty clamp floor (-rew_alive). Above the grasp default (1.5)
     # because the grouped full-body/bimanual tracking penalty is larger; kept high enough that good
     # tracking stays unsaturated (else the clamp kills the gradient) while flooring bad steps at 0.
     # User set 2.0 (from 4.0). Watch Reward/tracking_clamp_frac — if it climbs, raise back toward 4.
-    # ── [ROLLBACK MARKER: exp-tracking] tracking-reward SHAPE ────────────────────────────────
-    # False = the original linear form (sum of -w*err clamped at -rew_alive). True = SONIC's shape,
-    # w*exp(-err^2/sigma^2) per term. Flipping this one flag switches the whole tracking group; every
-    # other reward term is untouched, and the per-term weights are derived from the SAME rew_* below
-    # (normalised to exp_tracking_budget), so the two forms keep identical relative emphasis.
-    exp_tracking_reward: bool = True
-    # Total the eight tracking terms can pay per step. Held near the linear form's clamp magnitude
-    # (rew_alive = 1.5) ON PURPOSE: contact_force 0.7, com_support -0.5 and latent_reg -0.1 were all
-    # tuned against that scale, and adopting SONIC's absolute budget (its terms sum to 7.0) would
-    # weaken them ~5x without touching their values.
-    exp_tracking_budget: float = 1.50
-    exp_rew_alive: float = 0.5   # replaces rew_alive when exp_tracking_reward is on. Much smaller: the
-    # exponential terms are all positive, so a longer episode already earns more discounted return and
-    # no survival bonus is needed to encourage it (SONIC carries no alive term at all). It is not 0
-    # only because the negative regularisers could otherwise push the total under the final clamp(min=0),
-    # which would kill their gradient the same way the tracking clamp killed the tracking gradient.
-    # Sigmas: the error at which a term pays exp(-1) = 0.37 of its weight. Taken from SONIC
-    # (gear_sonic/config/manager_env/rewards/terms/*.yaml) where the terms correspond, tightened where
-    # our errors are measured to be smaller. Tune them from the `Sat /` logs, not by intuition.
-    sigma_body: float = 0.30        # SONIC tracking_relative_body_pos std
-    sigma_ee: float = 0.10          # SONIC tracking_vr_5point_local std
-    sigma_hand: float = 0.10
-    sigma_fingertip: float = 0.05  # half of term_ft_err
-    # 링크 원점과 표면 접촉점 사이에는 링크 두께만큼의 하한이 있습니다(실측 약 4cm).
-    # Sat / link_kpt 이 1에 붙지 않는 게 정상이고, 0.3~0.7 대역에 오도록 맞추세요.
-    sigma_link_kpts: float = 0.05
-    sigma_root_pos: float = 0.30    # SONIC tracking_anchor_pos std
-    sigma_root_rot: float = 0.40    # SONIC tracking_anchor_ori std
-    sigma_obj_pos: float = 0.05    # half of term_obj_pos_err
-    sigma_obj_rot: float = 0.25    # half of term_obj_rot_err
-    # ── [/ROLLBACK MARKER: exp-tracking] ─────────────────────────────────────────────────────
     rew_alive: float = 1.5
     rew_action_reg_hands: float = -0.004   # action-magnitude reg on the policy-controlled hand JOINTS. legs/
     #   arms/waist are SONIC-driven (regularized by rew_latent_reg on z_res instead).
@@ -616,8 +682,8 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # is left unconstrained (positions are still gated by body/ft/wrist_pos). Re-enable only with a
     # self-consistent reference (e.g. retarget-FK: the robot's own palm quat FK'd at each retarget frame)
     # AND a retarget that emits g1_palm_quat / that reference in _ref_palm_quat.
-    enable_wrist_rot_termination: bool = True    # [wrist-rot] 키포인트 좌표계 비교로 되살림
-    term_wrist_rot_err: float = 0.75       # rad [wrist-rot]       # rad, per-hand palm-rotation deviation (= grasp max_wrist_rot_err)
+    enable_wrist_rot_termination: bool = False
+    term_wrist_rot_err: float = 0.75       # rad, per-hand palm-rotation deviation (= grasp max_wrist_rot_err)
     termination: bool = True               # master switch (False during eval/warm-up)
     # GRACE PERIOD: suppress the deviation (tracking) termination for the first N steps of each episode
     # so an episode is not born-dead while the policy has not yet corrected the reset pose (e.g. the
@@ -642,65 +708,8 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # right under the object (centroid distance is an approximation of a proper AABB/footprint test).
     context_radius: float = 1.0            # m, XY centroid distance to the active object's swept path
     context_support_radius: float = 1.5    # m, XY cap for the always-included below-object support
-    # [ROLLBACK MARKER: context-z] Sink every context object at spawn, as an alternative to lifting
-    # the object (object_spawn_declear). Both fix the same defect — the reference holds the object a
-    # few mm INSIDE whatever it rests on — but they leave the error in different places, and that
-    # difference decides the reward.
-    #
-    # Lifting the object spawns it at the height it will actually settle at, which is ABOVE the
-    # reference. The reward compares against the untouched reference, so on every resting frame the
-    # object is being marked down for a position the SUPPORT PHYSICALLY BLOCKS it from reaching —
-    # unreachable reward, which no amount of training recovers. Sinking the support moves the
-    # settling height DOWN onto the reference, so the target becomes achievable.
-    #
-    # Measured 0.3 s after spawn, median over the resting frames (lift -> sink):
-    #     s101_seg29_pot     49.9 -> 22.4 mm      s100_seg02_kettle  28.6 ->  7.4 mm
-    #     s100_seg00_pan     29.2 ->  5.3 mm      s101_seg30_bowl    23.1 -> 18.4 mm
-    #     s10_seg03_book     70.4 -> 35.9 mm      s101_seg12_knife    5.7 ->  3.4 mm
-    # and the vertical component specifically goes from +23..33 mm to -0.4..+4.4 mm on all of them.
-    # With sigma_obj_pos, that is the object-position reward term going from ~0.37-0.99 to ~0.82-1.00.
-    #
-    # What it does NOT fix, so expectations stay honest: only the VERTICAL error. The object also
-    # slides horizontally (the bowl's z error goes to zero while 18 mm of horizontal error remains)
-    # and tips over (pot 9.6 deg, book 21.2 deg, cup 61.8 deg even after the fix) — both come from the
-    # reference pose not being a stable resting pose on the collider, which no z shift can address.
-    context_z_offset: float = 0.0          # m, how far DOWN to move the context objects at spawn
-    # Measure that number instead of hard-coding it: it is per-clip (5.5 mm on s101_seg12_knife,
-    # 19.5 mm on s100_seg00_pan, 24.1 mm on s100_seg02_kettle) and cannot be known before the
-    # contexts are spawned, because it comes from settling the object ON them. So: spawn, run the
-    # declear solve, sink the contexts by the median lift it asked for, re-solve. Costs one extra
-    # declear solve at startup. Composes with context_z_offset above — the solve always measures
-    # whatever is left over from wherever the contexts currently are. Leave object_spawn_declear ON
-    # alongside it: the ~2 mm the single constant cannot cover is what that per-frame lift is for.
-    context_z_auto: bool = True
-    # [/ROLLBACK MARKER: context-z]
 
-    # =========================================================================== #
-    # Adaptive frame-sampling curriculum + pretrain-cache RSI (reused from grasp)
-    # =========================================================================== #
-    # ── MASTER RSI SWITCH ─────────────────────────────────────────────────────────────────────
-    # False → NO Reference State Initialization. Every episode starts at FRAME 0 and the robot is
-    # reset to the frame-0 retarget-reference pose — deterministic and identical every episode
-    # (classic fixed-start imitation baseline). The train / pretrain state caches are never READ
-    # (still written, so flipping this back to True mid-run works); the object is seeded at its
-    # frame-0 reference pose+velocity. Every knob below (adaptive/failure-weighted sampling,
-    # adaptive_back_seconds, uniform_sampling_steps, rsi_curriculum_steps, pretrain_cache_warmstart)
-    # is inert while this is False. Episode length is unaffected: frame 0 → end of the sequence.
-    # Confirm it is live via `Diag / rsi_start_mean` == 0.
-    #   TEMPORARILY DISABLED (2026-07-28) to A/B the PPO ratio explosion — diverse-from-step-0 RSI
-    #   onto cold nets is the leading suspect (see the rsi_curriculum_steps note below, and the
-    #   A<0 unclipped-surrogate branch that turns one large log-ratio into an fp32 gradient
-    #   overflow). Set back to True once that is settled; the pretrain cfg pins it True because
-    #   pretrain exists to visit every frame and fill the cache.
-    use_rsi: bool = True
-    # [ROLLBACK MARKER: retarget-joint-order] map the retarget's g1_joint_pos columns onto the env's
-    # action joints BY NAME instead of trusting position. The two orders silently diverged when
-    # G1_shadow.usd was rebuilt after g1_shadow_joint_order.json was dumped: 24 of 65 slots were
-    # crossed, all in the hands (MF<->TH, FF<->RF at J1/J2/J3), so MFJ1 was fed THJ2's value and the
-    # middle finger stuck out in every rollout while body tracking looked fine. _ref_joints is the
-    # residual action base, the RSI reset pose and the state-cache seed, so it poisoned all three.
-    # False restores the pre-fix positional read.
-    remap_ref_joint_order: bool = True
+    # [/ROLLBACK MARKER: object-settle-lift] -----------------------------------------------------
 
     # [ROLLBACK MARKER: spawn-declear] -----------------------------------------------------------
     # Clear the object out of its support at SPAWN, solved once at env startup against whatever
@@ -740,64 +749,365 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # they show little change. The residual ~9 deg on the knife is a genuine settled tip under
     # gravity, not a spawn artifact, and no height offset can remove it.
     object_spawn_declear: bool = True
-    # Steps of FREE settling used to measure where the object actually comes to rest. Convergence is
-    # fast (the pan is within 0.6 mm of final by step 5); 12 leaves margin without costing much, since
-    # this now runs ONCE per frame instead of once per bisection iteration.
     declear_settle_steps: int = 12
     declear_max_lift: float = 0.05         # m, safety clip so a pathological frame cannot launch it
     declear_rest_lin: float = 0.05         # m/s   reference speed under which the object counts as at rest
     declear_rest_ang: float = 0.25         # rad/s reference angular speed for the same test
+    # [/ROLLBACK MARKER: spawn-declear] ----------------------------------------------------------
 
+    # =========================================================================== #
+    # Adaptive frame-sampling curriculum + pretrain-cache RSI (reused from grasp)
+    # =========================================================================== #
+    # ── MASTER RSI SWITCH ─────────────────────────────────────────────────────────────────────
+    # False → NO Reference State Initialization. Every episode starts at FRAME 0 and the robot is
+    # reset to the frame-0 retarget-reference pose — deterministic and identical every episode
+    # (classic fixed-start imitation baseline). The train / pretrain state caches are never READ
+    # (still written, so flipping this back to True mid-run works); the object is seeded at its
+    # frame-0 reference pose+velocity. Every knob below (adaptive/failure-weighted sampling,
+    # adaptive_back_seconds, uniform_sampling_steps, rsi_curriculum_steps, pretrain_cache_warmstart)
+    # is inert while this is False. Episode length is unaffected: frame 0 → end of the sequence.
+    # Confirm it is live via `Diag / rsi_start_mean` == 0.
+    #   TEMPORARILY DISABLED (2026-07-28) to A/B the PPO ratio explosion — diverse-from-step-0 RSI
+    #   onto cold nets is the leading suspect (see the rsi_curriculum_steps note below, and the
+    #   A<0 unclipped-surrogate branch that turns one large log-ratio into an fp32 gradient
+    #   overflow). Set back to True once that is settled; the pretrain cfg pins it True because
+    #   pretrain exists to visit every frame and fill the cache.
+    # RePHO's sampleable-start bounds. It samples the start DIRECTLY (intermimic.py:1401-1402) —
+    # there is no run-up rewind — and only trims the right end so a start cannot land with nothing
+    # left to roll out (`_init_range_right = max_episode_length - 24`, :111).
+    init_range_right_margin: int = 24
+    # ---- per-frame staging quality bars (see _save_state_cache) ----
+    # Two object bars picked by the SAMPLING PHASE: the loose pair during the uniform warm-up, the
+    # tight pair once adaptive sampling begins. Frame-local, never latched.
+    enough_ft_threshold: float = 0.10
+    enough_obj_threshold: float = 0.085          # warm-up object pos bar (m)
+    enough_obj_rot_threshold: float = 0.425      # warm-up object rot bar (rad)
+    enough_obj_threshold_late: float = 0.05      # adaptive-phase object pos bar
+    enough_obj_rot_threshold_late: float = 0.25  # adaptive-phase object rot bar
+    cache_body_bar: float = 0.30
+    cache_root_pos_bar: float = 0.10
+    cache_root_rot_bar: float = 0.30
+
+    # ---- [ROLLBACK MARKER: contact-term] contact-loss termination ----
+    # RePHO ends an episode once required body-object contact has been missing for this many
+    # consecutive steps (intermimic.py:1755, SupMat S.6 ii). It is what makes survival length a
+    # proxy for doing the task — which the cache score, the sampler and the swap gates all assume.
+    # 0 disables.
+    # 6, not 10: `> 6` is the TRAIN branch (intermimic.py:1753). The `> 10` at :1755 is the eval
+    # branch, which also swaps the streak for a non-resetting cumulative counter (:1941).
+    contact_loss_frames: int = 6
+    contact_loss_grace: int = 2        # steps after a reset during which the streak cannot build
+    # Which of RePHO's four streaks may terminate: any subset of the channel names below. EMPTY =
+    # contact termination off, which is the shipped default, and the reason is measured rather than
+    # cautious. A channel can only teach anything if the retargeted REFERENCE POSE satisfies it: a bar
+    # the reference itself trips would kill a perfect tracker and just truncate every episode.
+    # Pinning every env to the reference pose and reading the env's own contact path
+    # (scratchpad/test_ref_palm.py) gives the longest CONSECUTIVE violation run vs this 6-frame bar:
+    #   clip              l_fing      r_fing      l_palm     r_palm
+    #   s101_seg12_knife  kill(12)    ok(5)       kill(12)   kill(351)
+    #   s100_seg00_pan    no demand   ok(3)       no demand  kill(120)
+    #   s101_seg29_pot    ok(5)       ok(3)       kill(11)   kill(277)
+    #   s101_seg30_bowl   ok(4)       kill(11)    kill(64)   kill(45)
+    # No subset is safe on all four: knife needs l_fing off, bowl needs r_fing off. Raising
+    # contact_loss_frames past 12 would make every channel survivable everywhere, but the streak
+    # distribution decays ~65%/frame so the rule would then almost never fire. No palm channel
+    # survives anywhere — hand_contact.npz derives contacts from the HUMAN SMPL-X hand (wrist->palm
+    # via lbs argmax) and demands contact the Shadow palm's geometry cannot reach; the same map also
+    # feeds the contact-force and fingertip rewards, so that label is worth fixing on its own.
+    # The four violation rates stay visible as `Diag / clost_*` whether or not they terminate.
+    contact_loss_channels: tuple[str, ...] = ("l_fing", "r_fing", "l_palm", "r_palm")
+    contact_force_thresh: float = 1.0  # N on a required link to count as contact
+    use_rsi: bool = True
     adaptive_sampling: bool = True
     failure_weighted_sampling: bool = True   # TRAIN: True (failure-weighted). PRETRAIN overrides → False (uniform).
-    # [ROLLBACK MARKER: deferred-cache] ----------------------------------------------------------
-    # Commit the RSI state cache in BULK AT TERMINATION instead of per-step.
+    # 0.96 -> 0.0 (back to the instantaneous step reward, still clamped at 0). Measured on knife 40k
+    # against an otherwise identical run: the discounted return ACCELERATED early learning (reward
+    # 12.58 vs 8.74 and episode length 55.5 vs 41.9 over 3-6k) and then FROZE it — reward flat at
+    # 14.2-14.9 from 6k through 19k while the baseline climbed 12.6 -> 25.2, and episode length
+    # actually fell back 55.9 -> 48.5. `Cache / score_mean` plateaued at ~14.3 at exactly the step
+    # the reward stopped moving, and `Cache / overwrite` sat at ~10 of 501 frames = 2% turnover.
+    # The mechanism is self-reinforcing: return-to-go is a SHARP estimate of "how well does it go
+    # from here", so only high-scoring states survive; RSI then starts almost exclusively from those,
+    # the policy only ever sees them, and no fresh candidate can beat an entry scored under a policy
+    # that has since specialised to it. The instantaneous reward is a NOISIER key, which keeps the
+    # cache churning and the start distribution diverse — the exploration mattered more than the
+    # accuracy of the ranking. Sigma was identical in both runs (0.38 -> 0.43), so this is not an
+    # action-noise effect. NOTE the clamp at 0 is kept (grasp/TJ do the same) because the decay term
+    # below needs non-negative scores.
+    # 0.99 (RePHO's gamma). REQUIRED by repho_length_score: _episode_returns is only evaluated when
+    # this is > 0, and without it cand_ret falls back to the step reward, so the replacement rule's
+    # tiebreak would silently compare instantaneous rewards instead of returns.
+    # 0.96 = agents/skrl_ppo_cfg.yaml discount_factor, deliberately NOT RePHO's 0.99. The cache's
+    # return must discount on the same horizon the critic does, or the two disagree about what "how
+    # well did it go from here" means: at 0.99 the cache ranks a state over ~100 steps of future while
+    # PPO values it over ~25, so the states it promotes are ones the policy is not trained to exploit.
+    # REQUIRED > 0 by repho_length_score — _episode_returns is only evaluated when it is, and otherwise
+    # cand_ret silently falls back to the step reward, making the replacement rule's tiebreak a
+    # comparison of instantaneous rewards instead of returns.
+    cache_score_gamma: float = 0.96           # 0.0 → instantaneous reward
+    cache_score_decay: float = 5e-4          # per flush; 0.0 → no decay
+    # [/ROLLBACK MARKER: cache-score-rework] -------------------------------------------------------
+
+    # [ROLLBACK MARKER: rsi-phase-split] ---------------------------------------------------------
+    # Split RSI into two phases with DIFFERENT start-state sources, instead of one rule throughout.
     #
-    # Today `_save_state_cache` runs inside `_get_rewards`, i.e. EVERY control step, and writes the
-    # env's CURRENT frame immediately. The only quality filter is `_enough_continued` (tracking has
-    # been continuously good since reset) — which a born-dead episode PASSES for its first few steps,
-    # because at reset the state IS the reference/cache so the errors are still small. Such an episode
-    # therefore writes states that lead to death into frames whose cache was empty or worse, and those
-    # states are then restored by later resets.
+    # The problem today: an episode restores from the state cache whenever its start frame happens to
+    # be covered, else from the reference. Coverage grows front-to-back, so during the uniform warm-up
+    # the early frames already start from cached (settled) states while later frames still start from
+    # the reference (kinematic, unsettled) — and that boundary keeps moving as coverage fills in. The
+    # warm-up distribution therefore drifts, and "what did the warm-up train on" has no fixed answer.
     #
-    # With this > 0 the writes are held per-env and only committed when the episode ENDS, and only if
-    # it lasted at least this many control steps. Episodes that die sooner contribute nothing. The
-    # per-frame quality gate and the "keep the higher reward" rule are unchanged — this adds a
-    # hindsight filter on top of them.
+    # With these on:
+    #   WARM-UP (uniform sampling)  reference ONLY. The cache is written but never read, so every
+    #                               episode starts from the same kind of state. This also matches
+    #                               evaluation, where the cache is empty and rollout always starts
+    #                               from the reference.
+    #   ADAPTIVE                    start from the cache. The sampled TARGET frame is restricted to
+    #                               frames that have a cached frame within `adaptive_back_seconds`
+    #                               behind them, and the episode starts at the FURTHEST cached frame
+    #                               in that window (longest available run-up).
     #
-    # COST: a (num_envs, max_episode_length, 222) fp32 staging buffer. 2048 envs x 251 frames =
-    # 442 MB; 4096 x 501 = 1.76 GB. If that is too much, lowering it does NOT shrink the buffer (the
-    # buffer must span a whole episode) — cap `episode_length_s` or reduce num_envs instead.
-    # 0 disables the deferral entirely and restores the per-step write, byte-identical to before.
-    cache_min_episode_length: int = 5
-    # [/ROLLBACK MARKER: deferred-cache] ---------------------------------------------------------
-    adaptive_alpha: float = 0.001
-    adaptive_uniform_ratio: float = 0.1
-    adaptive_back_seconds: float = 0.8       # run-up before the sampled target frame (= 50 frames @50 fps)
-    # [ROLLBACK MARKER: rand-runup] 되감기를 [이 값, adaptive_back_seconds] 사이에서 프레임마다
-    # 무작위로 뽑습니다. 0이면 기존처럼 고정(TJ와 동일한 방식)입니다. 하한은 에피소드가
-    # cache_min_episode_length를 넘길 여지를 남기기 위한 것입니다.
-    runup_rand_min_frames: int = 10
-    # [ROLLBACK MARKER: ref-start-prob] 이 확률로 캐시 히트를 무시하고 레퍼런스 자세에서 시작합니다.
-    # 캐시는 프레임당 슬롯이 하나라, 한 번 들어간 상태가 나쁘면 그 프레임이 영구히 그 상태로
-    # 고정됩니다(그 상태에서 시작 -> 또 실패 -> 더 나은 상태가 그 프레임을 지나갈 일 없음).
-    # 레퍼런스를 가끔 섞으면 비교 대상이 생겨 교체가 일어날 수 있습니다. 0이면 기존 동작입니다.
-    ref_start_prob: float = 0.01
+    # Why a gap in coverage is harmless: targets just past a gap simply drop out of the pool, while
+    # targets before it stay in — and episodes launched from those roll forward INTO the gap, filling
+    # it from the left (the adaptive phase saves every step, see cache_min_episode_length_adaptive).
+    # Once filled, the later targets reappear. The pool is self-healing, so no special handling,
+    # no forced frame-0 seed and no out-of-window search are needed.
+    reference_only_warmup: bool = True   # warm-up ignores the cache, reference-only start states
+    # [/ROLLBACK MARKER: rsi-phase-split] --------------------------------------------------------
+
+    # [ROLLBACK MARKER: backward-dir] ------------------------------------------------------------
+    # Fraction of envs that track the reference BACKWARD in time (last frame -> first). 0 disables
+    # the whole mechanism and the env is byte-identical to forward-only.
+    #
+    # Why: the state cache can only grow FORWARD from a cached start, so the frames near the very
+    # beginning of a clip are only ever entered as a start, never rolled INTO. A backward episode
+    # passes through them at the END of its own trajectory, so it fills exactly the slots the forward
+    # direction cannot. Both directions share ONE cache, stored in ORIGINAL (forward) clip time.
+    #
+    # Feasibility was measured, not assumed: sonic_playback.py --reverse drives the FROZEN SONIC
+    # prior on a time-reversed reference in closed-loop physics and tracks it as well as forward
+    # (body_err 8.9 cm both ways, robot never falls) — so the prior, which is fed a 10-frame FUTURE
+    # window, is not broken by the reversal.
+    #
+    # A single policy handles both directions, conditioned on a 0/1 phase bit appended to the
+    # observation (hence observation_space +1). RePHO trains two separate policies and has them
+    # donate states to each other through files; one conditioned policy avoids that machinery.
+    #
+    # NOT used as a mixing ratio any more. The WARM-UP is forward-only (backward has nothing to
+    # extend while every episode starts from the reference), and in the ADAPTIVE phase the (2,F)
+    # failure table decides the direction mix on its own. This value now only switches the feature
+    # on (>0) or off (0). Backward bootstraps from `adaptive_uniform_ratio`'s floor, which is spread
+    # over both rows, so it enters the adaptive phase at a few percent and grows as it accumulates
+    # failures — watch `Curriculum / backward_sampled` to confirm it actually ramps.
+    # 0 disables backward rollouts entirely: _use_backward goes False, allow[1] is never set, so
+    # every draw lands on the forward row and _adaptive_dir_frame_weights degenerates to plain
+    # forward failure-RATE frame weighting (failure_rate_normalize below). The backward direction
+    # was meant to teach release, on the theory that release-then-reverse teaches grasp — but the
+    # policy never released (the clip has no release: reference contact runs frame 31 to 500, so
+    # release exists only below frame 31, and with StartHist p50 = 218 and ~39-step episodes a
+    # backward episode almost never reaches it). Costing half the samples for a mechanism that
+    # never fired is not worth it.
+    # FIXED share of resets given to backward (see [dir-fixed-share] in the env). Not a bid that
+    # failure statistics win or lose — backward's job is to lay down cache at the frames FORWARD
+    # dies on, so the budget is chosen and the target frames come from forward's failure table.
+    # 0.0 (2026-08-05, user): FORWARD ONLY, with the existing failure-weighted frame sampling. Setting
+    # this to 0 also switches off the whole direction machinery — _use_backward = backward_ratio > 0
+    # and use_rsi and adaptive_sampling — so _canon_frame mapping and the velocity sign flip go inert
+    # and the (2,F) failure table is driven by its forward row alone. The 25%-fixed-share and
+    # opposite-row variants were both tried and neither beat forward-only.
+    backward_ratio: float = 0.25   # FIXED partition: the last 25% of envs run backward
+    # [ROLLBACK MARKER: slot-cache] ----------------------------------------------------------------
+    # K-slot state cache + contribution-driven direction split + bad-reference exclusion.
+    # Set cache_num_slots=0 / backward_contrib_ema=0 / cache_exclude_bad_reference=False to get the
+    # previous single-slot, failure-driven-direction, no-exclusion behaviour back.
+    #
+    # WHY SLOTS. Every attempt this session to make the SINGLE slot smarter narrowed the start-state
+    # distribution and stalled learning: the discounted-return score froze the run at 6k, the
+    # instantaneous-reward score at 12k, and the loosest (oldest) variant went furthest. RePHO can
+    # afford a much sharper score than any of those because it keeps K alternatives per frame, draws
+    # among them by lottery, protects a reference slot, and decays scores — we ported the sharp score
+    # WITHOUT the diversity machinery. Slots restore it structurally.
+    #   slot 0      the retarget reference. State FIXED, score LIVE (mirrors RePHO's protected slot 0,
+    #               except RePHO pins its score at 1.0 forever; ours tracks reality so it cannot go
+    #               stale as the policy improves).
+    #   slot 1..K   states the policy actually reached. Lowest-scoring slot is evicted on a write.
+    #
+    # WHY THE DIRECTION IS NOT FAILURE-DRIVEN. Sampling the direction in proportion to its failure
+    # starves whichever direction is WINNING: it survives, so it terminates rarely, so it accumulates
+    # no failure mass, so it stops being drawn. Measured on run 2026-07-31_01-47-21: backward
+    # episodes lasted 147 steps against forward's 49 while backward's share collapsed 0.44 -> 0.09,
+    # and forward — the direction that actually ships — REGRESSED (54.7 -> 48.5 over 35k steps).
+    # Backward's only route to helping forward is putting better states in the cache (time reversal
+    # is not dynamically valid, so the skill does not transfer), and that contribution is directly
+    # measurable, so it drives the split instead. A fixed schedule would also work but has to be
+    # retuned per clip; the bandit reads the same curve off the data.
+    #
+    # WHY BAD FRAMES ARE EXCLUDED PER-SLOT, NOT PER-FRAME. The warm-up measures one thing: "starting
+    # from the REFERENCE state at frame f never survived 40 steps while staying good_enough". That
+    # condemns the reference row at f, not the frame — a state the policy later reaches at f can be
+    # perfectly fine. So the exclusion zeroes slot 0's lottery weight at f and nothing else.
+    #
+    # HOW A FRAME COMES BACK. _save_state_cache clears _bad_ref[f] whenever it writes a PHYSICS state
+    # into slot 0 at f, because the warm-up's verdict was on the reference row that state just
+    # replaced. That is what makes this work at cache_num_slots=0, where slot 0 is the ONLY slot:
+    # excluded frames cannot be STARTED from, but episodes passing THROUGH f still write states there,
+    # and the frame is startable again as soon as one does. Without that clear the exclusion is
+    # permanent (_bad_frozen never unfreezes) and one warm-up failure kills the frame for the run.
+    #
+    # IT DOES APPLY TO BACKWARD. An earlier version of this note claimed otherwise; the code does not
+    # agree — the backward row of the sampling pool is `torch.flip(covered0)` and covered0 already has
+    # _bad_ref folded in, so an excluded frame is excluded in both directions.
+    # 2 (RePHO uses 3 incl. the reference). repho_length_score's rule evicts the worst LEARNED slot
+    # (intermimic.py:1870 indexes [1:]), which does not exist at 0 — and with slot 0 protected there
+    # would be nowhere to write at all.
+    cache_num_slots: int = 3                 # learned slots per frame (total K+1 including the reference)
+    # [ROLLBACK MARKER: repho-cache] ---------------------------------------------------------------
+    # Port of RePHO/InterMimic's RSI buffer, read from the released code
+    # (github.com/dingbang777/RePHO, intermimic/env/tasks/intermimic.py) rather than the paper, which
+    # simplifies it. Every field below is OFF/0 by default: each stage can be enabled alone.
+    #
+    # WHAT RePHO ACTUALLY DOES, by line:
+    #   1829-1844  A rollout writes its WHOLE trajectory only if it was long enough (>30 steps with
+    #              continuous contact, or >70 with >=70 contact steps). Otherwise it writes ONLY its
+    #              START frame, valued at end-start. Neither -> nothing.
+    #   1831-1841  A rollout that reached the clip end keeps all its frames; one that DIED drops its
+    #              last 20, so the states leading into a failure never enter the buffer.
+    #   1832/1837  The stored value is `end - t`: how much longer the episode lived AFTER frame t.
+    #              Comparisons are per-frame, so every candidate at t shares the ceiling T-t.
+    #   1870       Replace the worst LEARNED slot when  L_new > L_min AND R_new >= R_min*ratio,
+    #              or unconditionally when L_new > L_min + 10.
+    #   1892-1899  Decay: L *= (1-5e-4) on slots 1.., R *= (1-5e-2) on ALL. Two different rates, and
+    #              slot 0 is exempt from the L decay.
+    #   412        Slot 0 (the reference) is seeded at 1.0 and never replaced.
+    #   1902-1905  Switch to adaptive when sum(L>25)>3 and epoch>30; ALSO a relaxed backup at
+    #              epoch>150 with sum(L>12)>3, so a hard clip cannot stay in uniform forever.
+    #   1321-1346  Frame sampling: P(t) proportional to summed L, then PENALISED where the clip is
+    #              already being finished (x0.5 above 0.8 finish rate, x0.2 above 0.9 with <=15 steps
+    #              left). Without that penalty, sampling by L would prefer the frames that already
+    #              work — the penalty is what makes it a curriculum.
+    #
+    # DELIBERATELY NOT PORTED: the contact conditions on the length gates (our contact reward is not
+    # trustworthy — see use_contact_normal_gate), the penetration.npy pre-filter (we derive bad frames
+    # from the warm-up instead), and the hard-coded epoch constants 53250/54400/58500 (experiment-
+    # specific, three orders of magnitude off the 30/150 switch scale).
+
+    repho_switch: bool = True
+    repho_switch_min_steps: int = 500        # floor, mirrors RePHO's epoch>30
+    repho_switch_len_hi: float = 25.0        # RePHO's sum(L>25)>3
+    repho_switch_len_lo: float = 12.0        # RePHO's relaxed sum(L>12)>3
+    repho_switch_count: int = 3              # RePHO's ">3"
+    repho_switch_relax_steps: int = 2000     # after this, accept the relaxed bar
+    repho_switch_max_steps: int = 4000       # hard ceiling: leave uniform regardless
+
+    # Drop the last N staged frames of an episode that DIED, keep everything when it timed out at the
+    # clip end (RePHO 1831-1841). Aimed at the states that lead into a failure: today the whole
+    # episode is kept or dropped by cache_min_episode_length, which is far blunter.
+    repho_drop_tail_on_death: int = 20        # 20 = RePHO
+
+    # Slot 0 holds the retarget reference. RePHO seeds its score at 1.0, exempts it from decay and
+    # never replaces its state; ours is seeded at 0, which in a survival-length regime reads as
+    # "worst possible" and would be evicted immediately.
+    repho_protect_slot0: bool = True
+
+    # --- stage 2: what the cache STORES. Changes the meaning of column 0. ---
+    # Score becomes SURVIVAL LENGTH (end - t) with the discounted return kept alongside as the
+    # tiebreak, instead of the instantaneous step reward. The step reward answers "did this look good
+    # at this instant"; survival length answers "how long did the episode live after being here",
+    # which is the only question an RSI start state is ever asked.
+    # NOTE cache_score_gamma (return-as-score) was tried and reverted — it accelerated early then
+    # froze, because `new > old` is the only write condition and nothing lowered `old`. RePHO avoids
+    # that with the two decays below, so this port must keep them on.
+    repho_length_score: bool = True
+    repho_trust_completion_after: int = 50   # clip-end completions before the tail cut is skipped
+    repho_completion_min_span: int = 50      # ... and only starts this far before the end count
+
+    # ── [ROLLBACK MARKER: curriculum-window] RePHO's start-frame window + post-swap seam drill ──
+    # init_range_left = 0 disables the window entirely (every frame sampleable from step 0, which is
+    # what we ran until now). Set it > 0 to make RSI start no earlier than that frame and open up only
+    # once the policy has repeatedly run the clip from the boundary. Applied in EPISODE time, so it is
+    # symmetric across directions. The seam drill needs track_buffer on to ever fire.
+    init_range_left: int = 0
+    left_boost_after: int = 100      # boundary completions before it gets RePHO's x3 (intermimic:1336)
+    left_open_after: int = 200       # ... and before the window opens to 0 (intermimic:1787)
+    tar_min_segment: int = 30        # a swap must span this many contiguous frames to be drilled
+    repho_decay_length_frozen: float = 5e-8   # buffer decay while the seam is being drilled
+    # RePHO anneals this to 0 within ~8% of its run (ratio = max((53250-epoch)/1000, 0), epoch
+    # starts at 53001), after which the buffer is decided by survival length alone. That is safe
+    # THERE because its early termination kills an episode once required body-object contact is
+    # lost for over 10 consecutive frames (SupMat S.6 ii) — surviving long REQUIRES holding the
+    # object, so length IS quality. We have no contact-loss termination and our error bars sit
+    # 2-3.6x above the errors actually reached, so a policy that lets the object drift survives
+    # fine: length and quality are decoupled here, and the return term is the only thing tying
+    # them together. Measured with the annealing on: Cache/return_mean ended at 0.225 against
+    # 2.5-3.0 on the two runs before it, while Cache/length_mean was the HIGHEST of the three
+    # (109) — the buffer filled with long-surviving, low-reward states, restarts began from them,
+    # and Diag/clamp_frac went 0.24 -> 0.71 with per-step reward collapsing 0.40 -> 0.046.
+    # Held at 1.0 (the incumbent's return must not be beaten downward) until a contact-loss
+    # termination exists to carry the signal.
+    repho_return_ratio_start: float = 1.0
+    repho_return_ratio_steps: int = 0        # 0 = no annealing, ratio stays at _start
+    repho_replace_margin: int = 10           # m: L_new > L_min + m replaces unconditionally
+    repho_decay_length: float = 5e-4         # on slots 1.., per flush
+    repho_decay_return: float = 5e-2         # on ALL slots — 100x faster; the return ages with policy
+    # Short episodes still contribute their START frame, valued at the length they achieved (RePHO
+    # 1843). Only meaningful once the score IS survival length: with an instantaneous-reward score a
+    # short episode's start frame can carry a high value and evict a good entry while adding nothing.
+    repho_start_frame_fallback: bool = True
+    repho_full_traj_length: int = 40         # above this, write every staged frame
+
+    # --- stage 3: how frames are SAMPLED. Replaces the failure-rate hazard. ---
+    repho_length_sampling: bool = True
+    # RePHO's slot lottery subtracts 6 and clamps at 1 (intermimic.py:1381): the clamp IS the floor,
+    # so no separate uniform term is needed and slot_uniform_ratio goes unused under repho_length_score.
+    repho_slot_floor: float = 6.0
+    repho_sample_floor: float = 7.0          # subtracted before weighting (RePHO 1316)
+    repho_finish_hi: float = 0.9             # completion fraction above which weight *= 0.2 ...
+    repho_finish_lo: float = 0.8             # ... and above which weight *= 0.5
+    repho_finish_left: int = 15              # ... the 0.2 rule also needs <= this many steps left
+    repho_penalty_hi: float = 0.2
+    repho_penalty_lo: float = 0.5
+
+    # ── [ROLLBACK MARKER: cross-buffer] RePHO inter-direction update (SupMat Alg 2/3) ────────────
+    # A rollout proves two things about every frame it passes: how far it still got (self) and how
+    # far it had come (cross). The second is what the OPPOSITE direction needs, so it is staged in a
+    # per-direction cross buffer and periodically imported into the other direction's reserved slot.
+    # Inert while backward_ratio == 0: the backward cross buffer is never written, so nothing to import.
+    cross_buffer: bool = True
+    cross_interval: int = 80        # 10 RePHO epochs x our PPO rollout length 8
+    cross_margin: float = 10.0      # import only if it beats the reserved slot by this (SupMat m)
+    cross_abs_floor: float = 40.0   # ... and clears an absolute length bar (intermimic.py:1058)
+    cross_rel_ratio: float = 1.25   # ... and beats this direction's OWN best slots by this ratio
+    cross_penalty: float = 10.0     # imported score is docked: another direction's evidence is weaker
+    cross_min_episode_length: int = 60   # RePHO only vouches for the other direction from LONG rollouts
+
+    # ── [ROLLBACK MARKER: track-buffer] kinematics update (SupMat Alg 3, lines 54-73) ────────────
+    # Rewrites the TRACKING TARGET — what the reward compares against — at frames where a physically
+    # successful rollout beat the retarget reference. This is the paper's headline mechanism, and our
+    # reference has exactly the flaw it addresses (PyRoki retarget of ParaHome SMPL-X: object spawns
+    # interpenetrating, contact normals 40-54 deg off the true surface).
+    # OFF by default. It changes the reward mid-training, and its staging buffer is as large as the
+    # state staging (~900 MB at 2048 envs), so both cost and effect must be an explicit choice.
+    track_buffer: bool = False
+    track_interval: int = 800       # 100 RePHO epochs x our PPO rollout length 8
+    track_margin_self: float = 30.0   # SupMat n1: beat the worst slot of THIS direction by this
+    track_ratio: float = 1.5          # RePHO's 3/2 relative-improvement conjunct (:1111)
+    track_margin_cross: float = 60.0  # cross path margin (intermimic.py:1152)
+    track_floor_self: float = 60.0    # absolute floor, self path (:1111)
+    track_floor_cross: float = 90.0   # ... and cross path (:1152)
+    track_death_tail: int = 10        # RePHO trims a died rollout by 10 frames (:1986)
+    track_ref_contact_frac: float = 0.5
+    # NOTE: RePHO has a SECOND swap path (load_ref_traj, intermimic.py:974) which adds a
+    # global precondition — bail unless finish_rate > 0.85 over 70% of the clip, then replace
+    # only where it is < 0.55. Not ported: the three conjuncts above are the load_run_val
+    # path, and they already require the candidate to beat the buffer by margin AND ratio.   # discard unless the REFERENCE contacts over half the span
+    track_start_step: int = 19000     # RePHO keeps the swap off for ~47% of its run (:1104)
+    track_harvest_envs: int = 1       # RePHO validates with --num_envs 1, one per direction       # RePHO validates with --num_envs 1; noise-free, so a handful is enough
+    # [/ROLLBACK MARKER: repho-cache] --------------------------------------------------------------
+
     # No-pretrain regime: RSI is seeded DIRECTLY from the PyRoki retarget reference (every frame is a valid
     # start via the where_ref reset path), so the pretrain-cache warm-start is OFF. The train cache still
     # supplies better (physical) restore states for frames it covers as training fills it.
     pretrain_cache_warmstart: bool = False   # was True (pretrain→train warm-start); now reference-seeded RSI
-    #   RESET on pretrain→train transfer (loaded policy fed RAW obs → diverged), NOT the warm-start.
-    #   Fixed in train.py _load_partial_checkpoint (floored scaler transfer). Warm-start gives
-    #   reference-matching reset poses (lower initial wrist_rot). Set False for vanilla RSI (rollback).
-    # [ROLLBACK MARKER: late-gate] fraction of the clip an episode must survive, on top of finishing
-    # within 3 frames of the end, before the cache quality gate switches to the tight 'late' object
-    # bars. The two together mean "started inside the first 20% and completed the clip". > 1.0 keeps
-    # the gate off for good; 0.0 drops the length requirement and the switch reduces to "any episode
-    # reached the end", which under reference-seeded RSI fires on the first control step.
-    late_gate_survival_frac: float = 0.8
-
-    uniform_sampling_steps: int = 2000
     # RSI START-FRAME CURRICULUM (cold-start mitigation). Diverse-from-step-0 RSI onto a COLD
     # value/policy/obs-scaler (no pretrain warm-start) ignites a PPO ratio explosion (policy loss
     # → e12–e21): the cold nets face the whole clip's state range at once → huge early value errors
@@ -813,27 +1123,6 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     rsi_curriculum_steps: int = 0
     ref_dt: float = 1.0 / 30.0
 
-    # --- State-cache quality gate (mirrors grasp _save_state_cache): a frame's state is cached
-    # only while tracking is CONTINUOUSLY "good enough" since reset (self._enough_continued), so
-    # RSI restores from good states, not barely-alive ones. Thresholds are TIGHTER than the
-    # termination gates. body+fingertip are the always-present bars; object uses a frame-dependent
-    # (start-loose / early / late) phase like grasp. When has_object is False (pretrain / no-object
-    # clips) the object conditions are trivially satisfied (obj errs = 0) → gate = body+ft only.
-    # enough_* now use the SAME VALUES as grasp (user: do not loosen). Matches grasp's gate exactly:
-    # fingertip + object phase only (NO body/hand enough thresholds — grasp never gated on those).
-    enough_ft_threshold: float = 0.10          # m, mean fingertip err (= grasp enough_ft_threshold; was loosened to 0.13)
-    enough_obj_threshold: float = 0.085        # m, early-phase obj pos err (= grasp; was 0.11)
-    enough_obj_rot_threshold: float = 0.425    # rad, early-phase obj rot err (= grasp; was 0.45)
-    enough_obj_threshold_late: float = 0.05    # m, late-phase obj pos err (= grasp; was 0.07)
-    enough_obj_rot_threshold_late: float = 0.25  # rad, late-phase obj rot err (= grasp; was 0.27)
-    # Floating-base cache quality bars (analog of grasp pretrain's fixed-base wrist bars): only
-    # cache a frame if the WHOLE BODY / ROOT also track well, not just the fingertips. Needed
-    # because with has_object=False the object phase-gate is a tautology → the gate would collapse
-    # to fingertip-only, letting a drifted torso with a compensating arm poison the RSI cache.
-    # Default inf = OFF (TRAIN unchanged); the PRETRAIN cfg tightens them (obj gate is inert there).
-    cache_body_bar: float = 0.30       # < term_body_kpt_err 0.25 (~0.65×); seed body err ~0.066 passes
-    cache_root_pos_bar: float = 0.10
-    cache_root_rot_bar: float = 0.30
 
     # =========================================================================== #
     # Per-LINK contact reward (Option A / DexMachina — the single env contact map, from hand_contact.npz)
@@ -844,57 +1133,6 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # REMOVED 2026-07-22 — superseded by the per-link Option-A map (rew_contact_force + contact_force_cap
     # above; LINK_CONTACT_NAMES). Only the SPATIAL-gate tolerance remains, now reused by the per-link force
     # reward (a link's force counts only if the robot link is within this of its object-surface target).
-    # [ROLLBACK MARKER: cws-contact] 링크별 접촉 센서가 접촉점 위치도 보고하게 합니다. 접촉 렌치의
-    # 모멘트 팔에 필요합니다. 켜면 프림당 접촉 데이터 버퍼를 실제로 쓰게 되는데, 이 버퍼는 넘쳐도
-    # 잘리지 않고 장치 단언으로 죽으므로 (ft_max_contact_points가 그 상한) 환경 수를 올릴 때 한 번은
-    # 확인이 필요합니다. 접촉 렌치 보상을 안 쓰면 꺼서 비용을 아낄 수 있습니다.
-    # ── 물체 마찰 커리큘럼 [ROLLBACK MARKER: friction-curriculum] ──────────────────────
-    # 에피소드마다 물체 마찰을 [friction_min, friction_max(t)]에서 뽑습니다. friction_max(t)는
-    # friction_max_init에서 friction_min까지 friction_decay_steps 제어 스텝에 걸쳐 선형 감소하고,
-    # 그 뒤로는 friction_min 고정입니다. 쉬움→어려움: 초반엔 잘 안 미끄러지니 대충 쥐어도 잡히고,
-    # 점차 실제 마찰로 조입니다. friction_min은 물체 USD에 구워진 값(DEFAULT_FRICTION=1.0)과
-    # 같게 두어, 감쇠가 끝나면 커리큘럼이 없던 것과 동일한 조건이 됩니다.
-    # False로 두면 물체 마찰은 USD의 구워진 값 그대로입니다.
-    # ── 역방향 롤아웃 [ROLLBACK MARKER: backward-dir] ──────────────────────────────────
-    # 이 비율만큼의 환경을 시간 역방향으로 굴립니다. 0.0이면 모든 관련 코드가 항등이 되어 기존
-    # 동작과 완전히 같습니다. 목적은 정방향이 통과하지 못하는 병목 프레임의 캐시를 채우는 것.
-    backward_ratio: float = 0.00
-    # 역방향이 쓴 상태가 정방향 항목을 밀어내려면 보상이 이 비율만큼 더 높아야 합니다. 점수 척도는
-    # 같지만(둘 다 그 프레임 레퍼런스와의 일치도) 정방향 항목에는 "정방향 동역학으로 실제 도달했다"
-    # 는 보증이 붙는 반면 역방향에는 없습니다. 보상 크기가 1.1~1.5 수준이라 2%는 절대값 0.02~0.03
-    # 으로, 프레임 간 흔들림보다는 크고 "쥐었다/아니다"의 차이(0.1 단위)보다는 훨씬 작습니다.
-    # `Curriculum / cache_bwd_frac`로 확인하세요 — 0에 붙으면 너무 빡빡, 1로 오르면 너무 느슨,
-    # 0.1~0.3이면 의도대로 병목 구간만 채우는 중입니다.
-    backward_replace_margin: float = 0.02
-    friction_curriculum: bool = True
-    friction_min: float = 1.0          # 하한이자 최종 고정값 (물체 USD의 기본 마찰과 동일)
-    friction_max_init: float = 3.0     # 초기 상한
-    friction_decay_steps: int = 30000  # 이 제어 스텝 동안 상한이 friction_min까지 내려옴
-    track_contact_points: bool = True
-
-    # ── [ROLLBACK MARKER: cws-contact] 접촉 렌치 보상 (CHORD, arXiv 2607.00033) ────────────────
-    # "force"  기존 힘 기반만  |  "cws"  접촉 렌치만  |  "both"  둘 다 (기본)
-    # 렌치 점수는 접촉의 배치만 보고 세기는 안 봅니다(마찰 원뿔의 대표 방향이 크기 1인 힘이라).
-    # 그래서 힘 보상을 없애면 "실제로 눌러라"를 가르치는 항이 사라집니다. 논문도 접촉 보상을 다른
-    # 보상들과 더하기로 붙이므로 병행이 기본입니다.
-    contact_reward_mode: str = "force"
-    # 접촉 그룹 총량을 기존 힘 보상과 같은 0.7로 맞춥니다. 나머지 보상(com_support -0.5,
-    # latent_reg -0.1 등)이 그 크기를 기준으로 튜닝돼 있어서, 배점을 0.35로 두면 접촉만 절반이
-    # 됩니다. "both"로 되돌릴 때는 0.35로 낮추고 rew_contact_force도 0.35로 내려야 총량이 유지됩니다.
-    rew_cws: float = 0.25
-    cws_beta: float = 0.2        # 여유 범위. 로봇이 사람의 (1-beta)~(1+beta)배 안이면 만점.
-    # 레퍼런스 자세 실측(덮은 방향 비율 평균): 여유 0.2에서 칼 66% 냄비 71% 그릇 74% 팬 40%,
-    # 0.3에서 75/80/82/47%. 0은 쓰면 안 됩니다 — 접촉점이 정확해지면서 오히려 값이 떨어졌습니다.
-    cws_v: float = 0.25           # 벌점 세기. Episode_Reward/contact_cws가 0.3~0.7에 오도록 맞춥니다.
-    cws_n_dir: int = 512         # 비교 방향 개수 (논문 부록 D)
-    cws_n_edge: int = 16         # 마찰 원뿔의 대표 방향 개수. 논문에 값이 없어 우리가 정합니다.
-    # 회전 시 값이 달라지는 오차(중앙/최대): 4개 5.1%/42%, 8개 1.1%/10.2%, 16개 0.3%/2.5%.
-    cws_link_chunk: int = 4      # 링크를 몇 개씩 나눠 계산할지. 0이면 한 번에(환경 2048에서 2 GB 초과).
-    cws_mu: float = 1.0          # 마찰계수. 물체 USD의 재질값(DEFAULT_FRICTION)과 맞춰야 합니다.
-    cws_seed: int = 0            # 비교 방향을 뽑는 시드. 사람/로봇이 같은 방향을 써야 하므로 고정.
-    cws_force_thresh: float = 1.0  # N, 접촉으로 칠 최소 법선 힘
-    # ── [/ROLLBACK MARKER: cws-contact] ──────────────────────────────────────────────────────
-
     contact_match_dist: float = 0.03          # m, robot-link ↔ contact-target tolerance for the force gate
     ft_max_contact_points: int = 64           # per-link contact-data buffer cap. DERIVED bound, not a guess:
     #   PhysX reduces a convex-vs-convex manifold to ≤4 points, and parahome_convert_obj_to_usd.py caps the
@@ -940,7 +1178,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # reference. No offset window — the correction is bounded by joint limits (anti-windup via the delta
     # clamp) and kept small by the delta clamp. Falls back to free-running delta if the
     # retarget joints are absent (guarded). Re-pretrain when toggling (action semantics change).
-    residual_action: bool = False   # BYPASSED in SONIC mode (governs only the non-SONIC fallback path).
+    residual_action: bool = True   # BYPASSED in SONIC mode (governs only the non-SONIC fallback path).
     # PER-STEP residual: target = clamp(ref_joints[frame] + residual_scale·a, limits), scaled PER GROUP.
     # Body (legs+waist+arms) gets a tighter residual (closer reference tracking); hands get a wider one
     # (grasp adaptation needs more finger authority than the reference provides).
@@ -964,22 +1202,42 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     use_sonic: bool = True
     sonic_config_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_release/config.yaml"
     sonic_ckpt_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_release/last.pt"
-    # [ROLLBACK MARKER: sonic-encoder-g1] SONIC에 무엇을 명령으로 줄지.
-    #   "smpl" : 사람 SMPL 관절 위치 + 손목 관절 6개 (기존 동작)
-    #   "g1"   : 로봇 자신의 29개 관절 각도 + 속도 (사람->로봇 변환 단계가 없음)
-    # 리타게팅(_ref_joints)이 없는 클립에서는 자동으로 smpl로 되돌아갑니다.
-    # 실측(SONIC 단독, residual 0, 오른손 손목 회전 오차 rad):
-    #                     smpl    g1
-    #   전체 p50          0.490  0.337
-    #   나이 3~10         0.504  0.299
-    #   나이 25~60        1.080  0.439   <- smpl은 시간이 갈수록 62도까지 벌어짐(옆면이 물체를 향함)
-    # 레퍼런스 고정 시 바닥값이 0.229이므로 SONIC이 만드는 순수 오차는 0.261 -> 0.108로 60% 감소.
-    # 에피소드도 훨씬 오래 삽니다(나이 60+ 표본 173 -> 7740).
-    sonic_encoder: str = "g1"
-    residual_scale_latent: float = 0.10   # λ on z_res (GRAIL pre-quantization latent residual scale)
+    # [ROLLBACK MARKER: lambda-vs-fsq-bin] λ on z_res (GRAIL pre-quantization latent residual scale).
+    # 0.10 -> 0.03. The SONIC quantizer is FSQ with 32 levels, whose bin width near the operating
+    # point is 0.0645 in latent units (verified against the installed vector_quantize_pytorch.FSQ:
+    # the env's _fsq_level helper matches it exactly). At λ=0.10 the policy's own exploration noise
+    # was λ·σ = 0.10 × 0.673 = 0.067 = 1.04 BINS, i.e. larger than one quantization step, so the
+    # decoder's input was re-drawn every control step and the residual's MEAN could not decide which
+    # bin was hit. Measured in sim: 47 of 64 latent dims changed level per step (Jerk / fsq_flip_run
+    # ≈ 0.74), and the commanded body target moved 0.28 rad/step — 8x the reference motion's mean
+    # per-step change and 1.6x its clip-wide MAXIMUM. `Error / body_kpts` was flat across 10k steps
+    # on two separate runs: the body was being driven by quantization noise, not by the reference.
+    # At λ=0.03 the jitter is 0.31 bins (below one step, so the mean decides the bin) and the reach
+    # at the ±5 action clip is 2.32 bins.
+    # WHY λ AND NOT σ: KL is computed in ACTION space, so λ (an env-side scaling) leaves it
+    # untouched, while shrinking σ inflates KL by 1/σ². That matters here because KLAdaptiveLR is
+    # ALREADY saturated — measured LR 1.26e-05 against a configured 3.0e-04 (4%), with kl_fp64
+    # ≈ 0.022 sitting permanently above kl_threshold 0.016. Lowering σ would throttle it further,
+    # and the LR is shared with the hand action, which is the part that is currently learning.
+    # WHY NOT AN EMA ON z_res: PPO would score the sampled z_res while the env applied the smoothed
+    # one, the accumulator would be hidden state absent from the obs, it adds ~5 steps of lag, and it
+    # needs a reset-time seed — the same class of fabrication that caused the reset-transient bug.
+    # TESTED AND REVERTED to 0.10. λ=0.03 did exactly what the analysis predicted mechanically —
+    # fsq_flip_run 0.744 -> 0.356 and the commanded per-step body motion 0.284 -> 0.146 rad, i.e.
+    # below the reference clip's own MAXIMUM — but the task got much worse, not better:
+    #   reward @10k   22.5 -> 5.6      episode_len @10k   68.4 -> 35.2
+    #   Error / body_kpts   0.132 -> 0.132  (UNCHANGED)
+    # Two conclusions. (1) The jitter was NOT what kept body tracking flat; that hypothesis is dead.
+    # (2) In a QUANTIZED latent the bin crossings ARE the exploration — the decoder output is
+    # literally constant within a bin — so halving the crossing rate halved the body's exploration
+    # and the reward fell with it. The twitching and the exploration are the same mechanism, which
+    # is why scaling λ trades one for the other and cannot fix both.
+    # If revisiting: λ=0.05 (jitter 0.52 bins, reach 3.87) is the untested middle, but the reward
+    # cost is likely to scale the same way. The lever that separates the two would have to make the
+    # residual's MEAN move the bin while the per-step noise does not — σ, not λ.
+    residual_scale_latent: float = 0.10
     control_fps: float = 50.0            # resample reference 30 fps → this; MUST match parahome_smpl_for_sonic TGT_FPS
     sonic_smpl_file: str = "sonic_smpl_50fps.npz"   # SONIC SMPL encoder arrays (sibling of the retarget npz)
-
 
 
     # =========================================================================== #
@@ -989,6 +1247,15 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # =========================================================================== #
     dataset_root: str = str(_DATA_DIR / "processed" / "parahome")   # absolute (package data dir)
     smplx_subdir: str = "smplx"            # keypoint/object reference tree (produced by parahome.py)
+    # [ROLLBACK MARKER: retarget-joint-order] ----------------------------------------------------
+    # Match the retargeted joint columns to the env's action joints BY NAME instead of trusting that
+    # the two orders line up positionally. They did not: g1_shadow_joint_order.json is a static dump
+    # of the robot's PhysX DOF order, G1_shadow.usd was rebuilt a day after that dump, and 24 of the
+    # 65 slots ended up crossed — all hands (MF<->TH, FF<->RF at J1/J2/J3, both sides), so the middle
+    # finger was driven by the thumb's near-zero joint and stuck out straight in every rollout while
+    # legs/waist/arms stayed correct. False restores the raw positional read (pre-fix baseline).
+    remap_ref_joint_order: bool = True
+    # [/ROLLBACK MARKER: retarget-joint-order] ---------------------------------------------------
     retarget_subdir: str = "g1_shadow"     # per-frame G1 joint refs (produced by retargeting; optional)
     retarget_file: str = "trajectory_pyroki.npz"  # retarget npz filename under the tree (PyRoki output; g1_joint_pos/g1_root_pose)
     clip_class: str = "single_rigid"       # single_rigid | single_articulated | ...

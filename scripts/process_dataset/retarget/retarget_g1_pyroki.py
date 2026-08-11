@@ -191,10 +191,191 @@ def _flat_heightmap(jp, bins=48, margin=0.6):
     return pk.collision.Heightmap.from_trimesh(box, x_bins=bins, y_bins=bins)
 
 
-def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_para, a_link, gw, lw,
+# [SCENE-COLLISION] ---------------------------------------------------------------------------
+def _context_boxes(sm, obj_key, jp_cloud, radius=1.0, support_radius=1.5,
+                   reach=float(os.environ.get("W_SCENEREACH", 0.2)),
+                   max_boxes=int(os.environ.get("W_SCENEMAXBOX", 64))):
+    """Boxes approximating the fixed scene the env spawns, for the world_collision cost.
+
+    The floor heightmap above was the ONLY thing the retarget collided against, so the counter, sink
+    and board simply were not in the problem. The solve happily put the LEFT hand inside the
+    countertop, and the sim then threw it out at up to 5.47 m/s (470 of 501 frames) — every bit of
+    that impulse lands on the robot, because the context spawns kinematic.
+
+    Geometry choice, measured on s101_seg12_knife (78 robot capsules x 301 frames):
+
+        one OBB per object     max penetration 36.6 cm, 21493 pairs — mostly the OBB's own slack
+                               (the sink mesh fills 31% of its OBB), and it traps the LEGS
+        per-hull OBBs          max  6.0 cm,  1813 pairs, and the deepest links are the LEFT HAND —
+                               which is the defect we are actually chasing
+        heightmap              max 117 cm, deepest links the ANKLES: a height field is solid all the
+                               way down, so a robot standing at a counter reads as buried in it
+
+    So: convex-decompose, then take each hull's OBB. pyroki has no hull primitive, but Capsule-Box
+    is native and `capsule_box` uses a real box SDF (inside, the depth is to the NEAREST FACE), which
+    is what keeps a pelvis grazing the counter edge at ~4 cm instead of the ~80 cm a height field
+    would report.
+
+    Hull count is NOT controllable here: trimesh delegates to `pyVHACD.compute_vhacd`, which takes no
+    keyword arguments, so the decomposition runs at its own default (~64 hulls on the sink). The
+    simulator converts with `max_convex_hulls=16`, so the two differ — the retarget sees a somewhat
+    tighter scene than PhysX does. Taking the OBB of each hull inflates it back, which pushes the
+    other way; the net is verified by measurement, not assumed. Aligning them properly means
+    re-converting the context USDs at a matching hull count.
+
+    Selection mirrors the env (proximity of the frame-0 centroid to the active object's swept path
+    + the below-object support), so both see the same scene.
+    """
+    act = sm[obj_key].astype(onp.float64)
+    act_xy, act0 = act[:, :2], act[0]
+    cands = []
+    for k in (kk for kk in sm.files if kk.startswith("ctx__") and kk.endswith("__base")):
+        pose0 = sm[k][0].astype(onp.float64)
+        dmin = float(onp.linalg.norm(act_xy - pose0[None, :2], axis=1).min())
+        cands.append((k.split("__")[1], pose0, dmin))
+    keep = {n for n, _, dm in cands if dm < radius}
+    below = [(float(onp.linalg.norm(act0[:2] - q[:2])), n) for n, q, _ in cands
+             if q[2] < act0[2] and float(onp.linalg.norm(act0[:2] - q[:2])) < support_radius]
+    if below:
+        keep.add(min(below)[1])
+
+    centres, extents = [], []
+    for name, q, _ in cands:
+        if name not in keep:
+            continue
+        src = _RAW_SCAN / name / "simplified" / "base.obj"
+        if not src.exists():
+            print(f"[pyroki-retarget] scene: no scan mesh for {name}, skipped")
+            continue
+        mesh = trimesh.load(str(src), process=False, force="mesh")
+        rot = trimesh.transformations.quaternion_matrix([q[3], q[4], q[5], q[6]])[:3, :3]
+        mesh.vertices = mesh.vertices @ rot.T + q[:3]
+        parts = mesh.convex_decomposition()                       # pyVHACD; takes no kwargs
+        parts = parts if isinstance(parts, list) else [parts]
+        if len(parts) <= 1:
+            # A single hull means the object collapsed to its own bounding volume, which for a
+            # counter is 3x its real volume and would trap the robot's legs. Loud on purpose: the
+            # earlier silent fallback to one OBB per object is what made the first run a no-op.
+            print(f"[pyroki-retarget] scene: WARNING {name} decomposed to {len(parts)} hull — its OBB "
+                  f"will be far larger than the object")
+        for prt in parts:
+            v = onp.asarray(prt.vertices)
+            lo, hi = v.min(0), v.max(0)
+            if (hi - lo).min() < 1e-4:                            # degenerate sliver
+                continue
+            centres.append((lo + hi) / 2.0)
+            extents.append(hi - lo)
+    if not centres:
+        return None
+    centres, extents = onp.asarray(centres), onp.asarray(extents)
+    # Prune to what the body can plausibly reach. This is not an optimisation nicety: the residual is
+    # (frames x capsules x boxes) and jaxls differentiates through all of it, so the unpruned 576
+    # boxes asked for 40 GB against a 27 GB device and the solve died. Distance is measured from the
+    # HUMAN body-keypoint cloud (the robot tracks it) to each box's surface, so a box is kept only if
+    # some body point passes within `reach` of it. At 0.3 m this keeps 179 of 576 — the cutting board
+    # and counter the hands work on — and drops the fridge/microwave the robot never approaches.
+    # The budget is tight because jaxls differentiates the whole (frames x capsules x boxes)
+    # block: 576 boxes needed 40 GB, 180 needed 21.6 GB, against a 32 GB device. 64 boxes at
+    # 0.2 m is the cutting board + countertop, which is exactly where the left hand sinks in;
+    # the legs that a larger set would also constrain were measured to be FALSE positives of
+    # the OBB slack, and grounding is already owned by the floor heightmap.
+    kp = jp_cloud.reshape(-1, 3)
+    gap = onp.abs(kp[:, None, :] - centres[None, :, :]) - extents[None, :, :] / 2.0
+    d = onp.linalg.norm(onp.clip(gap, 0.0, None), axis=-1).min(0)         # (K,) surface distance
+    m = d < reach
+    if m.sum() > max_boxes:                                              # keep the closest
+        m = onp.zeros_like(m); m[onp.argsort(d)[:max_boxes]] = True
+    centres, extents = centres[m], extents[m]
+    print(f"[pyroki-retarget] scene collision: {len(centres)} boxes (of {len(d)}) from {sorted(keep)} "
+          f"(kept within {reach} m of the body keypoints)")
+    return pk.collision.Box.from_extent(
+        extent=jnp.array(extents, jnp.float32),
+        position=jnp.array(centres, jnp.float32),
+        wxyz=jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0], jnp.float32), (len(centres), 1)))
+# [/SCENE-COLLISION] --------------------------------------------------------------------------
+
+
+# [OBJECT-COLLISION] ---------------------------------------------------------------------------
+def _object_boxes(obj_name, max_boxes=int(os.environ.get("W_OBJCOLLMAXBOX", 64))):
+    """Boxes approximating the MANIPULATED object, expressed in the OBJECT'S OWN frame.
+
+    The manipulated object was never in the retarget problem — only the floor (and optionally the
+    context furniture). Nothing stopped the solve from putting a finger INSIDE the knife, and it did:
+    measured on the reference poses of s101_seg12_knife, `robot0_r_ffmiddle` sits inside the knife
+    mesh in 60.9% of frames at 4.8 mm mean depth (every other right-hand link is under 1%). The sim
+    then has to resolve that overlap at episode start, which is the "hand stuck in the object" the
+    training runs show.
+
+    Local frame, not world: unlike the context furniture this object MOVES every frame, so the boxes
+    are built once here in the object's own frame and transformed per frame inside the cost, where
+    the frame index is already the vmapped axis.
+
+    Same geometry recipe as `_context_boxes` (convex-decompose, then take each hull's box) for the
+    same reason — one box per object is far larger than the object, and pyroki has no hull primitive.
+    The knife decomposes to 64 hulls of 8.5 mm median thickness, so the per-hull boxes stay thin
+    enough that a fingertip can rest ON the blade without the box claiming it is inside.
+    """
+    src = _RAW_SCAN / obj_name / "simplified" / "base.obj"
+    if not src.exists():
+        print(f"[pyroki-retarget] object collision: no scan mesh for {obj_name}, term disabled")
+        return None
+    mesh = trimesh.load(str(src), process=False, force="mesh")
+    parts = mesh.convex_decomposition()                       # pyVHACD; takes no kwargs
+    parts = parts if isinstance(parts, list) else [parts]
+    centres, extents, vols = [], [], []
+    for prt in parts:
+        v = onp.asarray(prt.vertices)
+        lo, hi = v.min(0), v.max(0)
+        if (hi - lo).min() < 1e-4:                            # degenerate sliver
+            continue
+        centres.append((lo + hi) / 2.0)
+        extents.append(hi - lo)
+        vols.append(float(onp.prod(hi - lo)))
+    if not centres:
+        return None
+    centres, extents, vols = onp.asarray(centres), onp.asarray(extents), onp.asarray(vols)
+    if len(centres) > max_boxes:                              # keep the bulkiest hulls
+        k = onp.argsort(-vols)[:max_boxes]
+        centres, extents = centres[k], extents[k]
+    inflate = float(extents.prod(1).sum() / max(sum(p.volume for p in parts), 1e-9))
+    print(f"[pyroki-retarget] object collision: {len(centres)} boxes for '{obj_name}' "
+          f"(hulls {len(parts)}, box volume {inflate:.1f}x the hulls')")
+    return onp.asarray(centres, onp.float32), onp.asarray(extents, onp.float32)
+# [/OBJECT-COLLISION] --------------------------------------------------------------------------
+
+
+def _give_hands_collision_geometry(urdf):
+    """Copy each hand link's VISUAL mesh into its (empty) collision slot, in place.
+
+    Without this the object-collision term below is aimed at nothing. The Shadow hand links in this
+    URDF carry no <collision> element at all, so pyroki fits them a ZERO-radius capsule — measured:
+    every `robot0_*` finger link has radius 0.0 mm, and the whole hand is represented by a single
+    65.2 mm-radius capsule on the palm (whose real thickness is 34 mm). Constraining that stand-in
+    made penetration WORSE, not better: it pushed the oversized palm ball clear of the knife and
+    drove the index finger — which the problem could not see — 4.6 mm -> 6.0 mm deeper.
+
+    The palm's own two boxes are left alone; its capsule is a poor fit either way (a capsule around
+    a flat palm is inflated no matter what it is fitted to), and the fingers are what penetrate.
+    """
+    n = 0
+    for name, link in urdf.link_map.items():
+        if not name.startswith("robot0_") or link.collisions or not link.visuals:
+            continue
+        for v in link.visuals:
+            if v.geometry is None or v.geometry.mesh is None:
+                continue
+            link.collisions.append(yourdfpy.Collision(name=f"{name}_coll", origin=v.origin,
+                                                      geometry=v.geometry))
+            n += 1
+    print(f"[pyroki-retarget] hand collision: filled {n} empty collision slots from the visual meshes")
+    return urdf
+
+
+def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, b_mask, a_para, a_link, gw, lw,
           l_contact, r_contact, l_foot_kp, r_foot_kp, left_foot_idx, right_foot_idx,
           left_knee_idx, right_knee_idx, root_R_target, root_z_target, ft_idx, ft_off, ft_margin, ft_target,
           ft_mask, rest_w, weights,
+          obj_boxes_local=None, obj_pose=None, obj_capsule_idx=None,
           s2_joints=None, s2_root=None, s2_offset=None, s2_lower_mask=None, s2_w=0.0):
     # STAGE 2 (s2_w>0): freeze the LOWER body (s2_lower_mask=1 joints) + root + offset at the stage-1
     # solution (s2_joints/s2_root/s2_offset) and warm-start from it, so only the UPPER body (waist+arms+
@@ -321,8 +502,47 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
         # Low weight: high enough to lift the robot up off the floor, low enough not to fight retargeting.
         transform = jaxlie.SE3.from_translation(vv[v_off]) @ vv[v_root]
         coll = robot_coll.at_config(robot, vv[v_cfg]).transform(transform)
-        return colldist_from_sdf(collide(coll, heightmap), activation_dist=0.005).flatten() \
-            * weights["world_collision"]
+        res = [colldist_from_sdf(collide(coll, heightmap), activation_dist=0.005).flatten()]
+        # [SCENE-COLLISION] the context objects the env spawns kinematic. Without this term they are
+        # absent from the problem entirely, and the solve puts the left hand inside the countertop.
+        # coll is (T,B) capsules, scene_boxes is (K,) — broadcast to (T,B,K) via a trailing axis.
+        if scene_boxes is not None:
+            d = collide(coll.reshape(coll.get_batch_axes() + (1,)), scene_boxes)
+            res.append(colldist_from_sdf(d, activation_dist=0.005).flatten()
+                       * weights["scene_collision"])
+        return jnp.concatenate(res) * weights["world_collision"]
+
+    # [OBJECT-COLLISION] the object the hand is grasping. `o_pose` is (7,) per frame (wxyz + xyz), so
+    # the boxes are rebuilt in world coordinates inside the vmapped frame axis.
+    if obj_boxes_local is not None:
+        _oc_ctr = jnp.asarray(obj_boxes_local[0])                      # (K,3) object frame
+        _oc_ext = jnp.asarray(obj_boxes_local[1])                      # (K,3)
+        _oc_idx = jnp.asarray(obj_capsule_idx)                         # capsules we constrain
+        _oc_tol = weights["object_collision_tol"]
+
+    @jaxls.Cost.factory
+    def object_collision(vv, v_root: jaxls.SE3Var, v_cfg, v_off: OffsetVar, o_pose):
+        transform = jaxlie.SE3.from_translation(vv[v_off]) @ vv[v_root]
+        coll = robot_coll.at_config(robot, vv[v_cfg]).transform(transform)
+        # Only the hand capsules are constrained. The residual is (capsules x boxes) per frame and
+        # jaxls differentiates all of it (the scene term needed 21.6 GB at 78 capsules x 180 boxes);
+        # nothing but a hand is ever inside a hand-held object, so the rest is memory for no term.
+        coll = jax.tree.map(lambda x: x[_oc_idx] if getattr(x, "ndim", 0) >= 1
+                            and x.shape[0] == robot_coll.num_links else x, coll)
+        o_wxyz, o_xyz = o_pose[:4], o_pose[4:]
+        R = jaxlie.SO3(o_wxyz).as_matrix()                             # object frame -> world
+        boxes = pk.collision.Box.from_extent(
+            extent=_oc_ext, position=_oc_ctr @ R.T + o_xyz,
+            wxyz=jnp.broadcast_to(o_wxyz, (_oc_ctr.shape[0], 4)))
+        d = collide(coll.reshape(coll.get_batch_axes() + (1,)), boxes)
+        # One-sided: `colldist_from_sdf(., 0)` is min(d, 0), so a link that merely TOUCHES the object
+        # costs exactly nothing and only overlap is charged. That is what lets this term carry a big
+        # weight — the scene-collision term had to stay at 1.0 because its 5 mm activation margin
+        # pushed on hands that were correctly resting on the surface, and it lost to the keypoint
+        # costs anyway. `tol` is the overlap we are willing to leave (the sim resolves that much
+        # itself through its contact offset).
+        return colldist_from_sdf(d + _oc_tol, activation_dist=0.0).flatten() * weights["object_collision"]
+    # [/OBJECT-COLLISION]
 
     costs = [
         local_align(var_root, var_joints, var_scale, keypoints),
@@ -355,6 +575,8 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     # faithful-tracking baseline (no grounding). To disable grounding entirely: W_WORLDCOLL=0.0.
     if weights["world_collision"] > 0:
         costs.append(world_collision(var_root, var_joints, var_offset))
+    if obj_boxes_local is not None and weights["object_collision"] > 0:
+        costs.append(object_collision(var_root, var_joints, var_offset, jnp.asarray(obj_pose)))
 
     init_vals = None
     if s2_w > 0.0:
@@ -395,6 +617,10 @@ def main():
 
     urdf = yourdfpy.URDF.load(str(_URDF))
     robot = pk.Robot.from_urdf(urdf)
+    # [OBJECT-COLLISION] the hand needs real collision shapes before anything can be kept out of the
+    # object; only pay for them when a term actually uses them.
+    if float(os.environ.get("W_OBJCOLL", 0.0)) > 0:
+        _give_hands_collision_geometry(urdf)
     robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
     sm = onp.load(_PROC / "smplx" / args.cls / args.clip / "0" / "trajectory.npz", allow_pickle=True)
@@ -496,7 +722,20 @@ def main():
                    offset_reg=_w("W_OFFSETREG", 0.0), offset_xy=_w("W_OFFSETXY", 1000.0),
                    contact=_w("W_CONTACT", 2.0), contact_margin=_w("W_CONTACTMARGIN", 0.005),
                    knee_separation=_w("W_KNEESEP", 5.0), knee_min=_w("W_KNEEMIN", 0.14),
-                   root_height=_w("W_ROOTHEIGHT", 0.0), joint_smoothness=_w("W_SMOOTH", 1.0))
+                   root_height=_w("W_ROOTHEIGHT", 0.0), joint_smoothness=_w("W_SMOOTH", 1.0),
+                   # [SCENE-COLLISION] OFF by default. Tried on s101_seg12_knife: the term is added and the solve
+                   # converges, but it does not move the result — penetration against its OWN box set went
+                   # 1813 -> 1963 pairs (6.03 -> 6.38 cm), and in sim the left hand got WORSE (5.47 -> 6.66
+                   # m/s). It is outweighed by the keypoint-tracking costs, which target human hand
+                   # positions that sit ON the surface, so matching them necessarily buries the thicker
+                   # robot hand. Raising the weight or changing the box set does not address that.
+                   # W_SCENECOLL=1 re-enables it; see _context_boxes for the geometry study.
+                   scene_collision=_w("W_SCENECOLL", 0.0),
+                   # [OBJECT-COLLISION] OFF by default until measured; W_OBJCOLL=50 to enable. The
+                   # weight can be large because the residual is one-sided (0 unless links overlap
+                   # the object), so at the pose we want the term contributes nothing at all.
+                   object_collision=_w("W_OBJCOLL", 0.0),
+                   object_collision_tol=_w("W_OBJCOLLTOL", 0.002))
 
     # per-axis, per-body-part global weights (n_corr,3): body order = pelvis(0) torso(1) arms(2-7)
     # legs(8-13) hands(14+). Default = uniform full tracking; the low-weight decoupling is opt-in via env.
@@ -521,15 +760,43 @@ def main():
     leg_ratio = _w("W_LEGRATIO", 0.86)
     root_z_tgt = (jp[:, 0, 2] * leg_ratio).astype(onp.float32)     # (F,) pelvis keypoint z × ratio
     heightmap = _flat_heightmap(jp)          # flat z=0 floor spanning the clip
+    scene_boxes = (_context_boxes(sm, bk[0], jp[:, :23, :]) if weights["scene_collision"] > 0 else None)
+
+    # [OBJECT-COLLISION] keep the hands out of the object they are grasping. The stored object pose is
+    # [xyz, wxyz]; the solve uses jaxlie's wxyz-then-xyz order everywhere else, so reorder here.
+    obj_boxes_local, obj_pose, obj_caps = None, None, None
+    if weights["object_collision"] > 0 and obj_name:
+        obj_boxes_local = _object_boxes(obj_name)
+        if obj_boxes_local is not None:
+            op = sm[bk[0]].astype(onp.float32)                      # (F,7) xyz + wxyz
+            obj_pose = onp.concatenate([op[:, 3:7], op[:, :3]], axis=1)
+            g2l = onp.asarray(robot_coll._geom_to_link_idx)
+            lnames = list(robot_coll.link_names)
+            # The palm is EXCLUDED by default. Its capsule has a 65.2 mm radius against a real palm
+            # thickness of 34 mm, so keeping that ball out of the knife shoves the whole hand away —
+            # and the palm barely penetrates to begin with (measured 6.3% of frames at 1.8 mm, versus
+            # 89% at 4.7 mm for the index finger). Constraining the well-fitted finger capsules and
+            # leaving the palm out buys the penetration fix at a far smaller tracking cost.
+            # W_OBJCOLLSKIP="" constrains every hand link including the palm.
+            skip = os.environ.get("W_OBJCOLLSKIP", "palm")
+            skip_parts = [s for s in skip.split(",") if s]
+            obj_caps = onp.asarray([i for i, g in enumerate(g2l)
+                                    if lnames[g].startswith("robot0_")
+                                    and not any(s in lnames[g] for s in skip_parts)], onp.int32)
+            print(f"[pyroki-retarget] object collision: {len(obj_caps)} hand capsules "
+                  f"x {len(obj_boxes_local[0])} boxes x {len(obj_pose)} frames, "
+                  f"weight {weights['object_collision']}, tolerance "
+                  f"{weights['object_collision_tol'] * 1000:.0f} mm")
 
     t0 = time.time()
-    Ts_root, joints = solve(robot, robot_coll, heightmap, jnp.array(jp), b_para, b_link, b_mask, a_para,
+    Ts_root, joints = solve(robot, robot_coll, heightmap, scene_boxes, jnp.array(jp), b_para, b_link, b_mask, a_para,
                             a_link, jnp.array(gw), jnp.array(lw), jnp.array(l_c), jnp.array(r_c),
                             jnp.array(l_kp), jnp.array(r_kp), left_foot_idx, right_foot_idx,
                             left_knee_idx, right_knee_idx,
                             jnp.array(root_R_target), jnp.array(root_z_tgt), jnp.array(ft_idx), jnp.array(ft_off),
                             jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
-                            jnp.array(rest_w), weights)
+                            jnp.array(rest_w), weights,
+                            obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps)
     joints = onp.array(joints); root = onp.array(Ts_root.wxyz_xyz)
     print(f"[pyroki-retarget] stage-1 solved in {time.time()-t0:.1f}s")
 
@@ -548,13 +815,14 @@ def main():
         gw2[14:] = _w("W_STAGE2HAND", 5.0)                      # hands STRONG (pull arms up to keypoints)
         s2_off = onp.zeros((F, 3), onp.float32)                 # stage-1 root already baked → pin offset→0
         t1 = time.time()
-        Ts_root, joints2 = solve(robot, robot_coll, heightmap, jnp.array(jp), b_para, b_link, b_mask, a_para,
+        Ts_root, joints2 = solve(robot, robot_coll, heightmap, scene_boxes, jnp.array(jp), b_para, b_link, b_mask, a_para,
                                  a_link, jnp.array(gw2), jnp.array(lw), jnp.array(l_c), jnp.array(r_c),
                                  jnp.array(l_kp), jnp.array(r_kp), left_foot_idx, right_foot_idx,
                                  left_knee_idx, right_knee_idx,
                                  jnp.array(root_R_target), jnp.array(root_z_tgt), jnp.array(ft_idx),
                                  jnp.array(ft_off), jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
                                  jnp.array(rest_w), weights,
+                                 obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps,
                                  s2_joints=jnp.array(joints), s2_root=jnp.array(root),
                                  s2_offset=jnp.array(s2_off), s2_lower_mask=jnp.array(lower_mask), s2_w=w_stage2)
         joints = onp.array(joints2); root = onp.array(Ts_root.wxyz_xyz)
@@ -595,8 +863,14 @@ def main():
 
     out = _PROC / "g1_shadow" / args.cls / args.clip / "0" / f"trajectory_pyroki{os.environ.get('W_OUTSUFFIX','')}.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Record the column layout with the data. g1_joint_pos is written in `act` order, and the env
+    # reads column k into its OWN k-th action joint — an agreement nothing enforced, since `act`
+    # comes from a static json dump of the robot's PhysX DOF order. Rebuilding G1_shadow.usd
+    # repermutes the env side and silently crosses the columns (it did: 24 of 65, all hands, the
+    # middle finger driven by the thumb). With the names alongside, the env matches by name.
     onp.savez(out, g1_joint_pos=g1_joint_pos.astype(onp.float32),
-              g1_root_pose=g1_root_pose.astype(onp.float32))
+              g1_root_pose=g1_root_pose.astype(onp.float32),
+              joint_names=onp.array(act, dtype=object))
     print(f"[pyroki-retarget] wrote {out}  ({nmap}/{len(act)} action joints solved)")
 
 

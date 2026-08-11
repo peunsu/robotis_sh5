@@ -233,11 +233,18 @@ def act(actor, actor_obs: torch.Tensor, tokenizer: torch.Tensor) -> torch.Tensor
 # GRAIL Eq.6: a_body = G(z + lambda*dz), residual added to the encoder latent BEFORE FSQ.
 # Used by the SonicResidual env: policy outputs z_res (64); env does encode -> +lambda*z_res -> FSQ -> decode.
 @torch.no_grad()
-def encode_latent(actor, tokenizer: torch.Tensor) -> torch.Tensor:
-    """(E,TOK) -> PRE-quantization smpl latent (E, max_num_tokens, token_dim) = (E,2,32)."""
+def encode_latent(actor, tokenizer: torch.Tensor, encoder: str = "smpl") -> torch.Tensor:
+    """(E,TOK) -> PRE-quantization latent (E, max_num_tokens, token_dim) = (E,2,32).
+
+    `encoder` selects which of the checkpoint's tokenizer encoders reads the observation. The name is
+    passed explicitly here rather than inferred from the tokenizer's `encoder_index` one-hot, because
+    m.encode() takes the name directly — so a caller that flips encoder_index but leaves this at the
+    default would silently keep using the old encoder while APPEARING to have switched. Callers must
+    set both, consistently ('g1' -> [1,0,0], 'smpl' -> [0,0,1]; column order = m.encoders).
+    """
     m = actor.actor_module
     parsed = m.parse_tokenizer_obs({"tokenizer": tokenizer.unsqueeze(1)})   # terms (E,1,*dims)
-    latent = m.encode("smpl", parsed, encoder_mask=None, no_quantization=True)  # (E,1,2,32) or (E,2,32)
+    latent = m.encode(encoder, parsed, encoder_mask=None, no_quantization=True)  # (E,1,2,32) or (E,2,32)
     return latent
 
 

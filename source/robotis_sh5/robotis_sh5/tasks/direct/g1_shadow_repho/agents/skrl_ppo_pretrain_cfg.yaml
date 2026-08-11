@@ -1,8 +1,8 @@
 seed: 42
 
 
-# Standard Gaussian PPO (no mass-as-action model — that was grasp-specific).
-# Starting point for the 65-DOF / ~620-D full-body loco-manip policy; tune.
+# Kinematic-only pretrain for the G1+Shadow loco-manip policy. Same model shapes as the train
+# yaml (621 obs / 65 act) so pretrain.pt transfers by shape; shorter horizon (no physics object).
 models:
   separate: True
   policy:
@@ -10,18 +10,8 @@ models:
     clip_actions: False
     clip_log_std: True
     min_log_std: -20.0
-    max_log_std: 0.75 # 0.75
-    # -0.5 -> -1.0 (sigma 0.607 -> 0.368). With lambda back at 0.10 the per-step latent jitter is
-    # 0.10*0.368 = 0.037 = 0.57 FSQ bins (was 1.04), predicted flip ~0.55 (was 0.74).
-    # Unlike lambda, sigma shrinks the NOISE while leaving the residual's mean reach at the full
-    # 7.75 bins — the lambda=0.03 test showed that cutting reach is what destroyed the reward.
-    # Applies to all 100 action dims (one scalar), so hand exploration starts smaller too; and a
-    # smaller sigma raises KL by 1/sigma^2, which KLAdaptiveLR may answer by cutting the LR further
-    # (already at 1.26e-05 vs the configured 3.0e-04). Watch Learning/Learning rate and the reward
-    # curve against the lambda=0.10/-0.5 baseline (reward 22.2 and ep_len 67.9 at 8-10k).
-    initial_log_std: -1.0  # -0.5 tried again in run 2026-08-03_01-09 (with contact 0.7): sigma 0.61
-    #   drove the FSQ latent across ~1.04 bins/step, episode length fell to 60.8 and the run
-    #   finished at 24.49. -1.0 (sigma 0.368) is the setting the best run used.
+    max_log_std: 0.75
+    initial_log_std: -1.514  # σ≈0.22
     network:
       - name: net
         input: OBSERVATIONS
@@ -53,7 +43,6 @@ agent:
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.016
-    # min_lr: 1.0e-04
   observation_preprocessor: RunningStandardScaler
   observation_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
@@ -63,19 +52,21 @@ agent:
   grad_norm_clip: 1.0
   ratio_clip: 0.2
   value_clip: 0.2                      # >0 enables predicted-value clipping (replaces clip_predicted_values)
-  entropy_loss_scale: 0.000 # 0.004
+  entropy_loss_scale: 0.004
   value_loss_scale: 2.0
   kl_threshold: 0.0
   rewards_shaper_scale: 0.1
+  # See skrl_ppo_cfg.yaml — episodes end by sequence-end time-out (truncated slot); False would let
+  # the next episode's value/advantage bleed across the boundary instead of bootstrapping.
   time_limit_bootstrap: True
   experiment:
-    directory: "g1_shadow_sonic_residual"
+    directory: "g1_shadow_repho_pretrain"
     experiment_name: "default"
     write_interval: 10
     checkpoint_interval: 2000
-    wandb: True
+    wandb: False
 
 trainer:
   class: SequentialTrainer
-  timesteps: 50000   # longer for full-body loco-manip
+  timesteps: 30000   # kinematic pretrain — shorter than the train phase
   environment_info: log

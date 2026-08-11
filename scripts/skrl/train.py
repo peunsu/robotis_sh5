@@ -1298,6 +1298,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # End of custom callback for logging success rate
     #####################
 
+    # [ROLLBACK MARKER: track-harvest] deterministic actions for the tracking-harvest envs.
+    # RePHO harvests the replacement kinematics from a SEPARATE `--test --num_envs 1` process, i.e. a
+    # single rollout with NO exploration noise (scripts/train_dual_forward_val.sh). Noise matters here
+    # more than anywhere else: a trajectory that only survived because the noise happened to fall well
+    # is not one the policy can reproduce, and it would become the thing the reward is measured
+    # against. We cannot spawn a second Isaac Lab process cheaply, but we can take the distribution
+    # MEAN for the handful of envs that are allowed to promote.
+    # The log_prob is recomputed for the action actually taken, so the PPO ratio stays consistent;
+    # what remains is that those envs are behaviourally off-policy. With track_harvest_envs at 2 of
+    # 2048 that is ~0.1% of the batch.
+    _harv = getattr(env.unwrapped, "_harvest", None)
+    if _harv is not None and bool(_harv.any()):
+        _agent_act = agent.act
+
+        def _act_deterministic_for_harvest(states, timestep, timesteps):
+            actions, outputs = _agent_act(states, timestep, timesteps)
+            mean = outputs.get("mean_actions") if isinstance(outputs, dict) else None
+            if mean is not None:
+                actions = torch.where(_harv.unsqueeze(-1), mean, actions)
+                dist = agent.policy.distribution(role="policy")
+                if dist is not None:
+                    lp = dist.log_prob(actions).sum(dim=-1, keepdim=True)
+                    outputs["log_prob"] = torch.where(_harv.unsqueeze(-1), lp, outputs["log_prob"])
+                    agent._current_log_prob = outputs["log_prob"]
+            return actions, outputs
+
+        agent.act = _act_deterministic_for_harvest
+        print(f"[track-harvest] deterministic actions for {int(_harv.sum())}/{env.unwrapped.num_envs} "
+              f"envs (tracking-target harvest)")
+
     # run training
     runner.run()
 

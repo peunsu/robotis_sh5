@@ -405,6 +405,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if episode_done.all():
             break
 
+    # ── Per-frame error traces ────────────────────────────────────────────────
+    # The buffers above already hold every step; only their means reach metrics.csv. Dumping the
+    # full traces answers WHEN a rollout diverges, which the per-episode aggregate cannot: an
+    # episode that never grasps and one that grasps then drops the object have similar means.
+    os.makedirs(args_cli.output_dir, exist_ok=True)
+    _L = max(len(b) for b in obj_pos_bufs)
+    def _pad(bufs):
+        import numpy as _np
+        out = _np.full((len(bufs), _L), _np.nan, dtype=_np.float32)
+        for _i, _b in enumerate(bufs):
+            out[_i, :len(_b)] = _b
+        return out
+    import numpy as _np
+    _np.savez(os.path.join(args_cli.output_dir, "per_frame.npz"),
+              obj_pos=_pad(obj_pos_bufs), obj_rot=_pad(obj_rot_bufs),
+              kpts=_pad(kpts_bufs), ft=_pad(ft_bufs))
+    print(f"[rollout] per-frame traces -> per_frame.npz  ({len(obj_pos_bufs)} x {_L})")
+
     # ── Write metrics.csv ─────────────────────────────────────────────────────
     os.makedirs(args_cli.output_dir, exist_ok=True)
     csv_path = os.path.join(args_cli.output_dir, args_cli.metrics_name)

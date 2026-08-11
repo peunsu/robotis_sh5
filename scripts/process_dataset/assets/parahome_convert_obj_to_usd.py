@@ -61,9 +61,14 @@ def parse_args():
 
 
 def _mesh_to_usd(obj_path: Path, usd_path: Path, mass: float, friction: float,
-                 collider: str = "decomposition"):
+                 collider: str = "decomposition", max_hulls: int = 16, kinematic: bool = False):
     """Convert one .obj -> rigid-body USD with a collider + physics material.
-    collider: 'decomposition' (concave-safe) | 'hull' | 'none' (visual/static)."""
+    collider: 'decomposition' (concave-safe) | 'trimesh' (exact, KINEMATIC/static only)
+              | 'hull' | 'none' (visual/static).
+
+    'trimesh' authors the collider as the triangle mesh itself, with no approximation at all. PhysX
+    only accepts it on a static or kinematic actor, so it must be paired with kinematic=True.
+    """
     import isaaclab.sim as sim_utils
     from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
     from isaaclab.sim.schemas import schemas_cfg
@@ -84,8 +89,21 @@ def _mesh_to_usd(obj_path: Path, usd_path: Path, mass: float, friction: float,
         # guess. 16 hulls still preserves handle voids / rims for graspability (2-4 would bridge
         # them). For tighter VRAM use max_convex_hulls=8 with ft_max_contact_points=32.
         # NB: the collider is baked at cook time — re-run with --overwrite after changing this.
+        # `max_hulls` defaults to the 16 the reasoning above derives, and MUST stay 16 for anything
+        # a fingertip ContactSensor filters on (the manipulated Object). CONTEXT USDs are exempt: the
+        # env spawns them at /World/envs/env_*/Ctx_<i>_<name>, and the sensor filter matches the
+        # literal leaf "Object", so a context collider never reaches that buffer. Raising hulls there
+        # is free of the overflow risk and buys real accuracy — a convex hull always CONTAINS the
+        # mesh, so a coarse decomposition inflates the object and reports penetration that is not
+        # there: measured on s101_seg12_knife, the left hand read 6.0 cm deep against 64-hull OBBs
+        # but only 3.2 cm against the true scan surface.
         mesh_collision = schemas_cfg.ConvexDecompositionPropertiesCfg(
-            max_convex_hulls=16, hull_vertex_limit=64)
+            max_convex_hulls=int(max_hulls), hull_vertex_limit=64)
+    elif collider == "trimesh":
+        # No approximation: the collider IS the scan triangles. Only legal on a static or kinematic
+        # actor, so pair it with kinematic=True. UNUSED — see CONTEXT_COLLIDER for the measurement
+        # that ruled it out (16 hulls already match the true surface; this only costs throughput).
+        mesh_collision = schemas_cfg.TriangleMeshPropertiesCfg()
     elif collider == "hull":
         mesh_collision = schemas_cfg.ConvexHullPropertiesCfg()
     else:
@@ -100,7 +118,8 @@ def _mesh_to_usd(obj_path: Path, usd_path: Path, mass: float, friction: float,
             solver_position_iteration_count=8,
             solver_velocity_iteration_count=1,
             max_depenetration_velocity=1.0,
-            disable_gravity=False,
+            disable_gravity=kinematic,
+            kinematic_enabled=kinematic,
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         mesh_collision_props=mesh_collision,
@@ -139,6 +158,29 @@ def convert_rigid(obj: str, overwrite: bool):
     _mesh_to_usd(src, out, mass=DEFAULT_MASS, friction=DEFAULT_FRICTION, collider="decomposition")
 
 
+# Context colliders only; see _mesh_to_usd. Held at the SAME 16 as the manipulated object and the
+# articulated parts, so every collider in the scene is cooked at one hull budget. 64 was legal here
+# (a context prim is never named "Object", so it cannot reach the fingertip ContactSensor buffer that
+# forces 16 elsewhere) and it did buy accuracy, since a convex hull always CONTAINS the mesh and a
+# coarse decomposition inflates the support. Uniformity was chosen over that: the spawn-declear solve
+# measures penetration against these colliders, so a support cooked at a different budget than the
+# object makes the correction answer a different geometry than the one the policy touches.
+CONTEXT_MAX_HULLS = 16
+# "decomposition", NOT "trimesh" — 16 hulls were MEASURED to be enough, so the exact collider buys
+# nothing. The worry was that a convex approximation fills concave voids and leaves the hand stuck
+# inside a phantom solid, which is real for a kitchen sink: with the retargeted reference poses of
+# s101_seg12_knife, the hand sits inside the sink collider by
+#     1 hull  107.1 mm mean (96.7% of frames)   <- the void IS filled at this extreme
+#     8 hulls  10.4 mm
+#    16 hulls   6.4 mm (72.4%)                  <- what we cook
+#    64 hulls   6.5 mm                          <- indistinguishable from the true surface
+# so at 16 the basin is already hollow and the remaining 6.4 mm is the REFERENCE POSE penetrating
+# the sink, which no collider setting can fix. Cooking the contexts as exact triangle meshes instead
+# cost 26% of training throughput (3,584 -> 2,664 env-steps/s at 512 envs) plus a 64 MB -> 512 MB
+# gpu_collision_stack_size (PhysX drops contacts below that), for no measurable benefit.
+CONTEXT_COLLIDER = "decomposition"
+
+
 def convert_context(obj: str, overwrite: bool):
     """STATIC-collision context USD: base.obj -> <obj>/<obj>_ctx.usd, convex-decomposition collider.
     Uniform for rigid AND articulated objects — for articulated furniture (gasstove/sink/...) this
@@ -148,12 +190,21 @@ def convert_context(obj: str, overwrite: bool):
     src = _SCAN / obj / "simplified" / "base.obj"
     if not src.exists():
         print(f"[skip] {obj}: no base.obj"); return
-    out = _ASSET_OUT / obj / f"{obj}_ctx.usd"
+    # Own subdirectory, NOT alongside <obj>.usd. MeshConverter writes the geometry to
+    # <usd_dir>/Props/instanceable_meshes.usd and references it, so a context USD cooked next to the
+    # rigid one SHARES that file — and the collider lives in it. While both were cooked at the same
+    # 16 hulls the shared file was identical and the coupling was invisible; the moment the context
+    # switched to a triangle mesh it overwrote the manipulated object's collider too, and PhysX
+    # demoted the (dynamic) object to a convex hull: "triangle mesh collision cannot be a part of a
+    # dynamic body, falling back to convexHull". That silently erases the knife's handle void and
+    # serrations, which is exactly the geometry a grasp depends on.
+    out = _ASSET_OUT / obj / "ctx" / f"{obj}_ctx.usd"
     if out.exists() and not overwrite:
         print(f"[skip] {obj}: {out.name} exists"); return
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"[context] {obj} -> {out.relative_to(_ASSET_OUT)}")
-    _mesh_to_usd(src, out, mass=DEFAULT_MASS, friction=DEFAULT_FRICTION, collider="decomposition")
+    _mesh_to_usd(src, out, mass=DEFAULT_MASS, friction=DEFAULT_FRICTION, collider=CONTEXT_COLLIDER,
+                 max_hulls=CONTEXT_MAX_HULLS, kinematic=True)
 
 
 def convert_articulated(obj: str, spec: dict, overwrite: bool):

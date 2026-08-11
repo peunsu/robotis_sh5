@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# train_sequences_sonic_residual.sh — ParaHome pipeline for the SONIC-RESIDUAL
+# train_sequences_repho.sh — ParaHome pipeline for the RePHO
 # variant of the G1 + bimanual Shadow-hand whole-body loco-manipulation task.
 #
 # This variant drives the 29 G1 BODY DOF with a FROZEN SONIC decoder (the policy
 # emits a 64-D latent residual z_res, pre-quantization, GRAIL Eq.6) plus a 36-D
 # ABSOLUTE bimanual hand action. Task:
-#   Robotis-G1-Shadow-Locomanip-SonicResidual-Direct-v0
+#   Robotis-G1-Shadow-Locomanip-Repho-Direct-v0
 #
 # NO-PRETRAIN regime: train runs FROM SCRATCH (no --checkpoint). RSI is seeded
 # DIRECTLY from the PyRoki retarget reference — every frame is a valid episode
@@ -29,7 +29,7 @@
 #   5. Train (object spawned when its converted USD exists; RSI seeded from the retarget reference) → agent.pt.
 #
 # Checkpoints/metrics tree (evaluate.bash-compatible; clip_name at path parts[1]):
-#   data/processed/parahome/g1_shadow_sonic_residual/<clip_class>/<clip_name>/0/
+#   data/processed/parahome/g1_shadow_repho/<clip_class>/<clip_name>/0/
 #
 # ONE-TIME PREREQ (not per-clip): the composite PyRoki URDF must exist —
 #   source/robotis_sh5/data/robots/G1/urdf_pyroki/g1_shadow.urdf
@@ -42,7 +42,7 @@
 set -euo pipefail
 
 # ── User configuration ────────────────────────────────────────────────────────
-TASK="Robotis-G1-Shadow-Locomanip-SonicResidual-Direct-v0"
+TASK="Robotis-G1-Shadow-Locomanip-Repho-Direct-v0"
 CLIP_CLASS="${CLIP_CLASS:-single_rigid}"
 NUM_ENVS="${NUM_ENVS:-2048}"
 TIMESTEPS="${TIMESTEPS:-41000}"
@@ -60,37 +60,18 @@ VIDEO_INTERVAL="${VIDEO_INTERVAL:-2000}"
 # Defaults: single_rigid clips with converted rigid object USDs. Only clips that ALSO have a PyRoki
 # retarget (or SKIP_RETARGET builds one) and a SONIC smpl npz will train well. Override the whole list
 # from the env with CLIPS_OVERRIDE="clipA clipB".
-# Four objects x three clips. Every one was picked by measurement, not by eye, from the 328
-# single_rigid clips whose name ends in knife/pan/pot/bowl:
-#   standing the whole clip  - pelvis stays >0.85 m above the lower foot (sitting reads ~0.5 m).
-#                              ParaHome's own skeleton, NOT SMPL-X order: joint 0 = pelvis,
-#                              18 and 22 = the feet, floor at z=0.
-#   actually grasped         - some SMPL-X fingertip pad comes within 2 cm of the object SURFACE.
-#                              Distance to the object CENTRE is the wrong test: it rejects a pot
-#                              held correctly by its handle just for being a big object.
-#   manipulated, not nudged  - the object travels >0.10 m.
-#   standing in place        - the pelvis travels <0.5 m (no walking across the room).
-#   trainable length         - 120-320 frames at 30 fps (4-11 s).
-#   one subject per object   - the three clips of each object come from three different people,
-#                              so a per-object result is not one person's habit.
-# The first clip of each object is the one that was already here; the other two are new.
 CLIPS=(
     "s100_seg00_pan"
     "s101_seg12_knife"
     "s101_seg29_pot"
     "s101_seg30_bowl"
-    "s66_seg26_pan"
-    "s55_seg31_knife"
-    "s73_seg31_pot"
-    "s33_seg18_bowl"
-    "s127_seg29_pan"
-    "s53_seg19_knife"
-    "s152_seg21_pot"
-    "s71_seg27_bowl"
     # "s100_seg02_kettle"
     # "s100_seg03_cup"
+    # "s101_seg30_bowl"
+    # "s101_seg29_pot"
     # "s101_seg18_potlid"
-    # "s101_seg23_salt"      # ← uncomment / add more clips here
+    # "s103_seg09_knife"     # ← uncomment / add more clips here
+    # "s101_seg23_salt"
 )
 # Optional: replace the whole list from the environment (space-separated).
 [[ -n "${CLIPS_OVERRIDE:-}" ]] && read -ra CLIPS <<< "${CLIPS_OVERRIDE}"
@@ -99,8 +80,8 @@ CLIPS=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/parahome"
-CHECKPOINT_BASE="${DATA_BASE}/g1_shadow_sonic_residual/${CLIP_CLASS}"
-LOG_BASE="${PROJECT_DIR}/logs/skrl/g1_shadow_sonic_residual"
+CHECKPOINT_BASE="${DATA_BASE}/g1_shadow_repho/${CLIP_CLASS}"
+LOG_BASE="${PROJECT_DIR}/logs/skrl/g1_shadow_repho"
 URDF="${PROJECT_DIR}/source/robotis_sh5/data/robots/G1/urdf_pyroki/g1_shadow.urdf"
 FORCE="${FORCE:-0}"
 
@@ -129,7 +110,7 @@ for clip in "${CLIPS[@]}"; do
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "[sonic ${IDX}/${TOTAL}] class=${CLIP_CLASS}  clip=${clip}"
+    echo "[repho ${IDX}/${TOTAL}] class=${CLIP_CLASS}  clip=${clip}"
     echo "  train=${TIMESTEPS} steps (${NUM_ENVS} envs)  from scratch (no pretrain; reference-seeded RSI)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 

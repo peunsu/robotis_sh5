@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # =============================================================================
-# evaluate_sequences_sonic_residual.sh — Roll out each trained SONIC-residual
+# evaluate_sequences_repho.sh — Roll out each trained SONIC-residual
 # ParaHome G1+Shadow loco-manip clip and aggregate metrics.
 #
 # Mirrors evaluate_sequences.sh but targets the SONIC-residual task
-# (Robotis-G1-Shadow-Locomanip-SonicResidual-Direct-v0) and the tree written by
-# train_sequences_sonic_residual.sh. rollout.py never arms the RSI warm-start, so
+# (Robotis-G1-Shadow-Locomanip-Repho-Direct-v0) and the tree written by
+# train_sequences_repho.sh. rollout.py never arms the RSI warm-start, so
 # evaluation runs the policy with vanilla frame-0 resets (same protocol as the
 # other variants). The frozen SONIC base + the per-clip sonic_smpl_50fps.npz /
 # trajectory_pyroki.npz produced during training are consumed by the env at load;
 # no extra prep here (evaluation is env_isaaclab only — no PyRoki needed).
 #
 # For each clip:
-#   1. Load agent.pt from the g1_shadow_sonic_residual tree.
+#   1. Load agent.pt from the g1_shadow_repho tree.
 #   2. rollout.py → metrics.csv (obj pos/rot + whole-body kpt + fingertip errors).
 #   3. After all clips, evaluate.bash aggregates per-method CSVs.
 #
 # Output tree (evaluate.bash compatible — clip_name lands at path parts[1]):
-#   data/processed/parahome/g1_shadow_sonic_residual/<clip_class>/<clip_name>/0/
+#   data/processed/parahome/g1_shadow_repho/<clip_class>/<clip_name>/0/
 #       agent.pt / pretrain.pt
 #       evaluation_ep_le_<TIMESTEPS>/metrics.csv
-# Aggregates → data/processed/parahome/g1_shadow_sonic_residual_method{1,2,3}.csv
+# Aggregates → data/processed/parahome/g1_shadow_repho_method{1,2,3}.csv
 #
 # Which clips run: edit CLIPS=(...) (comment lines to filter) or CLIPS_OVERRIDE="a b c".
-# Keep in sync with train_sequences_sonic_residual.sh.
+# Keep in sync with train_sequences_repho.sh.
 # Env vars: FORCE=1 (re-run rollouts), CLIP_CLASS=..., CLIPS_OVERRIDE="a b c",
 #   N_ROLLOUTS, TIMESTEPS (dir tag only), VIDEO=1, PY=<env_isaaclab python>,
 #   SEED=42, TWO_CAM=1, SBS=1, VIDEO_RESOLUTION=WxH.
@@ -50,7 +50,7 @@
 set -euo pipefail
 
 # ── User configuration ────────────────────────────────────────────────────────
-TASK="Robotis-G1-Shadow-Locomanip-SonicResidual-Direct-v0"
+TASK="Robotis-G1-Shadow-Locomanip-Repho-Direct-v0"
 CLIP_CLASS="${CLIP_CLASS:-single_rigid}"
 N_ROLLOUTS="${N_ROLLOUTS:-32}"
 TIMESTEPS="${TIMESTEPS:-60000}"   # directory-naming tag only (evaluation_ep_le_<TIMESTEPS>)
@@ -66,24 +66,18 @@ OLD_METRICS="metrics_camold.csv"   # pass-2 CSV = determinism receipt (invisible
 RES_ARGS=(); [[ -n "${VIDEO_RESOLUTION:-}" ]] && RES_ARGS=(--video_resolution "${VIDEO_RESOLUTION}")
 
 # Clip names to evaluate. Comment out lines to filter (like the hocap scripts). Keep this list in
-# sync with train_sequences_sonic_residual.sh. Or override with CLIPS_OVERRIDE="clipA clipB".
-# Must match train_sequences_sonic_residual.sh — see the selection criteria documented there.
+# sync with train_sequences_repho.sh. Or override with CLIPS_OVERRIDE="clipA clipB".
 CLIPS=(
     "s100_seg00_pan"
     "s101_seg12_knife"
     "s101_seg29_pot"
     "s101_seg30_bowl"
-    "s66_seg26_pan"
-    "s55_seg31_knife"
-    "s73_seg31_pot"
-    "s33_seg18_bowl"
-    "s127_seg29_pan"
-    "s53_seg19_knife"
-    "s152_seg21_pot"
-    "s71_seg27_bowl"
     # "s100_seg02_kettle"
     # "s100_seg03_cup"
+    # "s101_seg30_bowl"
+    # "s101_seg29_pot"
     # "s101_seg18_potlid"
+    # "s103_seg09_knife"
     # "s101_seg23_salt"
 )
 # Optional: replace the whole list from the environment (space-separated).
@@ -93,7 +87,7 @@ CLIPS=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/parahome"
-CHECKPOINT_BASE="${DATA_BASE}/g1_shadow_sonic_residual/${CLIP_CLASS}"
+CHECKPOINT_BASE="${DATA_BASE}/g1_shadow_repho/${CLIP_CLASS}"
 FORCE="${FORCE:-0}"
 
 # ── Rollout loop ──────────────────────────────────────────────────────────────
@@ -111,7 +105,7 @@ for clip in "${CLIPS[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [[ ! -f "${CKPT_FILE}" ]]; then
-        echo "[eval-sonic] ERROR: checkpoint not found — run train_sequences_sonic_residual.sh first.  ${CKPT_FILE}"
+        echo "[eval-sonic] ERROR: checkpoint not found — run train_sequences_repho.sh first.  ${CKPT_FILE}"
         continue
     fi
     # Skip the SIMULATION but still let the compose step run on existing mp4s, so a side-by-side can
@@ -174,5 +168,5 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "[eval-sonic] Aggregating metrics under ${DATA_BASE} ..."
 bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
-echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_sonic_residual_method{1,2,3}.csv"
+echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_repho_method{1,2,3}.csv"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
