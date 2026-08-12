@@ -1,3 +1,16 @@
+"""[LEGACY BASELINE — NOT CALLED BY ANYTHING]
+
+Frozen copy of the retargeting script as it was before the 2026-08-12 fixes, kept only so the
+old numbers can be reproduced for comparison. The live script is `retarget_g1_pyroki.py`;
+its docstring lists what changed and what each change was measured to do.
+
+Known defects preserved here on purpose:
+  - hand correspondence off by one joint (degenerate ffknuckle/ffproximal pair)
+  - grasp contact cost active in stage 1, distorting the grounding solve
+  - no wrist orientation target
+Writes the SAME output path as the live script, so always run it with W_OUTSUFFIX set.
+"""
+
 """G1 + bimanual Shadow retargeting with PyRoki (Phase 2: body + hands, contact-aware).
 
 Whole-trajectory batched least-squares (jaxls) retargeting of ParaHome SMPL-X body+hand
@@ -9,33 +22,8 @@ EXACT 65 action joints (29 body + 36 Shadow) + collision meshes, so the solve ou
 our action order and self-collision / (Phase-2b) object-contact work.
 
 Costs: local alignment (relative joint-vector + angle, learned per-joint scale) + global alignment
-over 46 body+hand correspondences · floor contact · foot skating · self-collision · smoothness ·
-rest (coupled J0 held ~0) · joint limits · object-contact grasp (STAGE 2 only) · wrist orientation.
-
-Four changes were made after the first working version, each kept behind a marked block and each
-validated by measurement on s101_seg12_knife. The version they replaced is preserved verbatim as
-`retarget_g1_pyroki_v1_baseline.py` (nothing calls it; it exists to reproduce the old numbers).
-
-  [V2: hand-correspondence]  The hand pairing was off by one joint. Shadow's abduction and flexion
-        axes meet at a point, so ffknuckle and ffproximal are always COINCIDENT — pairing the human
-        MCP and PIP to them demanded two targets 36.7 mm apart at one point, and everything below
-        shifted a joint. Dropping the degenerate link and re-pairing took the human/robot bone-length
-        ratio from 0.00-2.62 (sd 0.796) to 1.06-1.46 (sd 0.113), reproducible across 4 clips.
-  [V2: contact-stage2-only]  The grasp cost now runs only in stage 2. Stage 1's job is grounding, and
-        pulling the hand toward the object distorted it for a hand pose stage 2 discards anyway:
-        foot skating p90 went 1.4 -> 0.8 mm/frame, hand metrics unchanged or better.
-  [V2: wrist-orient]  A wrist ORIENTATION target, which did not exist before (the retarget npz has no
-        palm quaternion, so wrist direction was a by-product of the other terms). Built from hand
-        keypoints on BOTH the human and robot side, so it needs no shared convention. Palm-direction
-        error 12.9 -> 1.7 deg (right hand). Folded into contact_grasp rather than added as its own
-        cost: a separate cost re-differentiates forward kinematics for the whole clip and cost +5.3 GB
-        of host RAM for 3 residuals per hand.
-  [V2: hand-local-scale]  Hand local alignment + a shared hand scale matrix. Measured HARMFUL and
-        left OFF by default (W_HANDLOCAL=0) — see the weight's comment for the numbers.
-
-NOTE the left-hand mirror bug fixed in export_g1_shadow_urdf.py is NOT in this file: the URDF's left
-hand had lost its mirrored joint axes, so left fingers curled the wrong way. Both this script and the
-baseline read the repaired URDF, so both benefit.
+over 54 body+hand correspondences · floor contact · foot skating · self-collision · smoothness ·
+rest (coupled J0 held ~0) · joint limits.  [object-contact grasp cost = Phase 2b]
 
 Runs in env_pyroki (numpy>=2 + jax + pyroki), NOT env_isaaclab:
     /home/peunsu/anaconda3/envs/env_pyroki/bin/python scripts/process_dataset/retarget/retarget_g1_pyroki.py \
@@ -79,29 +67,12 @@ _BODY = [
     (19, "left_hip_pitch_link"), (20, "left_knee_link"), (21, "left_ankle_roll_link"),
 ]
 # hands: HAND_CHAIN (ParaHome hand-local idx → Shadow body); left block +23, right +48
-# [V2: hand-correspondence] 손 대응표. v1에서 관절 하나만큼 밀려 있던 것을 바로잡았습니다.
-#
-# Shadow 손은 벌림축과 굽힘축이 한 점에서 만납니다 — URDF의 FFJ2(ffknuckle -> ffproximal) origin이
-# (0,0,0)이라 두 링크가 항상 같은 자리에 있고 회전만 다릅니다. v1은 거기에 사람의 MCP와 PIP를 각각
-# 짝지었는데, 36.7 mm 떨어진 두 목표를 같은 점에 요구하는 것이라 전역 정렬이 중간에 설 수밖에
-# 없었습니다 — 손가락마다 노드 2개가 약 18 mm 오차를 구조적으로 안고 갔고(양손 16/40 노드),
-# 그 아래 마디도 전부 한 칸씩 밀렸습니다.
-#
-# 퇴화한 *proximal을 빼고 사람 인덱스를 한 칸 당기면 마디 길이 비가 이렇게 바뀝니다
-# (오른손, s101_seg12_knife, 사람 대비 로봇):
-#     v1  1.15 / 0.00 / 2.26 / 1.40    범위 0.00~2.62,  표준편차 0.796
-#     v2  1.15 / 1.23 / 1.25           범위 1.06~1.46,  표준편차 0.113
-# 4개 클립 x 양손에서 동일하게 재현됩니다. 즉 v1의 "손가락마다 크기 비가 제각각"은 실제 체형
-# 차이가 아니라 어긋난 대응이 만든 허상이었고, 바로잡으면 거의 균일한 1.2배 확대입니다.
-#
-# 사람 손끝(TIP: 21/17/13/9)은 대응에서 빠집니다 — 로봇에는 대응하는 링크 원점이 없고, 손끝은
-# _FT_PADS + _FT_OFF_R 로 접촉 비용에서 따로 다룹니다.
 _HAND_CHAIN = {
     "wrist":  ([0], ["palm"]),
-    "index":  ([18, 19, 20], ["ffknuckle", "ffmiddle", "ffdistal"]),
-    "middle": ([14, 15, 16], ["mfknuckle", "mfmiddle", "mfdistal"]),
-    "ring":   ([10, 11, 12], ["rfknuckle", "rfmiddle", "rfdistal"]),
-    "pinky":  ([6, 7, 8], ["lfknuckle", "lfmiddle", "lfdistal"]),
+    "index":  ([18, 19, 20, 21], ["ffknuckle", "ffproximal", "ffmiddle", "ffdistal"]),
+    "middle": ([14, 15, 16, 17], ["mfknuckle", "mfproximal", "mfmiddle", "mfdistal"]),
+    "ring":   ([10, 11, 12, 13], ["rfknuckle", "rfproximal", "rfmiddle", "rfdistal"]),
+    "pinky":  ([6, 7, 8, 9], ["lfknuckle", "lfproximal", "lfmiddle", "lfdistal"]),
     "thumb":  ([22, 23, 24], ["thproximal", "thmiddle", "thdistal"]),
 }
 
@@ -413,30 +384,11 @@ def _give_hands_collision_geometry(urdf):
     return urdf
 
 
-def _hand_sets(robot):
-    """[V2: hand-local-scale] 손 하나짜리 국소 정렬에 쓸 대응 집합. side -> (사람 인덱스, 로봇 링크 인덱스).
-
-    몸통과 같은 방식(쌍별 상대 벡터 + 방향)을 손 체인에도 적용하기 위한 것입니다. v1에서 손은
-    전역 정렬(절대 위치)만 받았는데, 로봇 손이 사람 손보다 약 1.2배 크므로 절대 위치를 맞추려면
-    손가락이 안쪽으로 눌립니다 — 크기 차이를 흡수할 통로가 없었습니다. pyroki 11번 손 예제는
-    바로 이 스케일 행렬로 그 차이를 흡수합니다.
-    """
-    out = {}
-    for side, off in (("l", 23), ("r", 48)):
-        hp, hl = [], []
-        for local, shadow in _HAND_CHAIN.values():
-            for pl, sh in zip(local, shadow):
-                hp.append(off + pl)
-                hl.append(robot.links.names.index(f"robot0_{side}_{sh}"))
-        out[side] = (hp, hl)
-    return out
-
-
 def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, b_mask, a_para, a_link, gw, lw,
           l_contact, r_contact, l_foot_kp, r_foot_kp, left_foot_idx, right_foot_idx,
           left_knee_idx, right_knee_idx, root_R_target, root_z_target, ft_idx, ft_off, ft_margin, ft_target,
           ft_mask, rest_w, weights,
-          obj_boxes_local=None, obj_pose=None, obj_capsule_idx=None, h_sets=None,
+          obj_boxes_local=None, obj_pose=None, obj_capsule_idx=None,
           s2_joints=None, s2_root=None, s2_offset=None, s2_lower_mask=None, s2_w=0.0):
     # STAGE 2 (s2_w>0): freeze the LOWER body (s2_lower_mask=1 joints) + root + offset at the stage-1
     # solution (s2_joints/s2_root/s2_offset) and warm-start from it, so only the UPPER body (waist+arms+
@@ -447,19 +399,11 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
     a_para = jnp.array(a_para); a_link = jnp.array(a_link)   # global-alignment set = body + hands
 
     class ScaleVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.ones((nb, nb))): ...
-
-    # [V2: hand-local-scale] 손 스케일. 한 손 체인의 노드 수만큼(현재 16) 정사각 행렬이고,
-    # 양손과 전 프레임이 하나를 공유합니다 — 같은 하드웨어라 마디 길이가 같고(실측 좌우 차 0.047),
-    # 손 크기는 클립 내내 안 변하기 때문입니다.
-    nh = len(h_sets["r"][0]) if h_sets else 1
-    class HandScaleVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.ones((nh, nh))): ...
-
     class OffsetVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros((3,))): ...
 
     var_joints = robot.joint_var_cls(jnp.arange(T))
     var_root = jaxls.SE3Var(jnp.arange(T))
     var_scale = ScaleVar(jnp.zeros(T))
-    var_hscale = HandScaleVar(jnp.zeros(T))       # [V2] 전 프레임 공유 (몸통 스케일과 같은 방식)
     var_offset = OffsetVar(jnp.arange(T))         # per-frame world translation (feet-on-floor placement)
 
     # per-node local weight `lw` (nb,) → pairwise lw[i]*lw[j]: weakening the ARM nodes frees the arm's
@@ -486,13 +430,6 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         return jnp.concatenate([(s - 1.0).flatten() * 1.0, (s - s.T).flatten() * 100.0,
                                 jnp.clip(-s, min=0).flatten() * 100.0])
 
-    # [V2] 손 스케일 정규화 — 몸통과 같은 형태(1 근처, 대칭, 음수 금지).
-    @jaxls.Cost.factory
-    def hand_scale_reg(vv, v_hs: HandScaleVar):
-        s = vv[v_hs]
-        return jnp.concatenate([(s - 1.0).flatten() * 1.0, (s - s.T).flatten() * 100.0,
-                                jnp.clip(-s, min=0).flatten() * 100.0]) * weights["hand_scale_reg"]
-
     # per-correspondence, PER-AXIS global weight `gw` (n_corr,3) built in main by body part: the only
     # ABSOLUTE-position anchors are hands (object grasp) + pelvis XY + feet (floor); torso/arm/leg and
     # pelvis-Z are weak/free so LOCAL (relative, scaled) align preserves the motion shape while the legs
@@ -515,7 +452,7 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         ]) * weights["floor_contact"]
 
     @jaxls.Cost.factory
-    def contact_grasp(vv, v_root: jaxls.SE3Var, v_cfg, tgt, msk, kp):
+    def contact_grasp(vv, v_root: jaxls.SE3Var, v_cfg, tgt, msk):
         # Pull each in-contact robot HAND POINT onto its object contact target, gated by msk so free/
         # reaching parts are untouched, with a per-point margin (so it stops once close). Points are the
         # full grasp set: 10 fingertip PADS (distal FK ∘ local pad offset → human fingertip pad) + the
@@ -525,30 +462,7 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         pt = jax.vmap(lambda i, o: T_wl.translation()[i]
                       + T_wl.rotation().as_matrix()[i] @ o)(ft_idx, ft_off)     # (P,3) world contact point
         res = jnp.maximum(jnp.abs(pt - tgt) - ft_margin[:, None], 0.0)          # (P,3)
-        out = [(res * msk[:, None]).flatten() * weights["contact"]]
-        # [V2: wrist-orient] 손목 방향 잔차를 여기에 얹습니다. 잔차는 손당 3개뿐인데 별도 비용으로
-        # 두면 그 이유만으로 프레임당 FK 야코비안이 한 벌 더 생깁니다(짧은 클립 실측 +5.3 GB).
-        # 이 비용은 이미 stage 2에서 T_wl 을 계산하므로 그대로 나눠 씁니다. v1에는 손목 회전 목표가
-        # 아예 없어서(retarget npz 에 손바닥 쿼터니언이 없음) 손목 방향이 다른 항들의 부산물이었고,
-        # 실측 오차가 25도였습니다. 사람과 로봇 양쪽에서 손 키포인트로 같은 방식의 프레임을 만들어
-        # 비교하므로 좌표 규약에 의존하지 않습니다: z = 손목->중지 knuckle, x = 손바닥 법선.
-        if weights["wrist_orient"] > 0 and h_sets is not None:
-            pos = T_wl.translation()
-
-            def _fr(p):
-                z = p[2] - p[0]
-                z = z / (jnp.linalg.norm(z) + 1e-9)
-                x = jnp.cross(z, p[1] - p[0])
-                x = x / (jnp.linalg.norm(x) + 1e-9)
-                return jnp.stack([x, jnp.cross(z, x), z], axis=-1)
-
-            for _side in ("l", "r"):
-                _hp, _hl = h_sets[_side]
-                _t = [0, 1, 4]                      # _HAND_CHAIN 순서: palm, ff*3, mf*3, ...
-                R_h = _fr(kp[jnp.array([_hp[i] for i in _t])])
-                R_r = _fr(pos[jnp.array([_hl[i] for i in _t])])
-                out.append(jaxlie.SO3.from_matrix(R_h.T @ R_r).log() * weights["wrist_orient"])
-        return jnp.concatenate(out)
+        return (res * msk[:, None]).flatten() * weights["contact"]
 
     @jaxls.Cost.factory
     def knee_separation(vv, v_root: jaxls.SE3Var, v_cfg):
@@ -651,7 +565,7 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         root_orient(var_root, root_R_target),
         root_height(var_root, root_z_target),
         knee_separation(var_root, var_joints),
-        # [V2: contact-stage2-only] 접촉 비용은 아래에서 단계별로 붙입니다.
+        contact_grasp(var_root, var_joints, ft_target, ft_mask),
         root_smooth(jaxls.SE3Var(jnp.arange(1, T)), jaxls.SE3Var(jnp.arange(0, T - 1))),
         skating(jaxls.SE3Var(jnp.arange(1, T)), robot.joint_var_cls(jnp.arange(1, T)),
                 OffsetVar(jnp.arange(1, T)), jaxls.SE3Var(jnp.arange(0, T - 1)),
@@ -676,68 +590,6 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         costs.append(world_collision(var_root, var_joints, var_offset))
     if obj_boxes_local is not None and weights["object_collision"] > 0:
         costs.append(object_collision(var_root, var_joints, var_offset, jnp.asarray(obj_pose)))
-    # [V2: hand-local-scale] 손 체인의 국소 정렬 + 스케일. 몸통 local_align 과 같은 형태이되
-    # 대상이 한 손이고, 스케일 행렬을 양손이 공유합니다. 절대 위치가 아니라 마디 사이 상대 벡터를
-    # 맞추므로, 로봇 손이 1.2배 커도 손가락을 눌러 접지 않고 "같은 모양"을 만들 수 있습니다.
-    # 양손 국소정렬 + 양손 손목방향을 하나의 비용으로 묶습니다. 비용을 4개로 나누면 jaxls가
-    # 비용마다 순기구학을 따로 미분해서 프레임당 FK 야코비안이 4벌 생기고(65자유도 x 78링크)
-    # 호스트 RAM이 터집니다. FK를 한 번만 계산해 네 잔차가 나눠 쓰면 그 4배가 사라집니다.
-    def _make_hand_costs(hs_l, hs_r, mask_l, mask_r, w_local, w_ori):
-        idx = {s: (jnp.array(hp), jnp.array(hl)) for s, (hp, hl) in (("l", hs_l), ("r", hs_r))}
-        masks = {"l": mask_l, "r": mask_r}
-        i_w, i_ff, i_mf = 0, 1, 4          # _HAND_CHAIN 순서: palm, ff*3, mf*3, rf*3, lf*3, th*3
-
-        def _frame(p):                     # p (3,3): 손목 / 검지 knuckle / 중지 knuckle
-            z = p[2] - p[0]
-            z = z / (jnp.linalg.norm(z) + 1e-9)
-            x = jnp.cross(z, p[1] - p[0])
-            x = x / (jnp.linalg.norm(x) + 1e-9)
-            return jnp.stack([x, jnp.cross(z, x), z], axis=-1)
-
-        @jaxls.Cost.factory
-        def hand_costs(vv, v_root: jaxls.SE3Var, v_cfg, v_hs: HandScaleVar, kp):
-            T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
-            pos = T_wl.translation()
-            scale = vv[v_hs][..., None]
-            pw_eye = 1 - jnp.eye(nh)
-            res = []
-            for side in ("l", "r"):
-                hp_j, hl_j = idx[side]
-                s_pos, r_pos = kp[hp_j], pos[hl_j]
-                if w_local > 0:
-                    d_s = s_pos[:, None] - s_pos[None, :]
-                    d_r = r_pos[:, None] - r_pos[None, :]
-                    pw = pw_eye * masks[side]
-                    res_pos = (d_s - d_r * scale) * pw[..., None]
-                    ds_n = d_s / jnp.linalg.norm(d_s + 1e-6, axis=-1, keepdims=True)
-                    dr_n = d_r / jnp.linalg.norm(d_r + 1e-6, axis=-1, keepdims=True)
-                    res_ang = (1 - (ds_n * dr_n).sum(-1)) * pw
-                    res += [res_pos.flatten() * w_local, res_ang.flatten() * w_local]
-                if w_ori > 0:
-                    tri = jnp.array([i_w, i_ff, i_mf])
-                    R_h, R_r = _frame(s_pos[tri]), _frame(r_pos[tri])
-                    res.append(jaxlie.SO3.from_matrix(R_h.T @ R_r).log() * w_ori)
-            return jnp.concatenate(res)
-
-        return hand_costs
-
-    # [V2: contact-stage2-only] 손을 물체로 당기는 비용은 STAGE 2 에만 겁니다.
-    # 1단계의 일은 접지입니다(발 평평 / 무릎 / 발미끄러짐 / 바닥 충돌 / 루트 높이). 거기에 손을
-    # 물체로 당기는 힘까지 같이 걸면 그 자세를 왜곡하는데, 2단계에서 하반신을 얼리고 상반신을 다시
-    # 풀기 때문에 1단계가 만든 손 자세는 어차피 버려집니다. pyroki 예제도 이렇게 나뉘어 있습니다 —
-    # 12번(전신)에는 접촉 비용이 없고, 11번(손)에만 있습니다.
-    # V2_CONTACT_STAGE2_ONLY=0 이면 v1처럼 두 단계 모두에 겁니다.
-    _c_s2_only = os.environ.get("V2_CONTACT_STAGE2_ONLY", "1") == "1"
-    if (s2_w > 0.0) or (not _c_s2_only):
-        costs.append(contact_grasp(var_root, var_joints, ft_target, ft_mask, keypoints))
-    # [V2] 손 관련 항은 STAGE 2 전용입니다 — 1단계는 접지가 일이고 손은 2단계에서 다시 풀립니다.
-    # 손목 방향은 contact_grasp 안으로 들어갔습니다(FK 공유). 여기 남은 것은 실험용 hand_local 뿐입니다.
-    _w_hl = weights["hand_local"]
-    if s2_w > 0.0 and h_sets is not None and _w_hl > 0:
-        _m = {s: create_conn_tree(robot, jnp.array(h_sets[s][1])) for s in ("l", "r")}
-        costs.append(_make_hand_costs(h_sets["l"], h_sets["r"], _m["l"], _m["r"], _w_hl, 0.0)(
-            var_root, var_joints, var_hscale, keypoints))
-        costs.append(hand_scale_reg(var_hscale))
 
     init_vals = None
     if s2_w > 0.0:
@@ -760,12 +612,11 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
             var_joints.with_value(_pin_j),
             var_root.with_value(jaxlie.SE3(_pin_root)),
             var_scale.with_value(jnp.ones((T, nb, nb))),
-            var_hscale.with_value(jnp.ones((T, nh, nh))),
             var_offset.with_value(_pin_off),
         ])
 
     prob = jaxls.LeastSquaresProblem(
-        costs=costs, variables=[var_joints, var_root, var_scale, var_hscale, var_offset]).analyze()
+        costs=costs, variables=[var_joints, var_root, var_scale, var_offset]).analyze()
     sol = prob.solve() if init_vals is None else prob.solve(initial_vals=init_vals)
     root = jaxlie.SE3.from_translation(sol[var_offset]) @ sol[var_root]   # bake floor offset into root
     return root, sol[var_joints]
@@ -797,7 +648,6 @@ def main():
     print(f"[pyroki-retarget] clip={args.clip} F={F} correspondences: global {len(pairs)} "
           f"(body {len(_BODY)} + hands {len(pairs)-len(_BODY)}), local+scale {len(_BODY)} (body)")
     b_mask = create_conn_tree(robot, jnp.array(b_link))
-    h_sets = _hand_sets(robot)          # [V2] STAGE 2 손 국소정렬/스케일/손목방향용 대응
 
     l_c = _foot_contact(jp, _PARA_BALL_L); r_c = _foot_contact(jp, _PARA_BALL_R)
     l_kp = jp[:, _PARA_BALL_L, :].copy(); l_kp[:, 2] = _ANKLE_SOLE_OFF   # target ANKLE at sole-on-floor height
@@ -898,26 +748,7 @@ def main():
                    # weight can be large because the residual is one-sided (0 unless links overlap
                    # the object), so at the pose we want the term contributes nothing at all.
                    object_collision=_w("W_OBJCOLL", 0.0),
-                   object_collision_tol=_w("W_OBJCOLLTOL", 0.002),
-                   # [V2] STAGE 2 전용 손 항목.
-                   #
-                   # hand_local(손 체인 상대벡터 + 공유 스케일)은 측정 결과 OFF 입니다. 손이 이미
-                   # 전역 정렬(절대 위치)과 접촉 비용(물체 표면)에 묶여 있는데 여기에 "상대 모양"까지
-                   # 얹으면 같은 링크를 세 방향으로 당기고, 자유로운 스케일 행렬이 손 전체를 돌려
-                   # 버립니다. s53_seg19_knife 실측 (손 항 OFF -> hand_local ON):
-                   #     손목 회전오차  24.1도 -> 50.6도      손끝-사람 거리  39.7 -> 57.2 mm
-                   #     VRAM 피크      11.0 -> 19.0 GB
-                   # 애초에 이 항의 근거였던 "손가락마다 크기 비가 제각각"은 어긋난 대응표가 만든
-                   # 허상이었고, 대응을 고친 뒤 비율이 1.06~1.46으로 균일해져 흡수할 것이 거의
-                   # 남지 않았습니다. 실험용으로만 W_HANDLOCAL=1 로 켭니다.
-                   hand_local=_w("W_HANDLOCAL", 0.0),
-                   hand_scale_reg=_w("W_HANDSCALEREG", 1.0),
-                   # wrist_orient 은 채택. v1에는 손목 회전 목표가 아예 없어서(retarget npz 에
-                   # 손바닥 쿼터니언이 없음) 손목 방향이 다른 항들의 부산물이었습니다. 사람과 로봇
-                   # 양쪽에서 손 키포인트로 같은 방식의 프레임을 만들어 비교하므로 좌표 규약에
-                   # 의존하지 않습니다. s53_seg19_knife 실측: 손목 회전오차 24.1도 -> 14.4도,
-                   # 손끝-사람 거리 39.7 -> 37.9 mm, VRAM 증가 없음.
-                   wrist_orient=_w("W_WRISTORI", 1.0))
+                   object_collision_tol=_w("W_OBJCOLLTOL", 0.002))
 
     # per-axis, per-body-part global weights (n_corr,3): body order = pelvis(0) torso(1) arms(2-7)
     # legs(8-13) hands(14+). Default = uniform full tracking; the low-weight decoupling is opt-in via env.
@@ -978,8 +809,7 @@ def main():
                             jnp.array(root_R_target), jnp.array(root_z_tgt), jnp.array(ft_idx), jnp.array(ft_off),
                             jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
                             jnp.array(rest_w), weights,
-                            obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps,
-                            h_sets=h_sets)
+                            obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps)
     joints = onp.array(joints); root = onp.array(Ts_root.wxyz_xyz)
     print(f"[pyroki-retarget] stage-1 solved in {time.time()-t0:.1f}s")
 
@@ -1006,7 +836,6 @@ def main():
                                  jnp.array(ft_off), jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
                                  jnp.array(rest_w), weights,
                                  obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps,
-                                 h_sets=h_sets,
                                  s2_joints=jnp.array(joints), s2_root=jnp.array(root),
                                  s2_offset=jnp.array(s2_off), s2_lower_mask=jnp.array(lower_mask), s2_w=w_stage2)
         joints = onp.array(joints2); root = onp.array(Ts_root.wxyz_xyz)
@@ -1045,7 +874,7 @@ def main():
     except Exception as _e:
         print(f"[metric] skipped ({type(_e).__name__}: {_e})")
 
-    out = _PROC / "g1_shadow" / args.cls / args.clip / "0" / f"trajectory_pyroki{os.environ.get('W_OUTSUFFIX', '')}.npz"
+    out = _PROC / "g1_shadow" / args.cls / args.clip / "0" / f"trajectory_pyroki{os.environ.get('W_OUTSUFFIX','')}.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
     # Record the column layout with the data. g1_joint_pos is written in `act` order, and the env
     # reads column k into its OWN k-th action joint — an agreement nothing enforced, since `act`

@@ -61,7 +61,8 @@ def parse_args():
 
 
 def _mesh_to_usd(obj_path: Path, usd_path: Path, mass: float, friction: float,
-                 collider: str = "decomposition", max_hulls: int = 16, kinematic: bool = False):
+                 collider: str = "decomposition", max_hulls: int = 16, kinematic: bool = False,
+                 contact_offset: float | None = None, rest_offset: float | None = None):
     """Convert one .obj -> rigid-body USD with a collider + physics material.
     collider: 'decomposition' (concave-safe) | 'trimesh' (exact, KINEMATIC/static only)
               | 'hull' | 'none' (visual/static).
@@ -121,7 +122,9 @@ def _mesh_to_usd(obj_path: Path, usd_path: Path, mass: float, friction: float,
             disable_gravity=kinematic,
             kinematic_enabled=kinematic,
         ),
-        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True,
+                                                        contact_offset=contact_offset,
+                                                        rest_offset=rest_offset),
         mesh_collision_props=mesh_collision,
     )
     MeshConverter(cfg)
@@ -179,6 +182,18 @@ CONTEXT_MAX_HULLS = 16
 # cost 26% of training throughput (3,584 -> 2,664 env-steps/s at 512 envs) plus a 64 MB -> 512 MB
 # gpu_collision_stack_size (PhysX drops contacts below that), for no measurable benefit.
 CONTEXT_COLLIDER = "decomposition"
+# Contact generation distance and target separation for the context supports, in metres.
+#   contact_offset  PhysX starts generating contacts once the two shapes are within the SUM of their
+#                   contact offsets. 0.01 halves Isaac's 0.02 default, so the counter stops producing
+#                   speculative contacts a full 2 cm out.
+#   rest_offset     the separation the solver drives the pair to. 0.0 = surfaces exactly touching.
+# NOTE what this does NOT do: with rest_offset at 0.0 the solver still pushes any overlap back out,
+# so the few mm the retargeted reference holds the HAND inside the counter (measured: cutting board
+# 6.2 mm on 82% of frames, sink 6.4 mm on 72%) is still ejected at reset. Tolerating that overlap
+# instead of ejecting it takes a NEGATIVE rest_offset (~ -0.008), which recesses the surface by that
+# much in every direction.
+CONTEXT_CONTACT_OFFSET = 0.01
+CONTEXT_REST_OFFSET = 0.0
 
 
 def convert_context(obj: str, overwrite: bool):
@@ -204,7 +219,8 @@ def convert_context(obj: str, overwrite: bool):
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"[context] {obj} -> {out.relative_to(_ASSET_OUT)}")
     _mesh_to_usd(src, out, mass=DEFAULT_MASS, friction=DEFAULT_FRICTION, collider=CONTEXT_COLLIDER,
-                 max_hulls=CONTEXT_MAX_HULLS, kinematic=True)
+                 max_hulls=CONTEXT_MAX_HULLS, kinematic=True,
+                 contact_offset=CONTEXT_CONTACT_OFFSET, rest_offset=CONTEXT_REST_OFFSET)
 
 
 def convert_articulated(obj: str, spec: dict, overwrite: bool):

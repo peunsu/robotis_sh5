@@ -84,6 +84,7 @@ def main():
     print(f"[export-urdf] re-authored {nfix} hand body xforms from joint anchors")
 
     npatch = 0
+    true_axis = {}   # [MIRROR-AXIS FIX] 조인트 이름 -> 자식 몸체 좌표계에서의 실제 회전축
     for prim in stage.Traverse():
         for JT in (UsdPhysics.RevoluteJoint, UsdPhysics.PrismaticJoint, UsdPhysics.FixedJoint):
             if not prim.IsA(JT):
@@ -97,13 +98,43 @@ def main():
             c_w = body_world(b1[0])
             A = c_w * p_w.GetInverse()          # child-in-parent (row-vec): child_world = A * parent_world
             r = A.ExtractRotationQuat(); t = A.ExtractTranslation()
+
+            # [MIRROR-AXIS FIX] Record the joint's TRUE axis in the CHILD BODY frame before the
+            # anchors are overwritten below. The axis token ("X"/"Y"/"Z") is expressed in the child
+            # ANCHOR frame, so the physical direction is R(localRot1)·token. Forcing B=identity moves
+            # that frame and the token would then name a different direction.
+            #
+            # This is not hypothetical: the LEFT hand is a proper geometric mirror of the right, and a
+            # reflection reverses a rotation axis (it is a pseudovector). graft_shadow_onto_g1.py
+            # encodes that by rotating BOTH anchor frames 180° about Z — rest pose unchanged, token-X
+            # direction flipped. That rotation lives ONLY in localRot0/localRot1, so rewriting the
+            # anchors by body pose alone silently dropped it, and every left finger in the exported
+            # URDF curled the WRONG WAY: flexing the four left fingers moved the tips to the same side
+            # as the right hand's while the left thumb sat on the opposite side — a hand that cannot
+            # oppose its thumb, i.e. cannot grasp. The simulator (which reads the USD anchors directly)
+            # was always correct; only the retarget URDF was wrong.
+            #
+            # The axis is written back into the URDF after conversion (step 3), not into the USD:
+            # UsdPhysics only allows an axis TOKEN, and some Shadow joints (e.g. LFJ4) are genuinely
+            # not axis-aligned once rotated, which a token cannot express. URDF takes a free vector.
+            if not prim.IsA(UsdPhysics.FixedJoint):
+                tok = j.GetAxisAttr().Get()
+                old_r1 = j.GetLocalRot1Attr().Get()
+                if tok is not None and old_r1 is not None:
+                    base = {"X": Gf.Vec3d(1, 0, 0), "Y": Gf.Vec3d(0, 1, 0), "Z": Gf.Vec3d(0, 0, 1)}[tok]
+                    v = Gf.Rotation(Gf.Quatd(float(old_r1.GetReal()),
+                                             Gf.Vec3d(*[float(x) for x in old_r1.GetImaginary()]))
+                                    ).TransformDir(base)
+                    true_axis[prim.GetName()] = (float(v[0]), float(v[1]), float(v[2]))
+
             j.GetLocalPos0Attr().Set(Gf.Vec3f(*[float(x) for x in t]))
             j.GetLocalRot0Attr().Set(Gf.Quatf(float(r.GetReal()), Gf.Vec3f(*[float(x) for x in r.GetImaginary()])))
             j.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
             j.GetLocalRot1Attr().Set(Gf.Quatf(1.0, Gf.Vec3f(0.0, 0.0, 0.0)))
             npatch += 1
             break
-    print(f"[export-urdf] rewrote {npatch} joint anchors to (A=true-relative, B=identity)")
+    print(f"[export-urdf] rewrote {npatch} joint anchors to (A=true-relative, B=identity); "
+          f"recorded true axis for {len(true_axis)} joints")
 
     patched = f"{_OUT}/G1_shadow_patched.usda"
     stage.Export(patched)
@@ -133,13 +164,27 @@ def main():
 
     for link in root.findall("link"):
         link.set("name", fix(link.get("name", "")))
+    nax = 0
     for joint in root.findall("joint"):
         for tag in ("parent", "child"):
             e = joint.find(tag)
             if e is not None:
                 e.set("link", fix(e.get("link", "")))
+        # [MIRROR-AXIS FIX] restore the physical rotation axis recorded before the anchors were
+        # rewritten. UsdToUrdf writes the axis TOKEN as-is, which is only valid while the child
+        # anchor frame equals the child body frame — no longer true once B was forced to identity.
+        ax = true_axis.get(joint.get("name", ""))
+        if ax is not None:
+            e_ax = joint.find("axis")
+            if e_ax is None:
+                e_ax = ET.SubElement(joint, "axis")
+            before = e_ax.get("xyz", "")
+            e_ax.set("xyz", " ".join(f"{v:.10g}" for v in ax))
+            if before.split() != [f"{v:.10g}" for v in ax]:
+                nax += 1
 
     tree.write(urdf_path)
+    print(f"[export-urdf] rewrote the axis of {nax} joints to the pre-patch physical direction")
     print(f"[export-urdf] normalized link names (prefix '{pfx}' stripped, root→pelvis). DONE.")
 
 

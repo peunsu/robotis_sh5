@@ -1138,6 +1138,29 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 self._ref_g1_v = torch.zeros_like(self._ref_g1_q)
                 self._ref_g1_v[1:] = (self._ref_g1_q[1:] - self._ref_g1_q[:-1]) * float(c.control_fps)
             self._sonic_scale = _SP.sonic_scale_vector(dev).view(1, -1)                        # (1,29) SONIC order
+            # [ROLLBACK MARKER: hist-from-reference] 리셋 때 SONIC의 10프레임 관측 창을 채울 재료.
+            # 프레임마다 "레퍼런스가 그 시점에 어떤 상태였는가"를 SONIC이 받는 형식 그대로 미리 만들어
+            # 둡니다. 창을 현재 행 복제로 채우면 "로봇은 10프레임 동안 안 움직였다"가 되는데, 같은 순간
+            # 토크나이저는 레퍼런스가 움직이는 중이라고 말합니다 — 두 이야기가 어긋납니다. 레퍼런스의
+            # 지난 10프레임으로 채우면 과거와 미래가 같은 궤적이 됩니다.
+            # jvr은 레퍼런스 관절의 차분이라 0번 프레임이 0인데, 그게 맞습니다 — 클립 시작에서
+            # 레퍼런스는 실제로 정지해 있으므로 0으로 잘린 창이 자기모순이 없습니다.
+            self._ref_hist = None
+            if self._ref_joints is not None:
+                _jpr_r = self._ref_joints[:, _idx29] - self._sonic_default                     # (F,29)
+                _jvr_r = torch.zeros_like(_jpr_r)
+                _jvr_r[1:] = (_jpr_r[1:] - _jpr_r[:-1]) * float(c.control_fps)
+                _q_r = self._ref_root_quat                                                     # (F,4)
+                _g_r = torch.tensor([0.0, 0.0, -1.0], device=dev).expand(self._ref_len, 3)
+                self._ref_hist = {
+                    "jpr": _jpr_r,
+                    "jvr": _jvr_r,
+                    # 이 자세를 명령하는 행동 = 디코드의 역: body = default + scale*a  =>  a = jpr/scale
+                    "act": _jpr_r / self._sonic_scale,
+                    "grav": math_utils.quat_apply(math_utils.quat_conjugate(_q_r), _g_r),
+                    "ang": math_utils.quat_apply(math_utils.quat_conjugate(_q_r), self._ref_root_angvel),
+                }
+            # [/ROLLBACK MARKER: hist-from-reference]
             # SONIC order -> action-body order (first 29 action joints = legs+waist+arms), by NAME
             _ab_names = [self.robot.joint_names[i] for i in self._action_joint_ids[:29]]
             self._sonic_gather = torch.tensor([list(_GIO).index(n) for n in _ab_names],
@@ -1575,9 +1598,48 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 self._sonic_hist[k][:, -1] = v
             if bool(self._sonic_hist_init.any()):
                 m = self._sonic_hist_init
-                for k in ("ang", "jpr", "jvr", "grav"):
-                    self._sonic_hist[k][m] = rows[k][m].unsqueeze(1)
-                self._sonic_hist["act"][m] = 0.0
+                # [ROLLBACK MARKER: hist-from-reference] -------------------------------------------
+                # 창을 레퍼런스의 지난 10프레임으로 채웁니다. 그러면 창 자체가 실재하는 궤적이고,
+                # 토크나이저가 미래로 주는 것과 같은 궤적이라 SONIC이 하나의 일관된 이야기를 봅니다.
+                # 인덱스는 에피소드 시간으로 만들고 0에서 자릅니다. 이 한 줄이 두 경우를 같이 처리합니다
+                # — 클립 시작(10프레임이 없으면 0번을 반복, 거기서는 레퍼런스가 실제로 정지 상태),
+                # 그리고 역방향 에피소드(에피소드의 과거가 원본에서는 앞쪽 프레임).
+                # 속도 두 채널은 역방향에서 부호를 뒤집습니다(리셋 경로와 동일). 위치·자세는 부호를
+                # 바꾸면 안 되므로 그대로 둡니다.
+                # 10칸을 전부 레퍼런스로 덮습니다(가장 최근 칸 포함). 최근 칸만 실측으로 남기면 추종
+                # 오차가 8번과 9번 칸 사이의 위치 점프로 들어가고, 속도 채널이 그걸 부정합니다 —
+                # 여기서 없애려는 결함 그 자체입니다.
+                _hist_ref_used = (bool(getattr(c, "sonic_hist_from_reference", True))
+                                  and self._ref_hist is not None)
+                if _hist_ref_used:
+                    _H = self._sonic_hist["jpr"].shape[1]                       # 10
+                    _ep = self._frame().unsqueeze(1) - torch.arange(_H - 1, -1, -1, device=self.device)
+                    _ep = _ep.clamp(min=0)                                      # (E,H) 에피소드 프레임
+                    # 에피소드 프레임 -> 원본 프레임. _rframe과 같은 사상이되 (E,H)로 방송합니다.
+                    _of = (_ep if not self._any_backward
+                           else torch.where(self._dir_fwd.unsqueeze(1), _ep, (self._ref_len - 1) - _ep))
+                    _sg = self._dir_sign.unsqueeze(-1)                          # (E,1,1) 속도 부호
+                    for k in ("jpr", "grav", "act"):
+                        self._sonic_hist[k][m] = self._ref_hist[k][_of][m]
+                    for k in ("jvr", "ang"):
+                        self._sonic_hist[k][m] = (self._ref_hist[k][_of] * _sg)[m]
+                else:
+                    for k in ("ang", "jpr", "jvr", "grav"):
+                        self._sonic_hist[k][m] = rows[k][m].unsqueeze(1)
+                # 복제 방식일 때만 의미가 있습니다. 위치를 10칸에 얼려놓고 살아있는 속도를 같이 넣으면
+                # "10프레임 동안 안 움직였는데 지금 움직이고 있다"가 되어 디코더가 학습 중 본 적 없는
+                # 이력이 됩니다. 속도를 0으로 두면 "10프레임 동안 정지"가 되어 자기모순이 없어집니다.
+                if not _hist_ref_used:
+                    if getattr(c, "sonic_hist_seed_zero_vel", False):
+                        self._sonic_hist["jvr"][m] = 0.0
+                    # 행동 이력: 0은 "지난 10프레임 동안 기본자세를 명령해 왔다"는 뜻이라 조작 도중
+                    # 복원된 로봇과 어긋납니다. 다만 IsaacLab의 행동 관리자가 리셋 때 행동을 0으로
+                    # 만들므로, 동결 디코더가 학습 중 실제로 본 값은 0입니다. 그래서 0이 기본입니다.
+                    if getattr(c, "sonic_act_seed_from_pose", False):
+                        self._sonic_hist["act"][m] = (rows["jpr"][m] / self._sonic_scale).unsqueeze(1)
+                    else:
+                        self._sonic_hist["act"][m] = 0.0
+                # [/ROLLBACK MARKER: hist-from-reference] ------------------------------------------
                 self._sonic_hist_init[m] = False
 
         if c.debug_vis:

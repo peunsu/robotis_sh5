@@ -244,7 +244,24 @@ G1_SHADOW_CFG = ArticulationCfg(
             angular_damping=0.0,
             max_linear_velocity=1000.0,
             max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
+            # [ROLLBACK MARKER: depen-vel] Cap on how fast PhysX pushes an overlap apart. This is NOT
+            # a bounce — restitution is 0.0 on the robot, the object and every context collider, so
+            # nothing here is elastic. It is the depenetration impulse, and the robot absorbs ALL of
+            # it because the supports are spawned kinematic (infinite mass).
+            #
+            # It fires every reset: the retargeted reference holds the hand a few mm inside whatever
+            # it rests on (measured on s101_seg12_knife: cutting board 6.2 mm on 82% of frames, sink
+            # 6.4 mm on 72%), and PhysX ejects that overlap on the first step. Measured hand speed one
+            # step after a pinned reset: 0.35 m/s with no context objects, 0.57 m/s with them — the
+            # 0.22 m/s difference is this ejection, and it pushed the >3 cm displacement frames from
+            # 25.9% to 39.7%.
+            #
+            # 1.0 -> 0.1 lets the overlap resolve over several steps instead of one kick. The cost is
+            # that a deep overlap now persists longer, so watch the reset-step hand displacement and
+            # the early-episode termination rate together. Raising this value was tried before and did
+            # nothing (at 20 the results were byte-identical — the cap was never binding upward);
+            # lowering it is the untested direction, which is why it is marked for rollback.
+            max_depenetration_velocity=0.1,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             # Match G1_29DOF locomotion setup. Self-collision off (full humanoid + 2 hands is
@@ -979,6 +996,28 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     residual_scale_latent: float = 0.10   # λ on z_res (GRAIL pre-quantization latent residual scale)
     control_fps: float = 50.0            # resample reference 30 fps → this; MUST match parahome_smpl_for_sonic TGT_FPS
     sonic_smpl_file: str = "sonic_smpl_50fps.npz"   # SONIC SMPL encoder arrays (sibling of the retarget npz)
+    # [ROLLBACK MARKER: hist-from-reference] What SONIC's 10-frame proprioception window is filled
+    # with at reset. The window is history — there is none at the first step of an episode, so it has
+    # to be fabricated, and the choice decides what the frozen decoder believes just happened.
+    #   True  = the REFERENCE's own last 10 frames. The window is then a real trajectory whose
+    #           positions, velocities and orientation agree with each other, and it is the SAME
+    #           trajectory the tokenizer feeds as the FUTURE.
+    #   False = replicate the current row into all 10 slots. That says "the robot has not moved for
+    #           10 frames" while the tokenizer says the reference is mid-motion — two different
+    #           stories, and a frozen robot past contradicts any non-zero velocity restored from the
+    #           state cache.
+    # Ported from the RePHO variant, where it was written and measured.
+    sonic_hist_from_reference: bool = True
+    # The two below only apply to the REPLICATED fallback (from_reference=False); with the reference
+    # window the velocities and the action already agree with the positions.
+    #   seed_zero_vel   zero the seeded joint velocity so the frozen positions and the velocity stop
+    #                   contradicting each other.
+    #   act_seed_from_pose  seed last_action with the action that commands the CURRENT pose
+    #                   (jpr / sonic_scale, the exact inverse of the decode) instead of 0. Off because
+    #                   IsaacLab's action manager zeroes the action at reset, so 0 is what the frozen
+    #                   decoder actually saw during its own training.
+    sonic_hist_seed_zero_vel: bool = False
+    sonic_act_seed_from_pose: bool = False
 
 
 
