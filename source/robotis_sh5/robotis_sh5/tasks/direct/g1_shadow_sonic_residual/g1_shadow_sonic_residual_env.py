@@ -100,6 +100,18 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ init
     def __init__(self, cfg: G1ShadowSonicResidualEnvCfg, render_mode: str | None = None, **kwargs):
+        # [ROLLBACK MARKER: body-kpt-off] 몸 키포인트 감독 비활성화(실험): 보상·종료·캐시 bar 일괄
+        # 적용. super() 이전에 cfg를 고쳐 두므로 exp 가중치 테이블(_post_init_buffers의 _lw 정규화 —
+        # body 몫이 나머지 항에 자동 재배분)과 params/env.yaml 덤프 모두 적용된 값을 본다. 관측
+        # (54kpt)과 e["body"] 계산·로깅은 그대로 — 감독만 빠진다. 낙상 감지는 루트 게이트가 대신
+        # (_dones_deviation). 되돌리기: cfg.body_kpt_supervision=True.
+        if not cfg.body_kpt_supervision:
+            cfg.rew_body_kpts = 0.0        # 코어 몸 10kpt 보상 제거 (ee/hand/link/fingertip/root/obj 유지)
+            cfg.term_body_kpt_err = 1.0e6  # body 종료 게이트 무력화 → 루트 게이트가 낙상 담당
+            cfg.cache_body_bar = 1.0e6     # 캐시 body bar 무력화 (root/fingertip bar는 유지)
+            print("[body-kpt-off] body keypoint supervision DISABLED: rew_body_kpts=0, "
+                  "body termination/cache-bar off, root fall gate on "
+                  f"(term_root_pos_err={cfg.term_root_pos_err}, term_root_rot_err={cfg.term_root_rot_err})")
         self._load_reference_trajectories(cfg)          # numpy buffers (pre-super: no device yet) → sets _ref_len
         self._build_object_cfg(cfg)                     # guarded: only if converted USD exists
         # EPISODE = RSI start frame → END OF THE REFERENCE SEQUENCE (or a termination). The horizon is
@@ -2112,6 +2124,11 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                       "obj_pos": e["obj_pos"] > cc.term_obj_pos_err, "obj_rot": e["obj_rot"] > cc.term_obj_rot_err,
                       "wrist_rot": ((e["wrist_rot"] > cc.term_wrist_rot_err) if self._has_palm_ref
                                     else torch.zeros_like(dead))}
+            # [ROLLBACK MARKER: body-kpt-off] 루트 낙상 게이트가 실제 게이트일 때만 원인으로 집계
+            # (기준선에서는 게이트가 아니므로 넣으면 허위 귀속이 된다).
+            if not cc.body_kpt_supervision:
+                _cause["root_pos"] = e["root_pos"] > cc.term_root_pos_err
+                _cause["root_rot"] = e["root_rot"] > cc.term_root_rot_err
             for k, mk in _cause.items():
                 log[f"Term / {k}"] = (mk & dead).float().sum() / nd
 
@@ -2125,6 +2142,12 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         their own."""
         c = self.cfg
         d = e["body"] > c.term_body_kpt_err                          # added full-body/locomotion gate
+        # [ROLLBACK MARKER: body-kpt-off] body 게이트를 끈 실험에서는 낙상/루트 이탈을 루트 게이트가
+        # 잡는다(기준 = 리타게팅된 로봇 골반 g1_root_pose, e["root_pos"/"root_rot"]은 이미 매 스텝
+        # 계산됨). 감독이 켜진 기준선에서는 body 게이트가 이를 포섭하므로(위 도크스트링) 비활성 —
+        # 기준선의 거동은 불변.
+        if not c.body_kpt_supervision:
+            d = d | (e["root_pos"] > c.term_root_pos_err) | (e["root_rot"] > c.term_root_rot_err)
         #  fingertip + wrist-POSITION deviation (ft = mean over all 10 pads; wrist_pos = mean over both
         #  wrists — plain means, matching body). The finger-chain (hand) keypoint mean is NOT a gate — it is
         #  REWARD-only (rew_hand_kpts), matching grasp (which never terminates on its keypoint mean). A

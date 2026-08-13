@@ -480,6 +480,17 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # shoulders, elbows, hips, knees) and the 4 END-EFFECTOR kpts (both wrists + both ankles), each with
     # its own weight so the extremities (reach + foot placement) can be emphasized independently. Both are
     # plain means over their group. The termination gate still uses the UNIFORM mean over ALL 14 (e["body"]).
+    # ── [ROLLBACK MARKER: body-kpt-off] 몸 키포인트 감독 스위치 (2026-08-14 실험) ─────────────
+    # 몸 키포인트 목표(_np_ref_kpts의 body 14개)는 SMPL-X 사람 키포인트를 그대로 쓰므로 몸 비율
+    # 차이가 영구 잔차로 남는다. False로 두면 env __init__이 (1) rew_body_kpts→0 (2)
+    # term_body_kpt_err→1e6 (3) cache_body_bar→1e6 을 일괄 적용해 코어 몸 감독을 빼고, body
+    # 게이트가 겸하던 낙상 감지는 아래 term_root_pos/rot_err 루트 게이트(기준 = 리타게팅된 로봇
+    # 골반 g1_root_pose — SMPL-X가 아님)가 대신한다. 목적: EE/손/루트 목표만 남겼을 때 SONIC
+    # prior가 몸을 얼마나 유지하는지 관찰 (감독 제거이지 정보 제거가 아님 — 관측 54kpt와
+    # e["body"] 계산·로깅 Error / body_kpts 는 그대로 남아 진단 지표가 된다).
+    # 유지되는 항: rew_ee_kpts(손목+발목), rew_hand_kpts, rew_link_kpts, rew_fingertip,
+    # rew_root_pos/ori, 물체 항, 캐시 root/fingertip bar. 되돌리기: True (아래 값들은 원본 유지).
+    body_kpt_supervision: bool = True
     rew_body_kpts: float = -0.5        # mean over the 10 CORE body kpts (non-end-effector)
     rew_ee_kpts: float = -1.76          # mean over the 4 END-EFFECTOR kpts (L/R wrist + L/R ankle)
     rew_hand_kpts: float = -1.76        # mean over 40 finger-chain kpts (dexterity)
@@ -616,6 +627,12 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # gates: the mean body-keypoint error subsumes them (a root shift moves every keypoint, a tilt
     # rotates the far keypoints away, a fall drives foot/pelvis keypoints off) — one clean body gate.
     term_body_kpt_err: float = 0.50        # m, mean body-keypoint tracking error (covers root/fall).
+    # [ROLLBACK MARKER: body-kpt-off] 루트 낙상 게이트 — body_kpt_supervision=False일 때만 활성
+    # (_dones_deviation). body 게이트가 겸하던 낙상/루트 이탈 감지의 대체물. 기준은 리타게팅된
+    # 로봇 골반(g1_root_pose) 대비 e["root_pos"]/e["root_rot"] — 이미 매 스텝 계산되는 값이라
+    # 추가 비용 없음. 감독이 켜진 기준선에서는 body 게이트가 이를 포섭하므로 여기는 잠잠하다.
+    term_root_pos_err: float = 0.40        # m, root(pelvis) position deviation (fall/drift substitute gate)
+    term_root_rot_err: float = 1.0         # rad, root(pelvis) rotation deviation (tilt/fall substitute gate)
     term_obj_pos_err: float = 0.15         # m, active-object position tracking error (= grasp max_obj_pos_err; was loosened to 0.20, now grasp-parity)
     term_obj_rot_err: float = 0.75         # rad, active-object rotation tracking error (= grasp max_obj_rot_err; was 0.80)
     # Fingertip + wrist-POSITION deviation gates (mirror grasp max_ft_mean_err / max_wrist_pos_err;
