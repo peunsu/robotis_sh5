@@ -20,7 +20,7 @@
 #   data/processed/parahome/g1_shadow_repho/<clip_class>/<clip_name>/0/
 #       agent.pt / pretrain.pt
 #       evaluation_ep_le_<TIMESTEPS>/metrics.csv
-# Aggregates → data/processed/parahome/g1_shadow_repho_method{1,2,3}.csv
+# Aggregates → data/processed/parahome/g1_shadow_repho/method{1,2,3}.csv
 #
 # Which clips run: edit CLIPS=(...) (comment lines to filter) or CLIPS_OVERRIDE="a b c".
 # Keep in sync with train_sequences_repho.sh.
@@ -168,5 +168,5 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "[eval-sonic] Aggregating metrics under ${DATA_BASE} ..."
 bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
-echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_repho_method{1,2,3}.csv"
+echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_repho/method{1,2,3}.csv"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

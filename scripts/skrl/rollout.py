@@ -48,6 +48,13 @@ parser.add_argument("--trajectory_task", type=str, default=None)
 parser.add_argument("--trajectory_data_id", type=int, default=None)
 parser.add_argument("--clip_class", type=str, default=None, help="ParaHome clip class (g1 loco-manip).")
 parser.add_argument("--clip_name", type=str, default=None, help="ParaHome clip name (g1 loco-manip).")
+parser.add_argument("--zero_zres", action="store_true",
+                    help="[zres-ablation] 정책 액션의 잠재 블록(앞 sonic_action_dim 차원)을 0 으로 "
+                         "덮어써 순수 SONIC 프리어만 몸통을 구동합니다. 손 액션은 그대로 두어 과제가 "
+                         "진행되게 합니다. z_res 섭동이 SONIC 출력 포화의 원인인지 가르는 진단.")
+parser.add_argument("--dump_joints", action="store_true",
+                    help="[joint-dump] env 0 의 PD 타겟/실측 관절 궤적을 joint_trace.npz 로 저장 "
+                         "(bang-bang 진단용). _apply_action 이 쓰는 _residual_target 을 그대로 기록.")
 parser.add_argument("--debug_vis", action="store_true", help="Draw reference-keypoint markers (needs a viewer / not --headless).")
 # ── Recorded-video CAMERA ANGLE (video-only — never touches physics) ─────────────────────────
 # The g1 sonic/locomanip env recomputes cfg.viewer.eye/lookat from cfg.viewer_{yaw,elev,look_obj,
@@ -361,6 +368,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     seq_name  = (getattr(env_cfg, "trajectory_task", None) or getattr(env_cfg, "object_id", None)
                  or getattr(env_cfg, "clip_name", None) or "clip")
 
+    # ── [joint-dump] env 0 의 관절 PD 타겟 vs 실측 ─────────────────────────────────────────
+    # env._apply_action 은 set_joint_position_target(_residual_target, _action_joint_ids) 로 씁니다.
+    # 그 타겟의 시간축 거동이 bang-bang 판정의 대상입니다. 첫 에피소드 동안만 기록합니다.
+    _jrec = None
+    if args_cli.dump_joints:
+        _jrec = {k: [] for k in ("target", "qpos", "qvel", "tau", "action", "a_sonic",
+                                 "root_pos", "root_quat", "ref_root_pos", "frame")}
+        print(f"[joint-dump] env 0 기록 시작: {len(actual_env._action_joint_names)}관절")
+
     for _step in range(args_cli.max_steps):
         with torch.no_grad():
             obs_norm = observation_preprocessor(obs)   # apply training-time normalization stats
@@ -368,6 +384,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Default: deterministic (use policy mean). Pass --stochastic to sample.
             if not args_cli.stochastic:
                 actions = outputs.get("mean_actions", actions)
+
+        # [zres-ablation] z_res=0 → residual_decode(latent, 0, ...) = 순수 SONIC 디코드.
+        if args_cli.zero_zres:
+            _nz = int(getattr(env_cfg, "sonic_action_dim", 0))
+            if _nz > 0:
+                actions = actions.clone()
+                actions[:, :_nz] = 0.0
 
         obs, rewards, terminated, truncated, _info = env.step(actions)
 
@@ -394,6 +417,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 ft_bufs[i].append(_fte[i].item())
                 r = rewards[i] if rewards.ndim == 1 else rewards[i, 0]
                 reward_sums[i] += float(r)
+
+        # [joint-dump] env 0 이 첫 에피소드를 도는 동안만.
+        if _jrec is not None and not episode_done[0]:
+            _jid = actual_env._action_joint_ids_t
+            _tg = getattr(actual_env, "_residual_target", None)
+            _jrec["target"].append((_tg[0] if _tg is not None
+                                    else actual_env.robot.data.joint_pos[0, _jid]).clone().cpu())
+            _jrec["qpos"].append(actual_env.robot.data.joint_pos[0, _jid].clone().cpu())
+            _jrec["qvel"].append(actual_env.robot.data.joint_vel[0, _jid].clone().cpu())
+            _jrec["tau"].append(actual_env.robot.data.applied_torque[0, _jid].clone().cpu())
+            _jrec["action"].append(actual_env._cur_policy_action[0].clone().cpu())
+            # [joint-dump] SONIC 디코더가 결과적으로 내는 29-D 몸통 액션. SONIC 관절 순서로
+            # 저장되므로 _sonic_gather 로 action-body 순서(= joint_names[:29])에 맞춥니다.
+            _as = getattr(actual_env, "_last_a_sonic", None)
+            if _as is not None:
+                _g = getattr(actual_env, "_sonic_gather", None)
+                _jrec["a_sonic"].append((_as[0, _g] if _g is not None else _as[0]).clone().cpu())
+            # [joint-dump] 넘어짐 판정용 루트 상태. rollout 은 termination=False 라 "완주"가
+            # 자세 정상을 뜻하지 않습니다 — 골반 높이와 기울기로 직접 봐야 합니다.
+            _jrec["root_pos"].append(actual_env.robot.data.root_pos_w[0].clone().cpu())
+            _jrec["root_quat"].append(actual_env.robot.data.root_quat_w[0].clone().cpu())
+            _rr = getattr(actual_env, "_ref_root_pos", None)
+            if _rr is not None:
+                _fi = int(actual_env._frame_idx[0].clamp(max=_rr.shape[0] - 1))
+                _jrec["ref_root_pos"].append(_rr[_fi].clone().cpu())
+            _jrec["frame"].append(int(actual_env._frame_idx[0]))
 
         # Update mass-policy cache for terminated envs.
         if _is_grasp:
@@ -422,6 +471,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
               obj_pos=_pad(obj_pos_bufs), obj_rot=_pad(obj_rot_bufs),
               kpts=_pad(kpts_bufs), ft=_pad(ft_bufs))
     print(f"[rollout] per-frame traces -> per_frame.npz  ({len(obj_pos_bufs)} x {_L})")
+
+    # ── [joint-dump] 관절 궤적 저장 ────────────────────────────────────────────────────────
+    if _jrec is not None and _jrec["qpos"]:
+        _jt = os.path.join(args_cli.output_dir, "joint_trace.npz")
+        _sv = dict(joint_names=_np.array(actual_env._action_joint_names),
+                   ctrl_lower=actual_env._ctrl_lower.cpu().numpy(),
+                   ctrl_upper=actual_env._ctrl_upper.cpu().numpy(),
+                   frame=_np.asarray(_jrec["frame"], dtype=_np.int64),
+                   control_fps=_np.asarray(round(1.0 / (env_cfg.sim.dt * env_cfg.decimation))),
+                   clip=_np.asarray(str(seq_name)))
+        for _k in ("target", "qpos", "qvel", "tau", "action", "root_pos", "root_quat"):
+            _sv[_k] = torch.stack(_jrec[_k]).numpy()
+        if _jrec["ref_root_pos"]:
+            _sv["ref_root_pos"] = torch.stack(_jrec["ref_root_pos"]).numpy()
+        # [joint-dump] SONIC 액션 + 그 액션을 관절 타겟으로 바꾸는 아핀 계수(같은 순서로 gather).
+        # 분석 쪽에서 (한계 - default)/scale 로 "관절 한계가 함의하는 액션 범위"를 계산합니다.
+        if _jrec["a_sonic"]:
+            _sv["a_sonic"] = torch.stack(_jrec["a_sonic"]).numpy()
+            _g = getattr(actual_env, "_sonic_gather", None)
+            if _g is not None:
+                _sv["sonic_default"] = actual_env._sonic_default[0, _g].cpu().numpy()
+                _sv["sonic_scale"] = actual_env._sonic_scale[0, _g].cpu().numpy()
+        _rj = getattr(actual_env, "_ref_joints", None)
+        if _rj is not None:
+            _sv["ref_joints"] = _rj.cpu().numpy()
+        _np.savez_compressed(_jt, **_sv)
+        print(f"[joint-dump] -> joint_trace.npz  스텝 {len(_jrec['qpos'])}  "
+              f"관절 {len(actual_env._action_joint_names)}")
 
     # ── Write metrics.csv ─────────────────────────────────────────────────────
     os.makedirs(args_cli.output_dir, exist_ok=True)

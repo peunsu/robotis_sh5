@@ -18,7 +18,7 @@
 #       evaluation_ep_le_<TIMESTEPS>/metrics.csv
 #
 # Aggregate CSVs are written to:
-#   data/processed/hocap/ffw_sh5_method{1,2,3}.csv
+#   data/processed/hocap/ffw_sh5/method{1,2,3}.csv
 #
 # Set FORCE=1 to re-run rollouts even when metrics.csv already exists.
 # =============================================================================
@@ -156,5 +156,5 @@ bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[eval] Done.  Results written to:"
-echo "       ${DATA_BASE}/ffw_sh5_method{1,2,3}.csv"
+echo "       ${DATA_BASE}/ffw_sh5/method{1,2,3}.csv"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

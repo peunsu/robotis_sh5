@@ -349,15 +349,17 @@ Results are stored per dataset so OakInk and HO-Cap outputs never collide. The
 source/robotis_sh5/data/processed/<dataset>/   # e.g. oakink/ or hocap/
 ├── mano/right/<trajectory_task>/<data_id>/    ← reference trajectories (source)
 ├── object_mass.json                           ← per-object mass ranges
-├── ffw_sh5/right/<trajectory_task>/<data_id>/         ← SINGLE-AGENT outputs
-│   ├── pretrain.pt              ← saved after pretrain
-│   ├── agent.pt                 ← saved after train
-│   ├── task_info.json           ← training metadata
-│   └── evaluation_ep_le_<N>/
-│       └── metrics.csv          ← N_ROLLOUTS rollout rows per sequence
-├── ffw_sh5_marl/right/<trajectory_task>/<data_id>/    ← MARL outputs (same structure)
-├── ffw_sh5_method{1,2,3}.csv          ← single-agent aggregates
-└── ffw_sh5_marl_method{1,2,3}.csv     ← MARL aggregates
+├── ffw_sh5/                                   ← SINGLE-AGENT outputs
+│   ├── method{1,2,3}.csv                      ← aggregates for this model
+│   └── right/<trajectory_task>/<data_id>/
+│       ├── pretrain.pt          ← saved after pretrain
+│       ├── agent.pt             ← saved after train
+│       ├── task_info.json       ← training metadata
+│       └── evaluation_ep_le_<N>/
+│           └── metrics.csv      ← N_ROLLOUTS rollout rows per sequence
+└── ffw_sh5_marl/                              ← MARL outputs (same structure)
+    ├── method{1,2,3}.csv
+    └── right/<trajectory_task>/<data_id>/
 ```
 
 `evaluate.bash` automatically iterates over every `ffw_sh5*/` subdirectory and produces
@@ -570,7 +572,9 @@ If rollouts are already done and you only want to recompute the CSV summaries:
 ```bash
 # Aggregate one dataset — picks up every ffw_sh5*/ subdir automatically.
 bash scripts/benchmark/evaluate.bash source/robotis_sh5/data/processed/oakink
-# → writes ffw_sh5_method{1,2,3}.csv and ffw_sh5_marl_method{1,2,3}.csv
+# → writes ffw_sh5/method{1,2,3}.csv and ffw_sh5_marl/method{1,2,3}.csv
+#   (aggregates land INSIDE each model dir; before 2026-08-14 they were flat in BASE_DIR
+#    as <model>_methodN.csv, which buried the run dirs once many runs accumulated)
 ```
 
 #### Evaluation metrics

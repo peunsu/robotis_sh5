@@ -11,10 +11,16 @@
 # Each model directory is expected to hold:
 #   <model>/right/<trajectory_task>/<data_id>/evaluation_*/metrics.csv
 #
-# Output files are written to BASE_DIR:
-#   <model>_method1.csv  — ManipTrans thresholds (all 4 metrics)
-#   <model>_method2.csv  — DexMachina thresholds (E_t < 10cm, E_r < 0.5 rad)
-#   <model>_method3.csv  — Mean over ALL rollouts regardless of success
+# Output files are written INSIDE each model directory (2026-08-14; they used to land
+# flat in BASE_DIR as <model>_methodN.csv, which buried the run directories under dozens
+# of loose CSVs once several runs accumulated):
+#   <model>/method1.csv  — ManipTrans thresholds (all 4 metrics)
+#   <model>/method2.csv  — DexMachina thresholds (E_t < 10cm, E_r < 0.5 rad)
+#   <model>/method3.csv  — Mean over ALL rollouts regardless of success
+#
+# Nothing in the repo READS these files (they are for humans), so the move is safe; the
+# only references were doc lines and the "results written to" echoes, updated with it.
+# Aggregates from earlier runs stay where they were — this only changes new writes.
 # =============================================================================
 
 BASE_DIR="${1:?Usage: $0 <BASE_DIR>}"
@@ -22,6 +28,29 @@ BASE_DIR="$(cd "${BASE_DIR}" && pwd)"
 
 python3 - "${BASE_DIR}" << 'PYEOF'
 import sys, os, csv, glob, math, statistics
+
+
+def _mean_finite(rows, col):
+    """유한한 값만으로 평균. (mean|None, n_used, n_skipped).
+
+    롤아웃 중 물리 발산으로 로봇 상태가 NaN 이 되면 그 스텝의 키포인트/손끝 오차가 nan 으로
+    기록되고, 에피소드 평균이 nan 이 되어 여기까지 올라온다 (물체 오차는 멀쩡한 채로).
+    nan 을 그대로 넘기면 statistics.stdev 가 'float object has no attribute numerator' 로
+    죽는다 — CPython 의 정확산술 경로가 비유한값에서 깨지면서 나는 불친절한 예외다.
+    """
+    vals = []
+    skipped = 0
+    for r in rows:
+        try:
+            v = float(r[col])
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if math.isfinite(v):
+            vals.append(v)
+        else:
+            skipped += 1
+    return (sum(vals) / len(vals) if vals else None), len(vals), skipped
 
 BASE_DIR = sys.argv[1]
 
@@ -73,10 +102,10 @@ def compute_sequences(model_dir, success_fn):
         seq_sr     = n_succ / n_total
 
         if n_succ > 0:
-            et  = sum(float(r["e_t_cm"])  for r in successful) / n_succ
-            er  = sum(float(r["e_r"])     for r in successful) / n_succ
-            ej  = sum(float(r["e_j_cm"])  for r in successful) / n_succ
-            eft = sum(float(r["e_ft_cm"]) for r in successful) / n_succ
+            et,  _, _ = _mean_finite(successful, "e_t_cm")
+            er,  _, _ = _mean_finite(successful, "e_r")
+            ej,  _, _ = _mean_finite(successful, "e_j_cm")
+            eft, _, _ = _mean_finite(successful, "e_ft_cm")
         else:
             et = er = ej = eft = None
 
@@ -118,10 +147,15 @@ def compute_sequences_all(model_dir):
         n_succ = sum(1 for r in rows if m1_success(r))
         seq_sr = n_succ / n_total
 
-        et  = sum(float(r["e_t_cm"])  for r in rows) / n_total
-        er  = sum(float(r["e_r"])     for r in rows) / n_total
-        ej  = sum(float(r["e_j_cm"])  for r in rows) / n_total
-        eft = sum(float(r["e_ft_cm"]) for r in rows) / n_total
+        et,  _,  s_et  = _mean_finite(rows, "e_t_cm")
+        er,  _,  s_er  = _mean_finite(rows, "e_r")
+        ej,  _,  s_ej  = _mean_finite(rows, "e_j_cm")
+        eft, _,  s_eft = _mean_finite(rows, "e_ft_cm")
+        _sk = max(s_et, s_er, s_ej, s_eft)
+        if _sk:
+            print(f"[warn] {task}: 비유한(nan/inf) 롤아웃 {_sk}/{n_total} 건을 평균에서 제외 "
+                  f"(성공률은 전체 {n_total} 건 기준 그대로). 롤아웃 중 물리 발산 의심.",
+                  file=sys.stderr)
 
         results.append({
             "task":     task,
@@ -144,7 +178,9 @@ def write_result_csv(rows, out_path, et_thr, er_thr, ej_thr, eft_thr):
     if n == 0:
         return
 
-    valid   = [r for r in rows if r["et_cm"] is not None]
+    valid   = [r for r in rows
+               if all(r[k] is not None and math.isfinite(r[k])
+                      for k in ("et_cm", "er_deg", "ej_cm", "eft_cm"))]
     n_valid = len(valid)
 
     if n_valid > 0:
@@ -225,9 +261,11 @@ for model in MODELS:
     rows_m2 = compute_sequences(model_dir, m2_success)
     rows_m3 = compute_sequences_all(model_dir)
 
-    out_m1 = os.path.join(BASE_DIR, f"{model}_method1.csv")
-    out_m2 = os.path.join(BASE_DIR, f"{model}_method2.csv")
-    out_m3 = os.path.join(BASE_DIR, f"{model}_method3.csv")
+    # 결과는 모델(런) 디렉터리 안에 씁니다. 이름에 모델명을 다시 붙이지 않는 이유: 폴더가 이미
+    # 신원을 갖고 있고, 셋이 method1/2/3로 나란히 정렬돼 눈으로 훑기 좋기 때문입니다.
+    out_m1 = os.path.join(model_dir, "method1.csv")
+    out_m2 = os.path.join(model_dir, "method2.csv")
+    out_m3 = os.path.join(model_dir, "method3.csv")
 
     sr_m1 = statistics.mean(r["success"] for r in rows_m1) * 100 if rows_m1 else 0.0
     sr_m2 = statistics.mean(r["success"] for r in rows_m2) * 100 if rows_m2 else 0.0

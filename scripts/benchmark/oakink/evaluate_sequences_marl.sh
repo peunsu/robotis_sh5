@@ -7,7 +7,7 @@
 #   2. Runs rollout_marl.py to produce metrics.csv.
 #   3. After all rollouts, calls evaluate.bash on <DATA_BASE> to produce per-method
 #      CSVs. Both `ffw_sh5` (single-agent) and `ffw_sh5_marl` are picked up
-#      automatically and aggregated into separate `<model>_method{1,2,3}.csv` files.
+#      automatically and aggregated into separate `<model>/method{1,2,3}.csv` files.
 #
 # Set FORCE=1 to re-run rollouts even when metrics.csv already exists.
 # =============================================================================
@@ -148,6 +148,6 @@ bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[eval-marl] Done.  Results written to:"
-echo "            ${DATA_BASE}/ffw_sh5_marl_method{1,2,3}.csv"
-echo "            (alongside ${DATA_BASE}/ffw_sh5_method{1,2,3}.csv if present)"
+echo "            ${DATA_BASE}/ffw_sh5_marl/method{1,2,3}.csv"
+echo "            (alongside ${DATA_BASE}/ffw_sh5/method{1,2,3}.csv if present)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

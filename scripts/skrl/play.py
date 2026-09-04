@@ -299,8 +299,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         print(f"[INFO] Checkpoint load issue ({err[:120]}); loading model weights only.")
         _load_partial_checkpoint(runner.agent, resume_path)
 
-    # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    # set agent to evaluation mode.
+    # skrl 2.1.0 replaced `set_running_mode("eval")` with `enable_training_mode(False)`; keep both
+    # so this script works against either version.
+    if hasattr(runner.agent, "set_running_mode"):
+        runner.agent.set_running_mode("eval")
+    else:
+        runner.agent.enable_training_mode(False, apply_to_models=True)
 
     # reset environment
     obs, _ = env.reset()

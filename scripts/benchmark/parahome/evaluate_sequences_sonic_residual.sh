@@ -20,7 +20,7 @@
 #   data/processed/parahome/g1_shadow_sonic_residual/<clip_class>/<clip_name>/0/
 #       agent.pt / pretrain.pt
 #       evaluation_ep_le_<TIMESTEPS>/metrics.csv
-# Aggregates → data/processed/parahome/g1_shadow_sonic_residual_method{1,2,3}.csv
+# Aggregates → data/processed/parahome/g1_shadow_sonic_residual/method{1,2,3}.csv
 #
 # Which clips run: edit CLIPS=(...) (comment lines to filter) or CLIPS_OVERRIDE="a b c".
 # Keep in sync with train_sequences_sonic_residual.sh.
@@ -73,6 +73,7 @@ CLIPS=(
     "s101_seg12_knife"
     "s101_seg29_pot"
     "s101_seg30_bowl"
+    "s207_seg06_kettle"
     "s66_seg26_pan"
     "s55_seg31_knife"
     "s73_seg31_pot"
@@ -174,5 +175,5 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "[eval-sonic] Aggregating metrics under ${DATA_BASE} ..."
 bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
-echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_sonic_residual_method{1,2,3}.csv"
+echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_sonic_residual/method{1,2,3}.csv"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

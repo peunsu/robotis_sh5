@@ -17,7 +17,7 @@
 #   data/processed/parahome/g1_shadow_locomanip/<clip_class>/<clip_name>/0/
 #       agent.pt / pretrain.pt
 #       evaluation_ep_le_<TIMESTEPS>/metrics.csv
-# Aggregates → data/processed/parahome/g1_shadow_locomanip_method{1,2,3}.csv
+# Aggregates → data/processed/parahome/g1_shadow_locomanip/method{1,2,3}.csv
 #
 # Which clips run: edit the CLIPS=(...) array below (comment lines out to filter, like the hocap
 # scripts), or override with CLIPS_OVERRIDE="clipA clipB". Keep in sync with train_sequences.sh.
@@ -99,5 +99,5 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "[eval-g1] Aggregating metrics under ${DATA_BASE} ..."
 bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
-echo "[eval-g1] Done.  → ${DATA_BASE}/g1_shadow_locomanip_method{1,2,3}.csv"
+echo "[eval-g1] Done.  → ${DATA_BASE}/g1_shadow_locomanip/method{1,2,3}.csv"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

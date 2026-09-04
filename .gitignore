@@ -2,6 +2,7 @@ source/robotis_sh5/data/processed
 source/robotis_sh5/data/raw
 source/robotis_sh5/data/robots
 **/.claude
+**/*.bak
 mano_v1_2/
 models_smplx_v1_1/
 

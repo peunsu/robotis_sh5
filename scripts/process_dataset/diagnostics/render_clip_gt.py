@@ -117,7 +117,11 @@ def look_at(eye, target, up=(0, 0, 1)) -> np.ndarray:
 
 
 def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
-                yaw: float, elev: float, zoom: float) -> str:
+                yaw: float, elev: float, zoom: float,
+                eye_override=None, lookat_override=None,
+                env_context: bool = False, ctx_radius: float = 1.0,
+                ctx_support_radius: float = 1.5,
+                follow_obj: bool = False, cam_dist: float = 0.9) -> str:
     import pyrender
     import trimesh
     import imageio.v2 as imageio
@@ -135,6 +139,21 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
 
     act_keys = [k for k in d.files if k.startswith("obj__") and k.endswith("__base")]
     ctx_keys = [k for k in d.files if k.startswith("ctx__") and k.endswith("__base")]
+    # [env-ctx] --env_context 면 env 가 실제로 스폰하는 것만 남깁니다 (g1_shadow_sonic_residual_env.py
+    # _ctx_spawn 과 같은 규칙): 활성 물체의 궤적에서 context_radius 안에 있는 것 + 그 아래에 있는
+    # 지지물 하나. 롤아웃 영상과 장면을 맞출 때 씁니다. 기본은 종전대로 전부 그립니다.
+    if env_context and act_keys:
+        _act = np.asarray(d[act_keys[0]], float)
+        _axy, _a0 = _act[:, :2], _act[0]
+        _c = [(k, np.asarray(d[k][0], float),
+               float(np.linalg.norm(_axy - np.asarray(d[k][0], float)[None, :2], axis=1).min()))
+              for k in ctx_keys]
+        _keep = {k for k, p0, dm in _c if dm < ctx_radius}
+        _below = [(float(np.linalg.norm(_a0[:2] - p0[:2])), k) for k, p0, dm in _c
+                  if p0[2] < _a0[2] and float(np.linalg.norm(_a0[:2] - p0[:2])) < ctx_support_radius]
+        if _below:
+            _keep.add(min(_below)[1])
+        ctx_keys = [k for k in ctx_keys if k in _keep]
     F = len(d["smplx_body_pose"])
     print(f"  frames={F} gender={gender} active={[k.split('__')[1] for k in act_keys]} "
           f"context={len(ctx_keys)}")
@@ -195,13 +214,40 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
         yaw = float(np.degrees(np.arctan2(v[1], v[0]))) if np.linalg.norm(v) > 1e-3 else 45.0
         print(f"  auto yaw={yaw:.1f} deg (camera placed on the object's side of the body)")
     az, el = np.radians(yaw), np.radians(elev)
-    eye = centre + np.array([dist * np.cos(az) * np.cos(el),
-                             dist * np.sin(az) * np.cos(el),
-                             dist * np.sin(el)])
+    _cam_dir = np.array([np.cos(az) * np.cos(el), np.sin(az) * np.cos(el), np.sin(el)])
+    eye = centre + dist * _cam_dir
+    # [rollout-cam] 롤아웃 영상과 동일한 시점을 쓰려면 eval 디렉터리의 viewer_*.json 에 저장된
+    # eye_env_local / lookat_env_local 을 그대로 넣습니다 (env 가 궤적 통계로 한 번 계산한 값).
+    if eye_override is not None:
+        eye = np.asarray(eye_override, float)
+    if lookat_override is not None:
+        centre = np.asarray(lookat_override, float)
+    # [ROLLBACK MARKER: follow-obj] --follow_obj 면 매 프레임 물체+손끝 중점을 주시하며 cam_dist
+    # 거리에서 따라갑니다. 물체가 크게 이동하는 클립(예: s207_seg06_kettle 2.05 m)에서 고정 시점으로
+    # 확대하면 프레임을 벗어나므로, 확대 관찰에는 추종이 필요합니다. 방향(yaw/elev)은 고정입니다.
+    _fw_tg = None
+    if follow_obj:
+        _tg = []
+        for _f in range(F):
+            _p = []
+            if act_keys:
+                _p.append(np.mean([np.asarray(d[k][_f][:3], float) for k in act_keys], axis=0))
+            if "fingertip_pad_pos" in d:
+                _p.append(np.asarray(d["fingertip_pad_pos"][_f], float).mean(axis=0))
+            _tg.append(np.mean(_p, axis=0) if _p else centre)
+        _tg = np.stack(_tg)
+        _k = 9                                   # 이동평균으로 손끝 떨림 억제
+        _pad = np.pad(_tg, ((_k // 2, _k // 2), (0, 0)), mode="edge")
+        _fw_tg = np.stack([_pad[i:i + _k].mean(axis=0) for i in range(F)])
+        eye, centre = _fw_tg[0] + cam_dist * _cam_dir, _fw_tg[0]
+        print(f"  follow_obj: 주시점 이동 {np.linalg.norm(_fw_tg[-1] - _fw_tg[0]):.2f} m, "
+              f"카메라 거리 {cam_dist:.2f} m")
+
     cam_pose = look_at(eye, centre)
-    scene.add(pyrender.PerspectiveCamera(yfov=np.radians(45.0), znear=0.05, zfar=100.0),
-              pose=cam_pose)
-    scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0), pose=cam_pose)
+    _cam_node = scene.add(pyrender.PerspectiveCamera(yfov=np.radians(45.0), znear=0.05, zfar=100.0),
+                          pose=cam_pose)
+    _key_node = scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0),
+                          pose=cam_pose)
     scene.add(pyrender.DirectionalLight(color=[0.85, 0.88, 1.0], intensity=1.6),
               pose=look_at(centre + np.array([-dist, dist * 0.4, dist * 0.8]), centre))
 
@@ -217,6 +263,10 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
                     baseColorFactor=C_BODY, metallicFactor=0.0, roughnessFactor=0.9), smooth=True)
             for k, node in act_nodes:
                 scene.set_pose(node, pose_to_T(np.asarray(d[k][f], float)))
+            if _fw_tg is not None:                                  # [follow-obj]
+                _T = look_at(_fw_tg[f] + cam_dist * _cam_dir, _fw_tg[f])
+                scene.set_pose(_cam_node, _T)
+                scene.set_pose(_key_node, _T)
             color, _ = r.render(scene)
             w.append_data(np.asarray(color)[..., :3])
             if (f + 1) % 50 == 0:
@@ -238,6 +288,16 @@ def main() -> int:
                     help="camera azimuth (deg); default = auto, placed on the object's side of the body")
     ap.add_argument("--elev", type=float, default=22.0, help="camera elevation (deg)")
     ap.add_argument("--zoom", type=float, default=1.0, help="<1 = closer")
+    ap.add_argument("--eye", type=float, nargs=3, default=None, help="카메라 위치 직접 지정 (롤아웃과 맞출 때)")
+    ap.add_argument("--lookat", type=float, nargs=3, default=None, help="주시점 직접 지정")
+    ap.add_argument("--follow_obj", action="store_true",
+                    help="[follow-obj] 매 프레임 물체+손끝 중점을 추종 (확대 관찰용)")
+    ap.add_argument("--cam_dist", type=float, default=0.9,
+                    help="--follow_obj 일 때 주시점까지의 거리 (m). 작을수록 확대")
+    ap.add_argument("--env_context", action="store_true",
+                    help="env 가 실제로 스폰하는 context 물체만 (롤아웃 장면과 일치)")
+    ap.add_argument("--ctx_radius", type=float, default=1.0)
+    ap.add_argument("--ctx_support_radius", type=float, default=1.5)
     a = ap.parse_args()
 
     clips = a.clip
@@ -253,7 +313,9 @@ def main() -> int:
         print(f"[{i}/{len(clips)}] {a.klass}/{c}")
         try:
             out = Path(a.out) if (a.out and len(clips) == 1) else None
-            p = render_clip(c, a.klass, out, (W, H), a.fps, a.yaw, a.elev, a.zoom)
+            p = render_clip(c, a.klass, out, (W, H), a.fps, a.yaw, a.elev, a.zoom, a.eye, a.lookat,
+                            a.env_context, a.ctx_radius, a.ctx_support_radius,
+                            a.follow_obj, a.cam_dist)
             print(f"  -> {p}")
             n_ok += 1
         except Exception as exc:                       # noqa: BLE001

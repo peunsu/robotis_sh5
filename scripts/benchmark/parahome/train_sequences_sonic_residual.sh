@@ -75,10 +75,11 @@ VIDEO_INTERVAL="${VIDEO_INTERVAL:-2000}"
 #                              so a per-object result is not one person's habit.
 # The first clip of each object is the one that was already here; the other two are new.
 CLIPS=(
-    "s101_seg12_knife"
     "s100_seg00_pan"
+    # "s101_seg12_knife"
     "s101_seg29_pot"
     "s101_seg30_bowl"
+    "s207_seg06_kettle"
     "s66_seg26_pan"
     "s55_seg31_knife"
     "s73_seg31_pot"

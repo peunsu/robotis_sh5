@@ -395,6 +395,7 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
         a.memory.set_tensor_by_name("advantages", advantages)
 
         cumulative_policy_loss = 0
+        _rm = []          # [failure-sigma] V1: 첫 에포크의 PPO 비율 중앙값
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         # [DUAL-CLIP] diagnostics, accumulated over every mini-batch of the update. Kept as DEVICE
@@ -451,6 +452,12 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
                     # compute policy loss
                     ratio = torch.exp(next_log_prob - sampled_log_prob)
+                    # [ROLLBACK MARKER: failure-sigma] V1 검증. 롤아웃과 업데이트에 같은 beta 가
+                    # 적용되면 첫 에포크의 비율은 1 에서 시작합니다. 어긋나면 여기가 즉시 드러납니다
+                    # (beta=1.5, 36차원이면 3.7e-4 까지 떨어져 전부 클립됩니다).
+                    if epoch == 0:
+                        with torch.no_grad():
+                            _rm.append(float(ratio.median()))
                     surrogate = sampled_advantages * ratio
                     surrogate_clipped = sampled_advantages * torch.clip(
                         ratio, 1.0 - a.cfg.ratio_clip, 1.0 + a.cfg.ratio_clip
@@ -521,6 +528,8 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
         # record data
         _n = a.cfg.learning_epochs * a.cfg.mini_batches
+        if _rm:
+            a.track_data("Diag / ppo_ratio_med", sum(_rm) / len(_rm))
         a.track_data("Loss / Policy loss", cumulative_policy_loss / _n)
         a.track_data("Loss / Value loss", cumulative_value_loss / _n)
         if a.cfg.entropy_loss_scale:
@@ -782,6 +791,75 @@ def _patch_analytic_kl(agent) -> None:
     sched.step = _step_analytic_kl
     print("[analytic-kl] scheduler now driven by the closed-form Gaussian KL "
           "(rl_games convention); skrl's k3 value is logged as 'Diag / kl_k3'.")
+
+
+def _patch_failure_sigma(agent, n_action: int, dims: str) -> None:
+    """[ROLLBACK MARKER: failure-sigma] 실패 구간에서 sampling sigma 를 beta 배로 키웁니다.
+
+    env 가 관측 마지막 열에 beta 를 실어 보냅니다. 여기서 두 가지를 합니다.
+
+      1. 관측 전처리기를 감싸 beta 열은 정규화하지 않고 통과시킵니다.
+         RunningStandardScaler 에 넣으면 학습 초기 beta 가 상수 1.0 이라 분산이 0 으로 수렴하고,
+         정규화/역정규화가 0 으로 나누는 꼴이 되어 터집니다.
+
+      2. 정책의 compute 를 감싸 beta 를 log_std 에 더합니다 (log_std += log beta).
+         신경망에는 beta 를 뺀 앞부분만 넣으므로 mu 는 beta 를 보지 않습니다 — 탐색 폭만 바뀌고
+         행동 자체는 안 바뀝니다.
+
+    PPO 는 건드리지 않습니다. GaussianMixin.act 가 이 log_std 로 분포를 만들고 같은 분포로
+    log_prob / 엔트로피를 계산하며, 업데이트 때도 저장된 관측에서 같은 beta 가 나오므로 비율이
+    1 에서 시작합니다. (검증: Diag / ppo_ratio_med 가 첫 업데이트에서 1.00 ± 0.01)
+    """
+    import torch as _t
+
+    policy = agent.models["policy"]
+
+    # ── 1. 전처리기: 마지막 열(beta)은 통과 ────────────────────────────────────
+    _pre = agent._observation_preprocessor
+
+    def _pre_keep_last(x, train=False, **kw):
+        # 스케일러는 관측 전체 폭(767)으로 만들어져 있으므로 통째로 통과시킨 뒤 beta 열만 원본으로
+        # 되돌립니다. 열을 잘라 넣으면 폭이 안 맞아 터집니다. beta 쪽 running stat 은 갱신되지만
+        # 그 정규화 값을 쓰지 않으므로 무해합니다.
+        out = _pre(x, train=train, **kw)
+        return _t.cat([out[..., :-1], x[..., -1:]], dim=-1)
+
+    agent._observation_preprocessor = _pre_keep_last
+
+    # ── 2. 정책: log_std 에 log(beta) ─────────────────────────────────────────
+    # 인스턴스가 아니라 CLASS 에 붙입니다. 인스턴스에 붙이면 _patch_analytic_kl 의
+    # copy.deepcopy(agent.policy) 스냅샷이 그 클로저를 그대로 복사하는데, 클로저가 원본 정책의
+    # 바운드 메서드를 잡고 있어서 스냅샷이 원본 가중치로 계산합니다. 그러면 mu_old == mu_new 가 되어
+    # KL 이 항상 정확히 0 → KL 적응형 학습률이 무한정 올라가 정책이 발산합니다
+    # (실측: 보상 0.000, logratio_max -7588). 클래스에 붙이면 self 가 호출 시점에 풀리므로
+    # 스냅샷은 스냅샷의 가중치로 계산합니다.
+    # "hand" 면 뒤쪽 36차원(양손)만, "all" 이면 100차원 전체
+    _lo = 0 if dims == "all" else n_action - 36
+    _cls = type(policy)
+    _orig = _cls.compute
+
+    def _compute_beta(self, inputs, role=""):
+        obs = inputs.get("observations", None)
+        if obs is None or obs.shape[-1] < 2:
+            return _orig(self, inputs, role)
+        beta = obs[..., -1:].clamp(min=1e-6)
+        # 열을 잘라내면 안 됩니다 — 자동 생성된 compute 가 관측을 원래 폭으로 unflatten 하므로
+        # 폭이 바뀌면 터집니다. 상수 0 으로 덮어써서 mu 쪽 신경망이 beta 를 못 보게 합니다.
+        obs_masked = obs.clone()
+        obs_masked[..., -1] = 0.0
+        mean_actions, outputs = _orig(self, {**inputs, "observations": obs_masked}, role)
+        ls = outputs["log_std"]
+        if ls.dim() == 1:                       # 상태 비의존 파라미터 → 배치로 확장
+            ls = ls.unsqueeze(0).expand(beta.shape[0], -1).clone()
+        else:
+            ls = ls.clone()
+        ls[..., _lo:] = ls[..., _lo:] + beta.log()
+        outputs["log_std"] = ls
+        return mean_actions, outputs
+
+    _cls.compute = _compute_beta
+    print(f"[failure-sigma] 정책 패치 완료 — log_std[{_lo}:{n_action}] += log(beta), "
+          f"전처리기는 beta 열을 통과시킵니다.")
 
 
 def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
@@ -1200,6 +1278,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if _is_grasp_train:
         _patch_mass_policy(runner.agent, agent_cfg["models"]["policy"], agent_cfg["agent"]["learning_rate"])
         _patch_entropy_flip(runner.agent, env, agent_cfg["agent"]["entropy_loss_scale"])
+
+    # [ROLLBACK MARKER: failure-sigma] env 가 켰을 때만. 관측 마지막 열(beta)로 sampling sigma 조절.
+    if _is_g1_train and bool(getattr(env_cfg, "failure_sigma", False)):
+        _patch_failure_sigma(runner.agent, int(env_cfg.action_space),
+                             str(getattr(env_cfg, "failure_sigma_dims", "all")))
 
     # Manual env-info → Tensorboard (applies to BOTH train and pretrain — trainer's
     # auto-prefix "Info / " is disabled in main(), so this is the sole logging path

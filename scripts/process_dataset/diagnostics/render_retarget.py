@@ -24,6 +24,10 @@ parser.add_argument("--cam_yaw", type=float, default=45.0, help="camera azimuth 
 parser.add_argument("--cam_elev", type=float, default=None, help="camera elevation (deg); default derives from vertical extent")
 parser.add_argument("--cam_dist_scale", type=float, default=1.0, help="pull-back multiplier (>1 = further)")
 parser.add_argument("--look_obj", action="store_true", help="aim at the object centroid (where the hands work) instead of the root")
+parser.add_argument("--lookat_z", type=float, default=None, help="override the look-at height (m); default = body vertical centre")
+parser.add_argument("--cam_min_dist", type=float, default=1.5, help="floor on the pull-back distance before cam_dist_scale")
+parser.add_argument("--kpt_radius", type=float, default=0.018, help="human-keypoint marker sphere radius (m)")
+parser.add_argument("--follow_obj", action="store_true", help="move the camera every frame to keep the object (hands) centred — lets you zoom much tighter than a static mean-position camera")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -97,7 +101,20 @@ def main():
 
     # action-joint name → articulation joint index
     jn = robot.joint_names
-    aid = torch.tensor([jn.index(n) for n in act_names], dtype=torch.long, device=sim.device)
+    # [ROLLBACK MARKER: tendon-ineq] npz 가 자기 joint_names 를 들고 있으면 그걸 따릅니다.
+    # 부등식 리타게팅은 J0 8개를 자유 변수로 풀어 65 → 73 열로 저장하므로, 고정 65 목록으로
+    # 매핑하면 폭이 안 맞고 풀린 J0 도 버려집니다. 이름 기반이면 두 경우 모두 처리됩니다.
+    try:
+        _npz_names = [str(x) for x in rt["joint_names"]] if "joint_names" in rt.files else None
+    except ValueError:                       # object 배열 → allow_pickle 필요
+        _npz_names = [str(x) for x in np.load(os.path.join(
+            _PROC, "g1_shadow", args.cls, args.clip, "0", _rt_name),
+            allow_pickle=True)["joint_names"]]
+    _use = _npz_names if (_npz_names and len(_npz_names) == jpos.shape[1]) else act_names
+    if _use is not act_names:
+        print(f"[render] npz joint_names 사용 ({len(_use)}개, J0 "
+              f"{sum(1 for n in _use if n.endswith('J0') and 'TH' not in n)}개 포함)")
+    aid = torch.tensor([jn.index(n) for n in _use], dtype=torch.long, device=sim.device)
     default_q = robot.data.default_joint_pos.clone()
 
     # keypoint overlay: GREEN = human reference (54). Robot pose is shown by its mesh (no cyan → no
@@ -105,7 +122,7 @@ def main():
     m_human = None
     if not args.no_kpts:
         m_human = VisualizationMarkers(VisualizationMarkersCfg(prim_path="/Visuals/human", markers={
-            "s": sim_utils.SphereCfg(radius=0.018,
+            "s": sim_utils.SphereCfg(radius=float(args.kpt_radius),
                                      visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)))}))
         human_k = torch.from_numpy(jp_kp[:, ref_idx, :]).to(sim.device)   # (F,54,3) world
 
@@ -122,7 +139,7 @@ def main():
     z_bot = 0.0
     extent = z_top - z_bot
     lookat_z = 0.5 * (z_top + z_bot)
-    off = max(1.5, extent * 1.25) * args.cam_dist_scale          # pull back to fit the vertical extent
+    off = max(args.cam_min_dist, extent * 1.25) * args.cam_dist_scale   # pull back to fit the vertical extent
     horiz = off * (2 ** 0.5)                                     # horizontal cam distance (yaw=45 → default +X+Y)
     az = math.radians(args.cam_yaw)
     zoff = (0.12 * extent) if args.cam_elev is None else horiz * math.tan(math.radians(args.cam_elev))
@@ -130,6 +147,9 @@ def main():
     txy = obj_base[:, :2].mean(0).astype(np.float32) if (args.look_obj and obj_base is not None) else c[:2]
     eye = torch.tensor([[float(txy[0]) + horiz * math.cos(az), float(txy[1]) + horiz * math.sin(az),
                          lookat_z + zoff]], device=sim.device, dtype=torch.float32)
+    if args.lookat_z is not None:                      # 손 클로즈업: 시선 높이를 직접 지정
+        lookat_z = float(args.lookat_z)
+        eye[0, 2] = lookat_z + zoff
     tgt = torch.tensor([[float(txy[0]), float(txy[1]), lookat_z]], device=sim.device, dtype=torch.float32)
     cam.set_world_poses_from_view(eye, tgt)
 
@@ -151,6 +171,17 @@ def main():
             obj.write_data_to_sim()
         if m_human is not None:
             m_human.visualize(translations=human_k[f])                   # GREEN human keypoints
+        if args.follow_obj and obj_base is not None:
+            # 정적 평균 위치 카메라로는 타이트한 클로즈업에서 손이 프레임을 벗어난다.
+            # 프레임별 물체 위치를 시선 중심으로 잡아 따라간다 (거리/방위/고도는 그대로).
+            _t = obj_base[f, :3].astype(np.float32)
+            _lz = float(args.lookat_z) if args.lookat_z is not None else float(_t[2])
+            _e = torch.tensor([[float(_t[0]) + horiz * math.cos(az),
+                                float(_t[1]) + horiz * math.sin(az), _lz + zoff]],
+                              device=sim.device, dtype=torch.float32)
+            _g = torch.tensor([[float(_t[0]), float(_t[1]), _lz]],
+                              device=sim.device, dtype=torch.float32)
+            cam.set_world_poses_from_view(_e, _g)
         sim.render()
         cam.update(dt)
         if f % 30 == 0:
