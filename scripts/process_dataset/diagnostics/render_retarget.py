@@ -19,6 +19,7 @@ parser.add_argument("--fps", type=int, default=30)
 parser.add_argument("--out", default="")
 parser.add_argument("--variant", default="", help="'' → trajectory.npz (pink); 'pyroki' → trajectory_pyroki.npz")
 parser.add_argument("--retarget-file", default="", help="explicit npz name under the clip dir (overrides --variant)")
+parser.add_argument("--no_ctx", action="store_true", help="맥락 물체(ctx__*)를 그리지 않음")
 parser.add_argument("--no-kpts", action="store_true", help="disable the human(green)/robot(cyan) keypoint overlay")
 parser.add_argument("--cam_yaw", type=float, default=45.0, help="camera azimuth around the look target (deg; 45 = default +X+Y)")
 parser.add_argument("--cam_elev", type=float, default=None, help="camera elevation (deg); default derives from vertical extent")
@@ -61,12 +62,47 @@ def main():
     base_keys = [k for k in sm.files if k.startswith("obj__") and k.endswith("__base")]
     obj_name = base_keys[0].split("__")[1] if base_keys else ""
     obj_base = sm[f"obj__{obj_name}__base"].astype(np.float32) if obj_name else None
-    # human reference keypoints (14 body + 40 hand) for the GREEN overlay
-    jp_kp = sm["joint_positions"].astype(np.float32) if not args.no_kpts else None
+    # [ctx-render 2026-09-04] 맥락 물체(ctx__*__base): env 가 kinematic 으로 스폰하는 고정 장면
+    # 물체들. 리타게팅 문제에는 들어가지 않으므로(scene_collision 제거) 손이 통과할 수 있는데,
+    # 렌더링에 없으면 그게 보이지 않습니다. --no_ctx 로 끕니다.
+    # env(g1_shadow_sonic_residual_env.py:247-269)의 선별 규칙과 동일합니다:
+    #   1) 각 ctx 물체의 프레임-0 중심이 조작 물체의 SWEPT xy 경로에서 context_radius(1.0 m) 안
+    #   2) 조작 물체보다 아래에 있고 context_support_radius(1.5 m) 안인 가장 가까운 것 하나는 항상 포함
+    #      (식탁/카운터처럼 바닥면이 넓으면 중심이 1.0 m 밖으로 나갈 수 있어 지지면 안전망)
+    #   정적이므로 프레임-0 자세만 씁니다.
+    _CTX_R, _CTX_SUP_R = 1.0, 1.5
+    ctx_items = []
+    if not args.no_ctx and obj_base is not None:
+        _act_xy = obj_base[:, :2]                                        # (F,2) 조작 물체 경로
+        _act0 = obj_base[0]
+        _cands = []
+        for k in (kk for kk in sm.files if kk.startswith("ctx__") and kk.endswith("__base")):
+            _p0 = sm[k][0].astype(np.float32)
+            _dmin = float(np.linalg.norm(_act_xy - _p0[None, :2], axis=1).min())
+            _cands.append((k.split("__")[1], _p0, _dmin))
+        _keep = {n for n, p, dm in _cands if dm < _CTX_R}
+        _below = [(float(np.linalg.norm(_act0[:2] - p[:2])), n) for n, p, dm in _cands
+                  if p[2] < _act0[2] and float(np.linalg.norm(_act0[:2] - p[:2])) < _CTX_SUP_R]
+        if _below:
+            _keep.add(min(_below)[1])
+        ctx_items = [(n, p[None, :]) for n, p, dm in _cands if n in _keep]
+        print(f"[render] ctx 선별 {len(ctx_items)}/{len(_cands)}개 (radius {_CTX_R} m): "
+              f"{sorted(n for n, _ in ctx_items)}")
+    # [ctx-render] GREEN 오버레이를 SMPL-X 로 전환. 예전에는 sm["joint_positions"](ParaHome 73관절,
+    # 손 오프셋 23/48)을 썼는데 리타게팅이 SMPL-X 를 목표로 하므로 다른 데이터를 그리고 있었습니다.
+    # env(g1_shadow_sonic_residual_env.py)의 적재 로직과 같은 구성입니다.
+    jp_kp = None
+    if not args.no_kpts:
+        jp_kp = np.concatenate([sm["smplx_joints"].astype(np.float32),
+                                sm["fingertip_pad_pos"].astype(np.float32)], axis=1)   # (F,65,3)
+    _PAD_BASE = 55
     ref_idx = list(BODY_KPTS.keys())
-    for _off in (23, 48):
+    for _s, (_hb, _wr, _pb) in enumerate(((25, 20, _PAD_BASE), (40, 21, _PAD_BASE + 5))):
         for _spec in HAND_CHAIN.values():
-            ref_idx += [_off + p for p in _spec["parahome"]]
+            for _p in _spec["parahome"]:
+                if _p >= 0:      ref_idx.append(_hb + _p)
+                elif _p == -10:  ref_idx.append(_wr)
+                else:            ref_idx.append(_pb + (-_p - 1))
     import json
     order = json.load(open("/home/peunsu/workspace/robotis_sh5/source/robotis_sh5/data/robots/G1/g1_shadow_joint_order.json"))
     act_names = order["action_joint_names"]
@@ -92,6 +128,32 @@ def main():
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=tuple(float(v) for v in obj_base[0, :3]),
                     rot=tuple(float(v) for v in obj_base[0, 3:7]))))
+
+    # [ctx-render] 맥락 물체는 정적 프림으로 스폰합니다 (env 와 동일: 프레임-0 자세 고정).
+    # USD 경로 우선순위도 env(g1_shadow_sonic_residual_env.py:612-615)와 같습니다 —
+    #   ctx/<name>_ctx.usd  →  <name>_ctx.usd  →  <name>.usd
+    # 관절형 가구(sink/refrigerator/microwave/gasstove/washingmachine)는 <name>.usd 가 살아 있는
+    # articulation 이라 정적 충돌용 _ctx.usd 가 따로 만들어져 있습니다. 그것만 찾으면 스폰됩니다.
+    _ctx_n = 0
+    for _i, (_cn, _cb) in enumerate(ctx_items):
+        _b = os.path.join(_PROC, "assets", "objects", _cn)
+        _usd = os.path.join(_b, "ctx", f"{_cn}_ctx.usd")
+        if not os.path.exists(_usd):
+            _usd = os.path.join(_b, f"{_cn}_ctx.usd")
+        if not os.path.exists(_usd):
+            _usd = os.path.join(_b, f"{_cn}.usd")
+        if not os.path.exists(_usd):
+            print(f"[render] ctx 물체 USD 없음, 건너뜀: {_cn}")
+            continue
+        _cfg = sim_utils.UsdFileCfg(
+            usd_path=_usd, activate_contact_sensors=False,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True))
+        _cfg.func(f"/World/Ctx_{_i}_{_cn}", _cfg,
+                  translation=tuple(float(v) for v in _cb[0, :3]),
+                  orientation=tuple(float(v) for v in _cb[0, 3:7]))
+        _ctx_n += 1
+    if ctx_items:
+        print(f"[render] ctx 물체 {_ctx_n}/{len(ctx_items)}개 스폰")
 
     cam = Camera(CameraCfg(
         prim_path="/World/Camera", height=H, width=W, data_types=["rgb"],

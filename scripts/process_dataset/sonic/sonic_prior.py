@@ -36,24 +36,64 @@ PROPRIO_HIST = 10
 PROPRIO_PER_FRAME = 93  # base_ang_vel3 + joint_pos_rel29 + joint_vel_rel29 + last_action29 + gravity3
 ACTOR_OBS_DIM = PROPRIO_HIST * PROPRIO_PER_FRAME  # 930
 
-# ---- tokenizer 12-term dims (VERIFIED: build_test.py passed strict=True load with these) ----
-# NOTE: the 9 non-smpl terms are zero-filled at runtime; their exact dims only need to be
-# self-consistent (the encoder-input Linear shapes that strict-load checks are satisfied).
-TOK_DIMS = {
+# ---- tokenizer 관측 항 차원 (VERIFIED: build_test.py 가 strict=True 로드를 통과한 값) ----
+# NOTE: smpl 이 아닌 항들은 런타임에 0으로 채워지므로, 폭은 인코더 입력 Linear 형상과
+# 자기일관적이기만 하면 됩니다(strict 로드가 그것만 검사합니다).
+#
+# ── [ROLLBACK MARKER: sonic-v11] 이름 표 -> config 순서 기반 (2026-09-04) ──────────────
+# SONIC 은 정상 경로에서 Isaac Lab ObservationManager 가 각 항의 차원을 런타임에 계산하므로
+# 저장된 config 의 obs.group_obs_dims 가 {} 입니다. 우리는 Isaac 없이 프리어만 떼어 쓰기
+# 때문에 그 표를 여기서 대신 공급합니다.
+#   v1.1 은 자세 항 3개의 이름만 바꿨습니다(계산이 heading 정규화로 바뀌었을 뿐 폭은 같은 6D
+#   회전). 그래서 이름을 하드코딩하면 v1.1 로드가 ConfigKeyError 로 죽습니다. 항 이름과 순서는
+#   config 에서 읽고, 폭만 이름별 규칙으로 채웁니다. 항 순서/폭이 동일하므로 릴리스 레이아웃은
+#   비트 단위로 보존됩니다(총 2102, encoder_index [0:3), command_multi_future_nonflat [3:583) …).
+# 되돌리기: _tok_names_from_cfg 호출을 지우고 TOK_NAMES 를 _RELEASE_TOK_ORDER 로 고정.
+TOK_DIM_RULES = {
     "encoder_index": [3],
     "command_multi_future_nonflat": [10, 58],
     "command_z_multi_future_nonflat": [10, 32],
     "motion_anchor_ori_b_mf_nonflat": [10, 6],
+    "motion_anchor_ori_heading_mf_nonflat": [10, 6],       # v1.1: ori_b_mf_nonflat 대응
     "command_multi_future_lower_body": [234],
     "vr_3point_local_target": [9],
     "vr_3point_local_orn_target": [18],
     "motion_anchor_ori_b": [6],
+    "motion_anchor_ori_heading": [6],                      # v1.1: motion_anchor_ori_b 대응
     "command_z": [32],
     "smpl_joints_multi_future_local_nonflat": [10, 72],
     "smpl_root_ori_b_multi_future": [10, 6],
+    "smpl_root_ori_heading_multi_future": [10, 6],         # v1.1: smpl_root_ori_b_ 대응
     "joint_pos_multi_future_wrist_for_smpl": [10, 6],
 }
-TOK_NAMES = list(TOK_DIMS.keys())
+# 릴리스 기본 순서 (config 를 못 읽는 경로의 폴백이자 회귀 기준).
+_RELEASE_TOK_ORDER = [
+    "encoder_index", "command_multi_future_nonflat", "command_z_multi_future_nonflat",
+    "motion_anchor_ori_b_mf_nonflat", "command_multi_future_lower_body",
+    "vr_3point_local_target", "vr_3point_local_orn_target", "motion_anchor_ori_b",
+    "command_z", "smpl_joints_multi_future_local_nonflat",
+    "smpl_root_ori_b_multi_future", "joint_pos_multi_future_wrist_for_smpl",
+]
+TOK_NAMES = list(_RELEASE_TOK_ORDER)
+TOK_DIMS = {k: TOK_DIM_RULES[k] for k in _RELEASE_TOK_ORDER}
+
+
+def _tok_names_from_cfg(cfg) -> list[str]:
+    """config 의 tokenizer 관측 항 이름을 선언 순서대로. 비-관측 키(_target_ /
+    enable_corruption / concatenate_terms)는 func 가 없으므로 걸러집니다."""
+    try:
+        tk = cfg.manager_env.observations.tokenizer
+    except Exception:
+        return list(_RELEASE_TOK_ORDER)
+    out = []
+    for k, v in tk.items():
+        k = str(k)
+        if k.startswith("_"):
+            continue
+        if not hasattr(v, "get") or v.get("func", None) is None:
+            continue
+        out.append(k)
+    return out or list(_RELEASE_TOK_ORDER)
 
 # SONIC default standing pose (name-keyed, unlisted = 0.0), from g1.py G1_CYLINDER_MODEL_12_DEX_CFG.
 _SONIC_DEFAULT_RULES = {
@@ -127,12 +167,20 @@ def build_body_perm(robot_joint_names: list[str], device="cpu") -> torch.Tensor:
     return torch.tensor(perm, dtype=torch.long, device=device)
 
 
-def _make_env_config():
+def _make_env_config(tok_names: list[str] | None = None):
     from omegaconf import OmegaConf
 
+    names = list(tok_names) if tok_names else list(_RELEASE_TOK_ORDER)
+    unknown = [n for n in names if n not in TOK_DIM_RULES]
+    if unknown:
+        raise KeyError(
+            f"[sonic] tokenizer 관측 항의 차원을 모릅니다: {unknown}. "
+            f"TOK_DIM_RULES 에 추가하세요 (SONIC 이 항 이름을 바꾼 경우입니다)."
+        )
+    dims = {n: list(TOK_DIM_RULES[n]) for n in names}
     return OmegaConf.create({
-        "obs": {"group_obs_dims": {"tokenizer": {k: list(v) for k, v in TOK_DIMS.items()}},
-                "group_obs_names": {"tokenizer": TOK_NAMES}},
+        "obs": {"group_obs_dims": {"tokenizer": dims},
+                "group_obs_names": {"tokenizer": names}},
         "robot": {"actions_dim": 29, "algo_obs_dim_dict": {"actor_obs": ACTOR_OBS_DIM}},
     })
 
@@ -176,9 +224,11 @@ def build_sonic(config_path: str = DEFAULT_CONFIG, ckpt_path: str = DEFAULT_CKPT
     cfg.algo.config.actor.backbone.reencode_smpl_g1_recon = False
 
     # (d) instantiate exactly like eval_agent_trl.py:401.
+    # [sonic-v11] 항 이름/순서는 이 체크포인트의 config 에서 읽습니다.
+    _tok = _tok_names_from_cfg(cfg)
     actor = trl_common.custom_instantiate(
         cfg.algo.config.actor,
-        env_config=_make_env_config(),
+        env_config=_make_env_config(_tok),
         algo_config=cfg.algo.config,
         module_dim_dict={},
         backbone_kwargs={},

@@ -64,21 +64,30 @@ _ROBOT_USD = str(_DATA_DIR / "robots" / "G1" / "G1_shadow.usd")
 #   head-down gaze during manipulation). Spine/clavicle likewise have no independent body. Dropped
 #   — NOT forced (user-confirmed). pelvis(0)+torso_link(4)+shoulders(8,12)+hips(15,19) already
 #   bound trunk pose/orientation. All 16 targets below exist in G1_shadow.usd (CONFIRMED).
+# ── [ROLLBACK MARKER: smplx-kpts] ParaHome 스트림 -> SMPL-X 관절 (2026-09-04) ──────────────
+# 키가 SMPL-X 관절 인덱스입니다(옛 ParaHome/Xsens 인덱스가 아님). 구성은 PyRoki 원본
+# (examples/retarget_helpers/_utils.py get_humanoid_retarget_indices) 의 13쌍과 동일하며,
+# retarget_g1_pyroki.py 의 _BODY 와도 같아야 합니다 — 두 곳이 어긋나면 리타게팅이 맞춘 것과
+# 보상이 재는 것이 달라집니다.
+#   torso 는 제거했습니다(사용자 결정). 사람 상흉부(spine3, 골반 기준 25.1 cm)를 torso_link
+#   (골반 기준 4.4 cm)에 맞추는 대응은 오프셋 없이는 성립하지 않고, PyRoki 도 척추를 쓰지 않습니다.
+#   상체 방향은 local_alignment(어깨-골반 상대 기하)가 잡습니다.
+# SMPL-X 순서: 0 pelvis, 1/2 hip, 3 spine1, 4/5 knee, 6 spine2, 7/8 ankle, 9 spine3,
+#             10/11 foot, 12 neck, 13/14 collar, 15 head, 16/17 shoulder, 18/19 elbow, 20/21 wrist
 BODY_KPTS: dict[int, str] = {
-    0:  "pelvis",                     # pHipOrigin (root)
-    4:  "torso_link",                 # jT9T8 (upper-trunk / shoulder-girdle anchor)
-    8:  "right_shoulder_pitch_link",  # jRightShoulder (arm-root body)
-    9:  "right_elbow_link",           # jRightElbow
-    10: "right_wrist_yaw_link",       # jRightWrist (distal forearm; arm mount)
-    12: "left_shoulder_pitch_link",   # jLeftShoulder (arm-root body)
-    13: "left_elbow_link",            # jLeftElbow
-    14: "left_wrist_yaw_link",        # jLeftWrist (distal forearm; arm mount)
-    15: "right_hip_pitch_link",       # jRightHip (leg-root body)
-    16: "right_knee_link",            # jRightKnee
-    17: "right_ankle_roll_link",      # jRightAnkle (foot; 1 pt/foot, GRAIL-style)
-    19: "left_hip_pitch_link",        # jLeftHip (leg-root body)
-    20: "left_knee_link",             # jLeftKnee
-    21: "left_ankle_roll_link",       # jLeftAnkle (foot; 1 pt/foot, GRAIL-style)
+    0:  "pelvis",                     # pelvis (root)
+    17: "right_shoulder_pitch_link",  # right_shoulder
+    19: "right_elbow_link",           # right_elbow
+    21: "right_wrist_yaw_link",       # right_wrist (distal forearm; arm mount)
+    16: "left_shoulder_pitch_link",   # left_shoulder
+    18: "left_elbow_link",            # left_elbow
+    20: "left_wrist_yaw_link",        # left_wrist
+    2:  "right_hip_pitch_link",       # right_hip (leg-root body)
+    5:  "right_knee_link",            # right_knee
+    8:  "right_ankle_roll_link",      # right_ankle (foot; 1 pt/foot, GRAIL-style)
+    1:  "left_hip_pitch_link",        # left_hip
+    4:  "left_knee_link",             # left_knee
+    7:  "left_ankle_roll_link",       # left_ankle
 }
 # BODY = 14 links (pelvis, torso, shoulders/elbows/wrists ×2, hips/knees/ankles ×2) — matches GRAIL's
 # 14 tracked bodies. The ballfoot toe points (jRightBallFoot 18 / jLeftBallFoot 22) were DROPPED
@@ -92,9 +101,9 @@ BODY_KPTS: dict[int, str] = {
 # anatomically aligned instead of ~0.27 m off. Measured: jT9T8 in torso_link local frame at a
 # standing posture. (env robot-kpt = torso_link origin + offset; retarget targets the same frame.)
 TORSO_KPT_OFFSET: list[float] = [-0.033, 0.0, 0.274]
-BODY_KPT_OFFSETS: dict[int, list[float]] = {
-    4: TORSO_KPT_OFFSET,
-}
+# [smplx-kpts] torso 키포인트를 제거했으므로 오프셋 대상이 없습니다. TORSO_KPT_OFFSET 상수는
+# 되돌릴 때 쓰도록 위에 남겨둡니다(현재 어느 키포인트에도 적용되지 않습니다).
+BODY_KPT_OFFSETS: dict[int, list[float]] = {}
 
 # --- Hands: 20 keypoints per hand = wrist(1) + 4 fingers×4 + thumb×3. ------------------
 # ParaHome hand-local idx (0..24) → Shadow body. Applied to BOTH hands; the left-hand block
@@ -130,19 +139,25 @@ BODY_KPT_OFFSETS: dict[int, list[float]] = {
 # 의미가 바뀌므로 체크포인트는 재학습해야 합니다).
 HAND_CHAIN: dict[str, dict] = {
     #             [ParaHome idx]              [Shadow body]                 [offset key]
-    "wrist":  {"parahome": [0],              "shadow": ["palm"],           "pad": [False]},
+    # [smplx-kpts] "parahome" 키 이름은 그대로 두되 값은 SMPL-X 손 블록 로컬 인덱스입니다
+    # (왼손 base 25 / 오른손 base 40, 블록 순서 index1-3 middle1-3 pinky1-3 ring1-3 thumb1-3).
+    # 손끝(Tip)은 SMPL-X 손 블록에 관절이 없으므로 pad 배열(joints 뒤에 이어붙인 55.. 블록)을
+    # 가리킵니다 — 값 -1..-5 는 "pad 블록의 n번째"를 뜻하고 env 가 해석합니다.
+    # 손목은 SMPL-X 몸통 20/21 이라 손 블록에 없어 -10(왼)/-11(오른) 로 표시합니다.
+    # 엄지 3쌍은 TJ 의 검증된 MANO↔Shadow 매핑(gr_env_cfg.py)과 동일합니다.
+    "wrist":  {"parahome": [-10],            "shadow": ["palm"],           "pad": [False]},
     #             [MCP, PIP, DIP, Tip]        [knuckle, middle, distal, distal(+pad)]
-    "index":  {"parahome": [18, 19, 20, 21], "shadow": ["ffknuckle", "ffmiddle", "ffdistal", "ffdistal"],
+    "index":  {"parahome": [0, 1, 2, -2],    "shadow": ["ffknuckle", "ffmiddle", "ffdistal", "ffdistal"],
                "pad": [False, False, False, True]},
-    "middle": {"parahome": [14, 15, 16, 17], "shadow": ["mfknuckle", "mfmiddle", "mfdistal", "mfdistal"],
+    "middle": {"parahome": [3, 4, 5, -3],    "shadow": ["mfknuckle", "mfmiddle", "mfdistal", "mfdistal"],
                "pad": [False, False, False, True]},
-    "ring":   {"parahome": [10, 11, 12, 13], "shadow": ["rfknuckle", "rfmiddle", "rfdistal", "rfdistal"],
+    "ring":   {"parahome": [9, 10, 11, -4],  "shadow": ["rfknuckle", "rfmiddle", "rfdistal", "rfdistal"],
                "pad": [False, False, False, True]},
-    "pinky":  {"parahome": [6, 7, 8, 9],     "shadow": ["lfknuckle", "lfmiddle", "lfdistal", "lfdistal"],
+    "pinky":  {"parahome": [6, 7, 8, -5],    "shadow": ["lfknuckle", "lfmiddle", "lfdistal", "lfdistal"],
                "pad": [False, False, False, True]},
-    #             [MCP, IP, Tip]              [middle, distal, distal(+pad)]
-    "thumb":  {"parahome": [22, 23, 24],     "shadow": ["thmiddle", "thdistal", "thdistal"],
-               "pad": [False, False, True]},
+    #             [MCP, IP, DIP, Tip]         [thbase, middle, distal, distal(+pad)]
+    "thumb":  {"parahome": [12, 13, 14, -1], "shadow": ["thbase", "thmiddle", "thdistal", "thdistal"],
+               "pad": [False, False, False, True]},
 }
 
 # Robot-side fingertip = distal body origin + LOCAL offset (rotated), pad faces LOCAL normal.
@@ -187,9 +202,9 @@ FINGERTIP_PAD_NORMALS: dict[str, list[float]] = _build_ft(_FT_NORMAL_BASE)
 
 # Number of tracked keypoints (obs/reward): body 14 (BODY_KPTS entries, GRAIL-aligned) + hands
 # (wrist=1, index/mid/ring/pinky=4, thumb=3 → 20 per hand) × 2 = 54.
-N_BODY_KPTS = len(BODY_KPTS)                      # 14
-N_HAND_KPTS_PER_HAND = sum(len(v["parahome"]) for v in HAND_CHAIN.values())  # 20
-N_TRACK_KPTS = N_BODY_KPTS + 2 * N_HAND_KPTS_PER_HAND                          # 54
+N_BODY_KPTS = len(BODY_KPTS)                      # 13 [smplx-kpts] torso 제거
+N_HAND_KPTS_PER_HAND = sum(len(v["parahome"]) for v in HAND_CHAIN.values())  # 21 (손목1+손가락15+손끝5)
+N_TRACK_KPTS = N_BODY_KPTS + 2 * N_HAND_KPTS_PER_HAND                          # 55
 
 # --- Per-link CONTACT set for the Option-A per-link contact-FORCE reward ------------------
 # The wrap links whose object contact is precomputed in hand_contact.npz (parahome_hand_contact.py) and
@@ -344,30 +359,48 @@ G1_SHADOW_CFG = ArticulationCfg(
         #      The frozen SONIC decoder was trained with THESE gains + the per-joint action scale
         #      SONIC_SCALE = 0.25*effort/stiffness, so its a_sonic maps to the intended PD torque
         #      ONLY with this exact stiffness/damping/armature (verified via sonic_playback.py).
-        #      effort_limit_sim is kept GENEROUS (SONIC's own 5 Nm wrists saturate under object
-        #      load). Do NOT substitute the locomanip locomotion gains here. Groups mirror
+        #      Do NOT substitute the locomanip locomotion gains here. Groups mirror
         #      sonic_playback.py::_sonic_actuators. Shadow fingers unchanged (SONIC has no hands).
+        #
+        # ── [ROLLBACK MARKER: sonic-limits] effort/velocity 한계도 SONIC 원본에 맞춤 (2026-09-04)
+        # 이전에는 effort 를 300/300/200/150/150, velocity 를 전부 100 으로 넓혀 두었습니다
+        # (사유 주석: "SONIC's own 5 Nm wrists saturate under object load"). 상류 커밋
+        # 087f9ac 의 G1_CYLINDER_MODEL_12_DEX_CFG 와 29관절 전체를 대조한 결과 stiffness/
+        # damping/armature 는 29/29 일치하는데 effort/velocity 는 29/29 달랐습니다. 프리어가
+        # 학습된 조건(sonic_release/config.yaml: type g1_model_12_dex)에 맞추는 것이 맞다는
+        # 판단으로 원본 값으로 되돌립니다.
+        #   부수 효과: SONIC_SCALE = 0.25*effort/stiffness 를 담은 sonic_prior.py 의
+        #   _SONIC_SCALE_RULES 는 원래부터 상류 effort(예: 허리 50)로 계산돼 있었습니다. 즉
+        #   이전 cfg 는 "스케일은 50 기준, 시뮬레이터 한계는 200"으로 어긋나 있었고 이제 일치합니다.
+        #   우리 5개 그룹 경계가 상류 값 경계와 정확히 맞아 관절별 dict 없이 스칼라로 됩니다
+        #   (상류 legs/arms 는 dict 지만, 우리 그룹 안에서는 값이 균일합니다).
+        # 실측 여유 (s101_seg29_pot 롤아웃 332스텝, |tau| 최대 / 새 한계):
+        #   hip_knee 95.3/139  hipyaw_waistyaw 27.4/88  ankle_waist 45.0/50
+        #   shoulder_elbow 19.1/25  wrist_pitchyaw 5.0/5   -> 포화 스텝 0%
+        #   velocity 는 최대 10.58/20 로 여유가 큽니다. 다만 wrist_pitch 는 1스텝에서 4.998 까지
+        #   튀어 5.0 과 여유가 거의 없습니다 — 다른 클립에서 간헐 포화가 나올 수 있으니
+        #   Diag 의 토크/포화 지표를 함께 보세요. 되돌리기: 아래 5줄을 옛 값으로.
         "sonic_hip_knee": ImplicitActuatorCfg(
             joint_names_expr=[".*_hip_pitch_joint", ".*_hip_roll_joint", ".*_knee_joint"],
-            effort_limit_sim=300.0, velocity_limit_sim=100.0,
+            effort_limit_sim=139.0, velocity_limit_sim=20.0,
             stiffness=99.0997, damping=6.3088, armature=0.025101925),
         "sonic_hipyaw_waistyaw": ImplicitActuatorCfg(
             joint_names_expr=[".*_hip_yaw_joint", "waist_yaw_joint"],
-            effort_limit_sim=300.0, velocity_limit_sim=100.0,
+            effort_limit_sim=88.0, velocity_limit_sim=32.0,
             stiffness=40.1795, damping=2.5579, armature=0.010177520),
         "sonic_ankle_waist": ImplicitActuatorCfg(
             joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint",
                               "waist_roll_joint", "waist_pitch_joint"],
-            effort_limit_sim=200.0, velocity_limit_sim=100.0,
+            effort_limit_sim=50.0, velocity_limit_sim=37.0,
             stiffness=28.5013, damping=1.8143, armature=0.00721945),
         "sonic_shoulder_elbow": ImplicitActuatorCfg(
             joint_names_expr=[".*_shoulder_pitch_joint", ".*_shoulder_roll_joint",
                               ".*_shoulder_yaw_joint", ".*_elbow_joint", ".*_wrist_roll_joint"],
-            effort_limit_sim=150.0, velocity_limit_sim=100.0,
+            effort_limit_sim=25.0, velocity_limit_sim=37.0,
             stiffness=14.2506, damping=0.9072, armature=0.003609725),
         "sonic_wrist_pitchyaw": ImplicitActuatorCfg(
             joint_names_expr=[".*_wrist_pitch_joint", ".*_wrist_yaw_joint"],
-            effort_limit_sim=150.0, velocity_limit_sim=100.0,
+            effort_limit_sim=5.0, velocity_limit_sim=22.0,
             stiffness=16.7783, damping=1.0681, armature=0.00425),
         # ---- Bimanual Shadow fingers (from robotis_shadow_grasp): 18 actuated DOF/hand ----
         "shadow_fingers": ImplicitActuatorCfg(
@@ -447,7 +480,10 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #   emitted. The bounded copy is still used for the action_rate reward. See the block-C comment in
     #   _get_observations for the measurement, and note the real chain is the 100-D joint log-ratio
     #   feeding the `A<0` branch of PPO's `-min(A·r, A·clip(r))`, unbounded for r ≫ 1+ε.
-    observation_space: int = 766   # [backward-dir] +1 = 진행 방향 비트        # asserted in _get_observations. Per-link contact (Option A): the
+    # [smplx-kpts] 766 -> 772: 추적 키포인트가 54(몸통 14 + 손 20x2) -> 55(몸통 13 + 손 21x2)
+    # 로 바뀌었고 키포인트가 3차원 블록 두 곳에 들어가므로 +1 kpt = +6 차원입니다.
+    # (54x3x2=324 -> 55x3x2=330; 766-324+330=772). env 를 띄워 측정한 값입니다.
+    observation_space: int = 772   # [backward-dir] +1 = 진행 방향 비트        # asserted in _get_observations. Per-link contact (Option A): the
     #   fingertip future_contact(10)+fingertip force(10) obs were REPLACED by per-link mask(32)+force(32) → +44.
     state_space: int = 0
 
@@ -545,14 +581,28 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # e["body"] 계산·로깅 Error / body_kpts 는 그대로 남아 진단 지표가 된다).
     # 유지되는 항: rew_ee_kpts(손목2+발목2+몸통1), rew_hand_kpts, rew_link_kpts, rew_fingertip,
     # rew_root_pos/ori, 물체 항, 캐시 root/fingertip bar. 되돌리기: True (아래 값들은 원본 유지).
+    # ── [ROLLBACK MARKER: body-kpt-fk] 몸통 키포인트 목표를 리타게팅 FK 로 (2026-09-06) ──────
+    # 기본(False)은 SMPL-X 사람 키포인트를 그대로 목표로 씁니다. 그런데 그 목표는 G1 이 도달할 수
+    # 없습니다 — 리타게팅 측정에서 사람 발목이 로봇 발목보다 5.4~5.8 cm 위, 어깨 잔차 22 cm,
+    # 골반 잔차 9.4 cm 입니다. 실제로 2026-09-05 run 에서 Error/body_kpts 가 0.108 m 에 고정되고
+    # Episode_Reward/body_kpts 가 0.0 이었습니다 (도달 불가라 학습 신호가 되지 않음).
+    # True 면 목표를 "리타게팅된 로봇 자세의 링크 위치"(g1_joint_pos + g1_root_pose 에 로봇 FK)로
+    # 바꿉니다. 리타게팅이 이미 임베디먼트 절충을 푼 결과이므로 도달 가능한 목표가 됩니다.
+    # 손 키포인트(42)와 손목은 영향받지 않습니다 — 몸통 13개만 교체합니다.
+    # 계산은 init 에서 한 번, 제거된 _solve_ref_link_local() 과 같은 방식(로봇을 프레임마다 레퍼런스
+    # 자세로 세워 body_pos_w 를 읽음)입니다. 되돌리기: False.
+    body_kpt_from_retarget_fk: bool = True
     body_kpt_supervision: bool = True
-    rew_body_kpts: float = -0.5        # mean over the 9 CORE body kpts (pelvis/shoulders/elbows/hips/knees)
-    # ── [ROLLBACK MARKER: ee-kpts] 손목2 + 발목2 + 몸통1 을 한 항으로 (2026-09-01) ────────────
-    # 몸통은 BODY_KPTS 4번 torso_link + TORSO_KPT_OFFSET(윗가슴, jT9T8 대응)이다. G1 은 목 관절이
-    # 없고 head_link 가 torso_link 에 융합돼 있어 독립 머리 키포인트가 존재하지 않는다.
-    # 몸통을 넣는 이유: core 는 body_kpt_supervision=False 로 가중치 0 이라, 골반(rew_root_pos/ori)
+    rew_body_kpts: float = -1.0 # -0.5        # mean over the 9 CORE body kpts (pelvis/shoulders/elbows/hips/knees)
+    # ── [ROLLBACK MARKER: ee-kpts] 손목2 + 발목2 를 한 항으로 (2026-09-01) ───────────────────
+    # [smplx-kpts 2026-09-04] 몸통 키포인트는 제거됐다 (사용자 결정) — 이 항은 손목2 + 발목2 의
+    # 4개 mean 이다. 아래 "몸통" 관련 설명은 제거 전 이력으로 남긴다.
+    # (제거 전) 몸통은 BODY_KPTS 4번 torso_link + TORSO_KPT_OFFSET(윗가슴, jT9T8 대응)이었다. G1 은
+    # 목 관절이 없고 head_link 가 torso_link 에 융합돼 독립 머리 키포인트가 존재하지 않는다.
+    # 몸통을 넣었던 이유: core 는 body_kpt_supervision=False 로 가중치 0 이라, 골반(rew_root_pos/ori)
     # 과 손목·발목 사이의 몸통만 무감독이었고 허리가 자유로워 상체가 앞뒤로 들썩였다
     # (실측: 허리 yaw 진폭 로봇 3.37° vs 레퍼런스 0.47°, roll 3.52° vs 1.12°, pitch 1.37° vs 0.61°).
+    # 제거 후 그 감독이 다시 없어졌으므로, 상체 들썩임이 재발하면 여기가 되돌아볼 지점이다.
     # 한 mean 에 섞어도 되는 근거: exp 형태의 기울기 ∂/∂err_i = w·Sat·(-2·mean/σ²)·(1/N) 은 자기
     # 오차 크기와 무관하게 1/N 로 균등 배분된다. 몸통 오차는 mm, 발목은 cm 스케일이지만 발목이
     # mean 을 0 에서 떼어놓아 몸통도 단독 항보다 큰 기울기를 받는다. 키포인트당 배분은 균등하다.
@@ -689,7 +739,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #   ee 0.25 / obj_rot 0.68 / root_pos 0.97 / root_rot 0.92.
     #   root_pos·root_rot 는 0.9 대라 사실상 상수다 — 대역에 넣으려면 0.045 / 0.10 근처가 필요하고,
     #   ee 는 손목 병합으로 오차가 0.119 로 커져 0.16 근처가 맞다. 지금은 의도적으로 구값 유지.
-    sigma_body: float = 0.30        # SONIC tracking_relative_body_pos std
+    sigma_body: float = 0.20 # 0.30        # SONIC tracking_relative_body_pos std
     sigma_ee: float = 0.10          # [wrist-into-ee] 손목2+발목2+몸통1 공통 σ
     sigma_hand: float = 0.075 # 0.10
     sigma_fingertip: float = 0.05  # half of term_ft_err
@@ -775,11 +825,17 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # match = 1.0, not 2 — the weight is the true max bonus), POSITIVE bonus (outside the tracking clamp).
     # c_i = actual foot i in contact (ground-filtered force_matrix projected on the sole normal > force_thresh);
     # c*_i = reference foot i in contact, precomputed at load from the ParaHome ball keypoints via the SAME
-    # rule PyRoki used for retargeting: ball_z < foot_plant_h AND |ball_vz| < foot_plant_vz. Rewards correct
+    # rule PyRoki used for retargeting: ball_z < foot_plant_h AND ball_3d_speed < foot_plant_v. Rewards correct
     # contact TIMING (planted-when-should-be AND swing-when-should-be) → complements the CoM-over-support net.
     rew_feet_contact_match: float = 0.05   # POSITIVE max bonus (both feet matching → +this; 0 = disable)
-    foot_plant_h: float = 0.06            # reference contact: ball height below this = planted (m; = PyRoki)
-    foot_plant_vz: float = 0.15           # reference contact: |ball vertical speed| below this (m/s; = PyRoki)
+    # [ROLLBACK MARKER: foot-plant-3d] 속도를 수직 성분(|vz|)에서 3D 노름으로 바꿨습니다
+    # (SONIC/motionbricks foot_detect_from_pos_and_vel 와 같은 형태). 임계는 2026-09-04 에
+    # 높이 0.05 / 속도 1.00 으로 조정했습니다 — SONIC 기본(0.10 / 0.15)은 속도 항이 지나치게
+    # 조여 체중 이동을 스윙으로 오판하고, 높이 항은 느슨해 발이 사람보다 높이 떴습니다.
+    # 리타게팅의 _FOOT_PLANT_H / _FOOT_PLANT_V 와 반드시 같은 값이어야 합니다
+    # (이 스케줄이 rew_feet_contact_match 의 정답 c* 입니다).
+    foot_plant_h: float = 0.05            # reference contact: ball height below this = planted (m)
+    foot_plant_v: float = 1.00            # reference contact: ball 3D speed below this (m/s)
     foot_contact_force_thresh: float = 20.0  # actual contact: compressive foot↔ground force above this = in contact (N)
 
     # =========================================================================== #
@@ -1286,8 +1342,24 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # one control step == one reference frame. Built in _post_init_buffers (needs env_isaaclab +
     # gear_sonic + vector_quantize_pytorch installed).
     use_sonic: bool = True
-    sonic_config_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_release/config.yaml"
-    sonic_ckpt_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_release/last.pt"
+    # ── [ROLLBACK MARKER: sonic-v11] 프리어를 SONIC v1.1 로 전환 (2026-09-04) ─────────────
+    # v1.1 = 릴리스에서 resume 학습한 변형 (실험명 sonic_release_3pt_heading_wrist_81):
+    #   1) 참조 루트 자세를 로봇 heading(요)만으로 정규화 (릴리스는 펠비스 전체 자세).
+    #      env 가 레이아웃 키로 자동 판별합니다 — env.py 의 _sonic_heading / _sonic_anchor_q.
+    #   2) randomize_wrist_poses=True 손목 자세 증강 + tracking_vr_2wrists_local_ori 보상(0.4).
+    #   3) 디코더 MLP 확대 [4096,4096,2048,2048,1024,1024,512,512] → ckpt 469MB → 1.14GB.
+    #   4) 새 보상 energy_consumption(-0.0001) — 우리 rew_energy(-0.001)의 1/10 크기.
+    # 같은 것: robot type g1_model_12_dex(허리 stiffness 28.5 그대로 — waist_pitch 문제는
+    # v1.1 도 해결하지 않습니다), FSQ 32레벨, action_clip 20.0, 10프레임 step5 룩어헤드,
+    # 토크나이저 레이아웃 오프셋(총 2102), 디코더 proprio 930-D 구조.
+    #
+    # ★ 잔차 정책을 처음부터 다시 학습해야 합니다 ★ 릴리스로 학습한 agent.pt 를 v1.1 에 얹으면
+    # 보상 합이 550 → 4.2 로 붕괴합니다(실측, s101_seg29_pot). 프리어 단독(z_res=0, 117~124)
+    # 보다도 낮습니다 — λ·z_res(최대 0.32)가 인코더 잠재(최대 0.20)보다 커서 잔차가 잠재를
+    # 지배하기 때문입니다. pretrain 도 함께 다시 돌려야 합니다(이 클래스를 상속).
+    # 되돌리기: 아래 두 경로를 sonic_release/ 로. env 쪽은 자동 판별이라 수정 불필요.
+    sonic_config_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/config.yaml"
+    sonic_ckpt_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/last.pt"
     # [ROLLBACK MARKER: sonic-encoder-g1] SONIC에 무엇을 명령으로 줄지.
     #   "smpl" : 사람 SMPL 관절 위치 + 손목 관절 6개 (기존 동작)
     #   "g1"   : 로봇 자신의 29개 관절 각도 + 속도 (사람->로봇 변환 단계가 없음)

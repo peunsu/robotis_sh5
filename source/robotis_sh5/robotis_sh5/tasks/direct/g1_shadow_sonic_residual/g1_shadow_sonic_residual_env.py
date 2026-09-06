@@ -70,6 +70,8 @@ from .g1_shadow_sonic_residual_env_cfg import (
     JOINT_GROUPS,
     LINK_CONTACT_NAMES,
     LINK_PAD_NORMALS,
+    N_BODY_KPTS,
+    N_HAND_KPTS_PER_HAND,
     N_LINK_CONTACT,
     G1ShadowSonicResidualEnvCfg,
 )
@@ -161,22 +163,49 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 f"ParaHome clip not found (dataset_root={cfg.dataset_root}, class={cfg.clip_class}, "
                 f"name={cfg.clip_name or '<auto>'}). Run scripts/process_dataset/dataset/parahome.py first.")
         d = np.load(npz_path, allow_pickle=True)
-        jp = d["joint_positions"].astype(np.float32)          # (F,73,3) world keypoints
+        # ── [ROLLBACK MARKER: smplx-kpts] 키포인트 소스를 SMPL-X 로 (2026-09-04) ─────────────
+        # 옛 소스는 ParaHome 자체 스트림 joint_positions (F,73,3) 였습니다. 리타게팅
+        # (retarget_g1_pyroki.py) 도 같은 날 SMPL-X 로 전환했으므로 두 곳이 같은 스켈레톤을 봅니다.
+        # 배열 구성은 리타게팅과 동일하게 [smplx_joints(55) | fingertip_pad_pos(10)] = (F,65,3):
+        # 손끝은 SMPL-X 손 블록에 관절이 없어 pad 정점을 써야 하기 때문입니다.
+        if "smplx_joints" not in d.files:
+            raise KeyError("[smplx-kpts] smplx_joints 없음 — parahome.py --overwrite 로 재생성하세요")
+        jp = np.concatenate([d["smplx_joints"].astype(np.float32),
+                             d["fingertip_pad_pos"].astype(np.float32)], axis=1)   # (F,65,3)
         F = jp.shape[0]
 
-        # 56 reference-keypoint indices into the 73-joint array (body + L-hand + R-hand).
-        ref_idx: list[int] = list(BODY_KPTS.keys())            # 16 body (into [0:23])
-        for side_off in (23, 48):                              # left block, right block
+        # HAND_CHAIN["parahome"] 값 해석 (cfg 주석 참조):
+        #   p >= 0  : 그 손 블록의 로컬 인덱스 (왼손 base 25 / 오른손 base 40)
+        #   p == -10: 이 손의 손목 = SMPL-X 몸통 20(왼)/21(오른)
+        #   -1..-5  : pad 블록의 손가락 (th, ff, mf, rf, lf 순) → 55 + side*5 + (-p-1)
+        _PAD_BASE = 55
+        ref_idx: list[int] = list(BODY_KPTS.keys())            # 13 body (SMPL-X 인덱스)
+        for _s, (_hb, _wr, _pb) in enumerate(((25, 20, _PAD_BASE), (40, 21, _PAD_BASE + 5))):
             for spec in HAND_CHAIN.values():
-                ref_idx += [side_off + p for p in spec["parahome"]]
-        self._np_ref_kpts = jp[:, ref_idx, :]                  # (F,54,3) = 14 body + 40 hand
+                for p in spec["parahome"]:
+                    if p >= 0:
+                        ref_idx.append(_hb + p)
+                    elif p == -10:
+                        ref_idx.append(_wr)
+                    else:
+                        ref_idx.append(_pb + (-p - 1))
+        self._np_ref_kpts = jp[:, ref_idx, :]                  # (F,55,3) = 13 body + 21 hand x2
 
         # reference FOOT-CONTACT schedule (F,2)=[left,right] via the SAME rule PyRoki used for retargeting
         # (_foot_contact): the ball keypoint (ParaHome 22=left, 18=right) is near the floor AND slow in z.
         # Computed at the NATIVE source rate (fps below) then resampled (thresholded) with the other refs.
-        _bz = jp[:, [22, 18], 2]                               # (F,2) [L,R] ball height
-        _bvz = np.zeros_like(_bz); _bvz[1:] = (_bz[1:] - _bz[:-1]) * _PARAHOME_FPS
-        self._np_ref_foot_contact = ((_bz < cfg.foot_plant_h) & (np.abs(_bvz) < cfg.foot_plant_vz)).astype(np.float32)
+        # [smplx-kpts] 볼(ball) 발: ParaHome jLeftBallFoot(22)/jRightBallFoot(18) → SMPL-X
+        # left_foot(10)/right_foot(11). 리타게팅의 _PARA_BALL_L/R 과 같은 선택입니다.
+        # ── [ROLLBACK MARKER: foot-plant-3d] 접지 판정을 SONIC 기준으로 (2026-09-04) ──────────
+        # SONIC/motionbricks foot_detect_from_pos_and_vel(..., vel_thres=0.15, height_thresh=0.10)
+        # 과 동일하게 속도를 수직 성분이 아닌 3D 노름으로 봅니다. 리타게팅의 _foot_contact 와 반드시
+        # 같은 식이어야 합니다 (여기서 만드는 스케줄이 rew_feet_contact_match 의 정답 c* 입니다).
+        # 되돌리려면 cfg.foot_plant_h=0.06 으로 두고 아래 노름을 |Δz| 로 교체하십시오.
+        _bp = jp[:, [10, 11], :]                               # (F,2,3) [L,R] ball position
+        _bv = np.zeros(_bp.shape[:2], dtype=np.float32)        # (F,2) 3D speed (m/s)
+        _bv[1:] = np.linalg.norm(_bp[1:] - _bp[:-1], axis=-1) * _PARAHOME_FPS
+        self._np_ref_foot_contact = ((_bp[..., 2] < cfg.foot_plant_h) & (_bv < cfg.foot_plant_v)).astype(np.float32)
+        # ── [/ROLLBACK MARKER: foot-plant-3d] ────────────────────────────────────────────────
 
         # root SE(3): default from body_global_transform (human pelvis); OVERRIDDEN below by the
         # retargeting's ADJUSTED root (g1_root_pose) if present — the robot stands a little
@@ -948,12 +977,13 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # ANKLE (foot placement/balance) and CORE (everything else). Each gets its own reward weight
         # (rew_ee_kpts / rew_body_kpts) so the groups can be emphasized independently.
         # Matched by name (robust to reordering). The termination gate still uses the UNIFORM mean over
-        # ALL 14 (e["body"]). [ROLLBACK MARKER: ee-split] wrist+ankle used to share one _ee_kpt_idx.
-        # [ROLLBACK MARKER: ee-torso] torso_link 이 core(가중치 0)에서 EE 그룹으로 이동했다. 세 그룹은
-        # 서로 배타적이다 (9 core + 2 wrist + 3 ee = 14). 되돌리기: 아래 "torso" 조건 2곳을 제거.
+        # ALL 13 (e["body"]). [ROLLBACK MARKER: ee-split] wrist+ankle used to share one _ee_kpt_idx.
+        # [ROLLBACK MARKER: ee-torso] torso 키포인트는 [smplx-kpts] 에서 제거됐다. core 와 EE 는 서로
+        # 배타적이고 wrist 는 EE 의 부분집합이다: core 9 + EE 4(손목2+발목2) = 13.
         _body_names = kpt_names[:len(BODY_KPTS)]
         # [ROLLBACK MARKER: wrist-into-ee] 손목이 EE 그룹으로 흡수됐다 (손목2+발목2+몸통1 = 5).
-        _EE_NAMES = ("wrist", "ankle", "torso")   # EE 그룹에 들어가는 링크 이름 조각
+        # [smplx-kpts] torso 키포인트 제거(사용자 결정) → EE 그룹은 손목 2 + 발목 2 = 4개.
+        _EE_NAMES = ("wrist", "ankle")            # EE 그룹에 들어가는 링크 이름 조각
         self._body_core_idx = torch.tensor(
             [i for i, n in enumerate(_body_names)
              if not any(t in n for t in _EE_NAMES)],
@@ -962,11 +992,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 손목-POSITION 종료 게이트(term_wrist_pos_err)와 Error / wrist_kpts 로그에만 쓰인다.
         self._wrist_kpt_idx = torch.tensor(
             [i for i, n in enumerate(_body_names) if "wrist" in n], device=dev, dtype=torch.long)  # (2,)
-        # [wrist-into-ee] 손목 2 + 발목 2 + 몸통 1 = 5개의 MEAN → rew_ee_kpts. 몸통은 torso_link
-        # 원점이 아니라 BODY_KPT_OFFSETS[4] (TORSO_KPT_OFFSET, 윗가슴)이 더해진 점이다.
+        # [wrist-into-ee][smplx-kpts] 손목 2 + 발목 2 = 4개의 MEAN → rew_ee_kpts.
         self._ee_kpt_idx = torch.tensor(
             [i for i, n in enumerate(_body_names) if any(t in n for t in _EE_NAMES)],
-            device=dev, dtype=torch.long)                                    # (5,) wrist×2 + ankle×2 + torso
+            device=dev, dtype=torch.long)                                    # (4,) wrist×2 + ankle×2
         # 이름 매칭이라 조용히 잘못 묶일 수 있다 — 실제 구성을 한 번 찍어 확인 가능하게 남긴다.
         print(f"[g1] kpt groups: core({len(self._body_core_idx)})="
               f"{[_body_names[i] for i in self._body_core_idx.tolist()]} | "
@@ -1010,7 +1039,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # ---- reference tensors (move numpy → device) ----
         def T(a):
             return torch.from_numpy(np.asarray(a)).to(dev)
-        self._ref_kpts = T(self._np_ref_kpts)                          # (F,56,3)
+        self._ref_kpts = T(self._np_ref_kpts)                          # (F,55,3)
         self._ref_root_pos = T(self._np_root_pos)                      # (F,3)
         self._ref_root_quat = _canon(T(self._np_root_quat))            # (F,4)
         self._ref_root_linvel = T(self._np_root_linvel)                # (F,3)
@@ -1231,6 +1260,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 로봇을 프레임마다 레퍼런스 자세로 세워 링크 위치를 읽습니다. 물리를 진행시킬 필요가 없어
         # 청크당 한 스텝이면 되고, 환경 수가 프레임 수 이상이면 한 번에 끝납니다.
         self._build_ref_link_kpt_local()      # [ROLLBACK MARKER: link-kpt-smpl]
+        self._apply_body_kpt_fk()             # [ROLLBACK MARKER: body-kpt-fk]
         # [/ROLLBACK MARKER: spawn-declear]
         # ── [ROLLBACK MARKER: failure-dump] 실패 에피소드 링 버퍼 ─────────────────────────────
         # 한 행 = 한 (환경, 제어 스텝):
@@ -1348,9 +1378,24 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                   f"{self.num_envs * self._pend_cap * self._STATE_DIM * 4 / 1024**2:.0f} MB")
         else:
             self._pend_state = self._pend_frame = self._pend_valid = None
-        # [wrist-rot] 손 블록 배치: 손당 20개 = [0]손목 [1..4]검지 [5..8]중지 [9..12]약지 ...
-        _nb_k = self._ref_kpts.shape[1] - 40                        # 몸 키포인트 수 (14)
-        self._wrist_frame_idx = [(_nb_k + o, _nb_k + o + 5, _nb_k + o + 1) for o in (0, 20)]  # L, R
+        # [wrist-rot] 손 블록 배치: 손당 N_HAND_KPTS_PER_HAND 개
+        #   [0]손목/palm [1..4]검지 [5..8]중지 [9..12]약지 [13..16]소지 [17..20]엄지
+        # ── [ROLLBACK MARKER: wrist-frame-idx] 하드코딩 20 → 상수 참조 (2026-09-06) ──────────
+        # [smplx-kpts] 전환으로 손당 키포인트가 20 → 21 (손끝 pad 5개 추가), 몸통이 14 → 13 이
+        # 됐는데 이 두 줄이 옛 값을 하드코딩하고 있었습니다: `- 40` 은 손 40개(=20x2) 가정이라
+        # _nb_k 가 13 대신 15 로 나오고, 오프셋 (0,20) 도 21 이어야 합니다. 그 결과 손목 프레임을
+        # 만드는 세 점이 palm/중지MCP/검지MCP 가 아니라 손가락 마디로 잡혀 있었습니다
+        #   왼손  절대 15,20,16 → 손 내부 2,7,3  (검지PIP, 중지DIP, 검지DIP)
+        #   오른손 절대 35,40,36 → 손 내부 1,6,2  (검지MCP, 중지PIP, 검지PIP)
+        # 좌우가 서로 다른 점을 쓰기까지 했습니다. Error/wrist_rot 이 중앙 0.87 rad 로 나오고
+        # term_wrist_rot_err=0.75 를 상시 초과해 종료를 계속 발동시켰습니다(2026-09-05 run 실측).
+        _nb_k = N_BODY_KPTS                                          # 13
+        _nh = N_HAND_KPTS_PER_HAND                                   # 21
+        self._wrist_frame_idx = [(_nb_k + o, _nb_k + o + 5, _nb_k + o + 1) for o in (0, _nh)]  # L, R
+        assert self._ref_kpts.shape[1] == _nb_k + 2 * _nh, (
+            f"[wrist-frame-idx] 키포인트 수 불일치: ref {self._ref_kpts.shape[1]} != "
+            f"{_nb_k} + 2x{_nh}")
+        # ── [/ROLLBACK MARKER: wrist-frame-idx] ─────────────────────────────────────────────
         self._failure_count = torch.zeros(self._ref_len, device=dev)
         # [backward-dir] 각 프레임의 캐시 항목이 역방향에서 왔는지 (마진 값 진단용)
         self._cache_from_bwd = torch.zeros(self._ref_len, dtype=torch.bool, device=dev)
@@ -1398,6 +1443,22 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             self._sonic = _SP.build_sonic(config_path=c.sonic_config_path,
                                           ckpt_path=c.sonic_ckpt_path, device=str(dev))
             self._sonic_layout, self._sonic_tok_dim = _SP.tokenizer_layout(self._sonic)
+            # ── [ROLLBACK MARKER: sonic-v11] 참조 자세 관측이 heading 정규화인지 자동 판별 ────
+            # SONIC v1.1 은 참조 루트 자세를 로봇의 "heading(요)"만으로 정규화합니다. 릴리스는
+            # 펠비스 전체 자세(롤·피치 포함)로 정규화했습니다. 계산이 바뀐 것이고 폭은 같은 6D
+            # 회전이라, config 상 이름만 다릅니다(레이아웃 오프셋은 두 변형이 동일 — 실측 확인).
+            #   release: motion_anchor_ori_b_mf_nonflat      / smpl_root_ori_b_multi_future
+            #   v1.1   : motion_anchor_ori_heading_mf_nonflat / smpl_root_ori_heading_multi_future
+            # 체크포인트를 바꾸는 것만으로 전환되도록 cfg 플래그 대신 레이아웃 키로 판별합니다.
+            # 원본: commands.py:1996 root_rot_dif_heading_multi_future,
+            #       torch_transform.py:391 get_heading_q.
+            self._sonic_heading = "motion_anchor_ori_heading_mf_nonflat" in self._sonic_layout
+            self._sonic_key_ori_g1 = ("motion_anchor_ori_heading_mf_nonflat" if self._sonic_heading
+                                      else "motion_anchor_ori_b_mf_nonflat")
+            self._sonic_key_ori_smpl = ("smpl_root_ori_heading_multi_future" if self._sonic_heading
+                                        else "smpl_root_ori_b_multi_future")
+            print(f"[sonic] 참조 자세 정규화 = {'heading(요만, v1.1)' if self._sonic_heading else '전체자세(릴리스)'}"
+                  f"  슬롯 g1={self._sonic_key_ori_g1}")
             self._sonic_perm = _SP.build_body_perm(list(self.robot.joint_names), device=dev)  # robot->SONIC (29)
             self._sonic_default = _SP.sonic_default_vector(dev).view(1, -1)                    # (1,29) SONIC order
             # ── [ROLLBACK MARKER: sonic-encoder-g1] ────────────────────────────────────────
@@ -1555,6 +1616,22 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         return torch.cat([h["ang"].reshape(E, -1), h["jpr"].reshape(E, -1), h["jvr"].reshape(E, -1),
                           h["act"].reshape(E, -1), h["grav"].reshape(E, -1)], dim=-1)
 
+    def _sonic_anchor_q(self) -> torch.Tensor:
+        """(E,4) 참조 자세를 상대화할 로봇 앵커 쿼터니언.
+
+        [sonic-v11] heading 모드면 요만 남깁니다 — get_heading_q (torch_transform.py:391) 와 동일:
+        x,y 성분을 0 으로 만들고 재정규화. 그러면 참조 모션의 롤·피치가 중력 기준으로 보존되고
+        heading 차이만 제거됩니다. 원본 주석의 한계도 그대로 물려받습니다 — 로봇이 뒤집히면
+        heading 이 불연속/미정의가 됩니다(우리는 넘어짐 구간에서 그 상황을 겪습니다).
+        """
+        q = _canon(self.robot.data.root_quat_w)                         # (E,4) wxyz
+        if not getattr(self, "_sonic_heading", False):
+            return q
+        q = q.clone()
+        q[..., 1] = 0.0
+        q[..., 2] = 0.0
+        return q / q.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+
     def _sonic_tokenizer(self) -> torch.Tensor:
         """(E,TOK) SONIC tokenizer obs in SMPL mode: encoder_index=[0,0,1] + the 10-frame future
         SMPL reference window (joints local, wrist ref, root orientation RELATIVE to the live
@@ -1577,20 +1654,20 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             s_, e_, _ = lay["command_multi_future_nonflat"]
             tok[:, s_:e_] = torch.cat([self._ref_g1_q[idx].reshape(E, -1),
                                        self._ref_g1_v[idx].reshape(E, -1)], dim=-1)
-            pelvis_q = _canon(self.robot.data.root_quat_w)
+            pelvis_q = self._sonic_anchor_q()                           # [sonic-v11] heading 이면 요만
             rq = self._sonic_root_q[idx]
             dif = self._sonic_qmul(self._sonic_qinv(pelvis_q).unsqueeze(1).expand(E, K, 4), rq)
             ori6 = math_utils.matrix_from_quat(dif.reshape(-1, 4))[..., :2].reshape(E, K, 6)
-            s_, e_, _ = lay["motion_anchor_ori_b_mf_nonflat"]; tok[:, s_:e_] = ori6.reshape(E, -1)
+            s_, e_, _ = lay[self._sonic_key_ori_g1]; tok[:, s_:e_] = ori6.reshape(E, -1)
             return tok
         s, e, _ = lay["encoder_index"]; tok[:, s:e] = torch.tensor([0.0, 0.0, 1.0], device=dev)
         s, e, _ = lay["smpl_joints_multi_future_local_nonflat"]; tok[:, s:e] = self._sonic_smpl_j[idx].reshape(E, -1)
         s, e, _ = lay["joint_pos_multi_future_wrist_for_smpl"]; tok[:, s:e] = self._sonic_wrist_ref[idx].reshape(E, -1)
-        pelvis_q = _canon(self.robot.data.root_quat_w)                  # (E,4) live pelvis
+        pelvis_q = self._sonic_anchor_q()                               # [sonic-v11] heading 이면 요만
         rq = self._sonic_root_q[idx]                                    # (E,10,4) reference root (Z-up)
         dif = self._sonic_qmul(self._sonic_qinv(pelvis_q).unsqueeze(1).expand(E, K, 4), rq)  # (E,10,4) robot-relative
         ori6 = math_utils.matrix_from_quat(dif.reshape(-1, 4))[..., :2].reshape(E, K, 6)
-        s, e, _ = lay["smpl_root_ori_b_multi_future"]; tok[:, s:e] = ori6.reshape(E, -1)
+        s, e, _ = lay[self._sonic_key_ori_smpl]; tok[:, s:e] = ori6.reshape(E, -1)
         return tok
 
     def _sonic_pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -2615,6 +2692,78 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
 
 
     # ── [ROLLBACK MARKER: link-kpt-objframe] ──────────────────────────────────────────
+    # ── [ROLLBACK MARKER: body-kpt-fk] 몸통 키포인트 목표를 리타게팅 FK 로 (2026-09-06) ──────
+    def _apply_body_kpt_fk(self) -> None:
+        """cfg.body_kpt_from_retarget_fk 면 _ref_kpts 의 몸통 13개를 리타게팅 로봇 FK 로 교체합니다.
+
+        기본 목표(SMPL-X 사람 키포인트)는 G1 이 도달할 수 없습니다 — 리타게팅 측정에서 사람 발목이
+        로봇 발목보다 5.4~5.8 cm 위, 어깨 잔차 22 cm, 골반 잔차 9.4 cm 입니다. 2026-09-05 run 에서
+        Error/body_kpts 가 0.108 m 에 고정되고 Episode_Reward/body_kpts 가 0.0 이었습니다.
+
+        여기서는 로봇을 프레임마다 리타게팅 자세(g1_joint_pos + g1_root_pose)로 세워 body_pos_w 를
+        읽습니다. 제거된 _solve_ref_link_local() 과 같은 방식이고, 물리를 진행시킬 필요가 없어
+        청크당 한 스텝이면 됩니다(환경 수가 프레임 수 이상이면 한 번에 끝납니다).
+
+        손 키포인트 42개와 손목은 건드리지 않습니다 — 그쪽은 사람 손을 목표로 두는 것이 의도입니다.
+        키포인트 오프셋(_kpt_offsets)은 몸통에서 전부 0 이므로(BODY_KPT_OFFSETS 가 빈 dict)
+        링크 원점이 곧 키포인트입니다. 그래도 일반성을 위해 오프셋을 적용해 둡니다.
+        """
+        if not getattr(self.cfg, "body_kpt_from_retarget_fk", False):
+            return
+        if self._ref_joints is None:
+            print("[body-kpt-fk] g1_joint_pos 가 없어 건너뜁니다 (SMPL-X 목표 유지).")
+            return
+        F, E, dev = self._ref_len, self.num_envs, self.device
+        nb = N_BODY_KPTS
+        org = self.scene.env_origins
+        aid = self._action_joint_ids_t
+        body_ids = self._kpt_body_ids[:nb]
+        body_off = self._kpt_offsets[:nb]
+        keep_q = self.robot.data.joint_pos.clone()
+        keep_r = self.robot.data.root_state_w[:, :7].clone()
+        out = torch.zeros(F, nb, 3, device=dev)
+        for base in range(0, F, E):
+            fr = (base + torch.arange(E, device=dev)).clamp(max=F - 1)
+            rp = torch.zeros(E, 7, device=dev)
+            rp[:, :3] = self._ref_root_pos[fr] + org
+            rp[:, 3:7] = self._ref_root_quat[fr]
+            jp = self.robot.data.default_joint_pos.clone()
+            jp[:, aid] = self._ref_joints[fr]
+            if self._ref_j0 is not None and self._ref_j0_ids is not None:
+                jp[:, self._ref_j0_ids] = self._ref_j0[fr]
+            self.robot.write_root_pose_to_sim(rp)
+            # [body-kpt-fk] 루트 속도를 반드시 0 으로 씁니다. write_root_pose_to_sim 은 자세만 쓰고
+            # 속도를 남기므로, 청크를 도는 동안 중력·접촉 충격으로 속도가 누적되고 각 스텝에서 그
+            # 속도만큼 이동한 뒤 위치를 읽게 됩니다. 실측: 이걸 빼면 골반(루트 링크, 관절 FK 무관)
+            # 이 27.7 cm 어긋났습니다 — 오프라인 pinocchio 계산값 6.8 cm 대비 4배.
+            # 제거된 _solve_ref_link_local() 도 같은 구조였지만 물체 기준 상대 좌표라 로봇 전체
+            # 이동이 상쇄돼 드러나지 않았습니다.
+            self.robot.write_root_velocity_to_sim(torch.zeros(E, 6, device=dev))
+            self.robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.scene.update(dt=self.physics_dt)
+            p = self.robot.data.body_pos_w[:, body_ids] - org.unsqueeze(1)      # (E,nb,3) env-local
+            q = self.robot.data.body_quat_w[:, body_ids]
+            kp = p + math_utils.quat_apply(q, body_off.unsqueeze(0).expand(E, -1, -1))
+            n = min(E, F - base)
+            out[base:base + n] = kp[:n]
+        # 로봇을 원래대로 (이 계산이 상태를 남기면 안 됩니다)
+        self.robot.write_root_pose_to_sim(keep_r)
+        self.robot.write_root_velocity_to_sim(torch.zeros(E, 6, device=dev))
+        self.robot.write_joint_state_to_sim(keep_q, torch.zeros_like(keep_q))
+        self.scene.write_data_to_sim()
+        _d = (out - self._ref_kpts[:, :nb]).norm(dim=-1)                 # (F,nb)
+        _names = list(BODY_KPTS.values())
+        print(f"[body-kpt-fk] 몸통 {nb}개 목표를 리타게팅 FK 로 교체: {F} 프레임. "
+              f"SMPL-X 대비 이동 거리 중앙 {_d.median().item()*100:.1f} cm, "
+              f"최대 {_d.max().item()*100:.1f} cm")
+        _md = _d.median(dim=0).values
+        for _i in torch.argsort(_md, descending=True).tolist():
+            print(f"    {_names[_i]:32s} 중앙 {_md[_i].item()*100:6.1f} cm  "
+                  f"최대 {_d[:, _i].max().item()*100:6.1f} cm")
+        self._ref_kpts[:, :nb] = out
+
     def _build_ref_link_kpt_local(self) -> None:
         """(F,L,3) 각 wrap 링크의 SMPL-X 목표 키포인트를 물체 기준 좌표로 채웁니다.
 

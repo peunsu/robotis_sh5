@@ -27,13 +27,24 @@ _PROC = _ROOT / "data" / "processed" / "parahome"
 _URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow.urdf"
 
 _ANKLE_SOLE_OFF = 0.036                       # 발목 링크 원점에서 발바닥까지 (원본 스크립트와 동일)
-_PARA_BALL_L, _PARA_BALL_R = 22, 18           # ParaHome 발 앞꿈치 인덱스
-_FOOT_PLANT_H, _FOOT_PLANT_VZ, _FPS = 0.06, 0.15, 30.0
+# ── [ROLLBACK MARKER: smplx-kpts] ParaHome joint_positions → SMPL-X (2026-09-04) ────────────
+# 리타게팅(retarget_g1_pyroki.py)이 SMPL-X 로 넘어갔는데 이 스크립트만 ParaHome 스트림에 남아
+# 있어서, 같은 판정식을 써도 발 접지 기준선이 달랐습니다 (ParaHome 발끝 z 중앙 1.4 cm vs
+# SMPL-X 2.4~3.5 cm). 인덱스는 리타게팅의 _BODY/_HAND_CHAIN/_PALM/_PAD_BASE 와 같은 규약입니다.
+_BALL_L, _BALL_R = 10, 11                     # SMPL-X left_foot / right_foot (발 앞꿈치)
+# [foot-plant-3d] height 0.05, vel 1.00 (3D 노름) — 리타게팅의 _FOOT_PLANT_H/_V 와 같아야 합니다.
+_FOOT_PLANT_H, _FOOT_PLANT_V, _FPS = 0.05, 1.00, 30.0
 # 사람 손끝(TIP)과 로봇 distal 링크 + 패드 오프셋. 대응표가 바뀌어도 이 짝은 고정입니다.
-_TIPS = {"th": 24, "ff": 21, "mf": 17, "rf": 13, "lf": 9}
+# 손끝은 smplx_joints(55) 뒤에 fingertip_pad_pos(10) 를 이어붙인 자리에서 읽습니다 — 순서는
+# LEFT[th,ff,mf,rf,lf] 다음 RIGHT[th,ff,mf,rf,lf] 로 리타게팅의 _FT_OFF_R 순회와 동일합니다.
+_PAD_BASE = 55
+_TIPS = {"th": 0, "ff": 1, "mf": 2, "rf": 3, "lf": 4}
 _FT_OFF_R = {"th": [-0.0085, 0.0, 0.02], "ff": [0.0, -0.006, 0.0175], "mf": [0.0, -0.006, 0.0175],
              "rf": [0.0, -0.006, 0.0175], "lf": [0.0, -0.006, 0.0175]}
-_SIDE_OFF = {"l": 23, "r": 48}
+# 손목(SMPL-X wrist 20/21)과 손 관절 시작(25/40, 손가락 순서 index,middle,pinky,ring,thumb).
+# 손목 랜드마크 프레임에 쓰는 index MCP = hand+0, middle MCP = hand+3.
+_SIDES = {"l": {"wrist": 20, "hand": 25, "pad": _PAD_BASE},
+          "r": {"wrist": 21, "hand": 40, "pad": _PAD_BASE + 5}}
 
 
 def quat2R(q):
@@ -67,7 +78,10 @@ def main() -> None:
 
     d = _PROC / "smplx" / args.cls / args.clip / "0"
     sm = np.load(d / "trajectory.npz", allow_pickle=True)
-    jp = sm["joint_positions"].astype(np.float64)                    # (F,73,3)
+    if "smplx_joints" not in sm.files:
+        raise KeyError("[smplx-kpts] smplx_joints 없음 — parahome.py --overwrite 로 재생성하세요")
+    jp = np.concatenate([sm["smplx_joints"].astype(np.float64),
+                         sm["fingertip_pad_pos"].astype(np.float64)], axis=1)   # (F,65,3)
 
     urdf = yourdfpy.URDF.load(str(_URDF))
     robot = pk.Robot.from_urdf(urdf)
@@ -78,10 +92,10 @@ def main() -> None:
     # 발 접지 구간 (원본 스크립트의 _foot_contact 와 같은 판정)
     def plant(idx):
         p = jp[:, idx]
-        vz = np.zeros(len(p))
-        vz[1:] = np.abs(p[1:, 2] - p[:-1, 2]) * _FPS
-        return (p[:, 2] < _FOOT_PLANT_H) & (vz < _FOOT_PLANT_VZ)
-    c_l, c_r = plant(_PARA_BALL_L), plant(_PARA_BALL_R)
+        v = np.zeros(len(p))
+        v[1:] = np.linalg.norm(p[1:] - p[:-1], axis=-1) * _FPS   # [foot-plant-3d] 3D 노름
+        return (p[:, 2] < _FOOT_PLANT_H) & (v < _FOOT_PLANT_V)
+    c_l, c_r = plant(_BALL_L), plant(_BALL_R)
 
     print(f"클립 {args.clip}\n")
     hdr = (f"{'':<26}" + "".join(f"{('v1' if t == '' else t):>14}" for t in tags))
@@ -121,19 +135,21 @@ def main() -> None:
 
         # --- 손끝: 사람 TIP 과의 거리 (대응표와 무관) ---
         err = []
-        for side, off in _SIDE_OFF.items():
+        for side, sd in _SIDES.items():
             for fg, ti in _TIPS.items():
                 o = _FT_OFF_R[fg] if not (side == "l" and fg != "th") else \
                     [_FT_OFF_R[fg][0], -_FT_OFF_R[fg][1], _FT_OFF_R[fg][2]]
-                err.append(np.linalg.norm(world(f"robot0_{side}_{fg}distal", o) - jp[:, off + ti], axis=-1))
+                err.append(np.linalg.norm(world(f"robot0_{side}_{fg}distal", o)
+                                          - jp[:, sd["pad"] + ti], axis=-1))
         err = np.stack(err)                                            # (10,F)
         out["손끝-사람 거리 중앙(mm)"] = float(np.median(err)) * 1000
         out["손끝-사람 거리 p90(mm)"] = float(np.quantile(err, 0.9)) * 1000
 
         # --- 손목 회전: 사람/로봇 각각 랜드마크 프레임을 만들어 각도 차 ---
         wr = []
-        for side, off in _SIDE_OFF.items():
-            Rh = landmark_R(jp[:, off + 0], jp[:, off + 18], jp[:, off + 14])
+        for side, sd in _SIDES.items():
+            # [smplx-kpts] wrist / index MCP / middle MCP
+            Rh = landmark_R(jp[:, sd["wrist"]], jp[:, sd["hand"] + 0], jp[:, sd["hand"] + 3])
             Rr = landmark_R(world(f"robot0_{side}_palm"),
                             world(f"robot0_{side}_ffknuckle"), world(f"robot0_{side}_mfknuckle"))
             dR = np.einsum("fji,fjk->fik", Rh, Rr)

@@ -30,8 +30,6 @@ validated by measurement on s101_seg12_knife. The version they replaced is prese
         error 12.9 -> 1.7 deg (right hand). Folded into contact_grasp rather than added as its own
         cost: a separate cost re-differentiates forward kinematics for the whole clip and cost +5.3 GB
         of host RAM for 3 residuals per hand.
-  [V2: hand-local-scale]  Hand local alignment + a shared hand scale matrix. Measured HARMFUL and
-        left OFF by default (W_HANDLOCAL=0) — see the weight's comment for the numbers.
 
 NOTE the left-hand mirror bug fixed in export_g1_shadow_urdf.py is NOT in this file: the URDF's left
 hand had lost its mirrored joint axes, so left fingers curled the wrong way. Both this script and the
@@ -66,7 +64,11 @@ from retarget_helpers._utils import create_conn_tree  # noqa: E402
 
 _ROOT = Path("/home/peunsu/workspace/robotis_sh5/source/robotis_sh5")
 _PROC = _ROOT / "data" / "processed" / "parahome"
-_URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow.urdf"
+# [cost-cleanup 2026-09-04] 기본 URDF 를 부등식 모드(nomimic)로 전환했습니다. 등식 mimic
+# (J0 = 1.14184 x J1) 은 Shadow 문서의 J0 <= J1 부등식을 J1>0 에서 위반하고, 실측 기울기
+# 0.913 이 역수 r2/r1 = 0.87578 에 가까워 multiplier 가 뒤집혔을 가능성이 높습니다.
+# 등식 mimic 으로 되돌리려면 W_URDF=<...>/g1_shadow.urdf (그때는 W_TENDONINEQ 가 무효).
+_URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow_nomimic.urdf"
 # ── [ROLLBACK MARKER: tendon-ineq] J0 를 mimic 등식이 아니라 부등식으로 (2026-09-02) ──────────
 # Shadow 공식 문서(md_finger, Loopback tendons and J0 coupling)는 이 결합이 비례 기어가 아니라
 # 부등식이라고 명시한다:  joint1 angle ≤ joint2 angle  (Shadow 명명).
@@ -79,14 +81,27 @@ _URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow.urdf"
 _URDF = Path(os.environ.get("W_URDF", str(_URDF)))
 _ORDER = json.load(open(_ROOT / "data" / "robots" / "G1" / "g1_shadow_joint_order.json"))
 
-# ---- ParaHome joint idx → composite-URDF link name ----------------------------------------
-# body: our BODY_KPTS correspondence (minus ball-foot dups 18/22 → ankle_roll used at 17/21)
+# ── [ROLLBACK MARKER: smplx-kpts] 키포인트 소스를 ParaHome → SMPL-X 로 전환 (2026-09-04) ──
+# 이 파일은 원래 ParaHome 자체 스트림(joint_positions, Xsens 계열 23 몸통 + 25+25 손 = 73)을
+# 썼습니다. parahome.py 상단 서술이 SMPL-X 를 "리타게팅 표준 입력"으로 규정하는데 구현이 반대로
+# 되어 있었고, 사용자 의도가 SMPL-X 였으므로 전환합니다. 소스는 npz 의 smplx_joints (F,55,3).
+#
+# 몸통 대응은 PyRoki 원본(examples/retarget_helpers/_utils.py:147 get_humanoid_retarget_indices)
+# 의 13쌍과 동일하게 맞췄습니다 — 특히 척추를 매핑하지 않습니다.
+#   왜 척추를 빼는가: 사람 척추는 다관절이고 G1 허리는 3-DOF 에 torso_link 원점이 골반에서 4.4 cm
+#   뿐입니다. 옛 대응 (4 jT9T8 → torso_link) 은 사람 상흉부(골반 기준 32.0 cm)를 그 4.4 cm 링크에
+#   오프셋 0 으로 요구해 27.6 cm 가 구조적으로 만족 불가능했고(실측 잔차 37~51 cm, 전 대응 중 최대),
+#   그 잔차가 골반 하강/상체 기울기로 새어 waist_pitch 중력 모멘트를 키웠습니다.
+#   SMPL-X 로도 spine1 이 9.7~12.4 cm 라 오프셋 없이는 여전히 안 맞습니다. PyRoki 처럼 제외하면
+#   local_alignment(상대 벡터+각도, 학습 스케일)이 어깨-골반 상대 기하로 상체 방향을 잡습니다.
+# SMPL-X 관절 순서: 0 pelvis, 1/2 hip, 3 spine1, 4/5 knee, 6 spine2, 7/8 ankle, 9 spine3,
+#   10/11 foot, 12 neck, 13/14 collar, 15 head, 16/17 shoulder, 18/19 elbow, 20/21 wrist.
 _BODY = [
-    (0, "pelvis"), (4, "torso_link"),
-    (8, "right_shoulder_pitch_link"), (9, "right_elbow_link"), (10, "right_wrist_yaw_link"),
-    (12, "left_shoulder_pitch_link"), (13, "left_elbow_link"), (14, "left_wrist_yaw_link"),
-    (15, "right_hip_pitch_link"), (16, "right_knee_link"), (17, "right_ankle_roll_link"),
-    (19, "left_hip_pitch_link"), (20, "left_knee_link"), (21, "left_ankle_roll_link"),
+    (0, "pelvis"),
+    (17, "right_shoulder_pitch_link"), (19, "right_elbow_link"), (21, "right_wrist_yaw_link"),
+    (16, "left_shoulder_pitch_link"), (18, "left_elbow_link"), (20, "left_wrist_yaw_link"),
+    (2, "right_hip_pitch_link"), (5, "right_knee_link"), (8, "right_ankle_roll_link"),
+    (1, "left_hip_pitch_link"), (4, "left_knee_link"), (7, "left_ankle_roll_link"),
 ]
 # hands: HAND_CHAIN (ParaHome hand-local idx → Shadow body); left block +23, right +48
 # [V2: hand-correspondence] 손 대응표. v1에서 관절 하나만큼 밀려 있던 것을 바로잡았습니다.
@@ -106,12 +121,19 @@ _BODY = [
 #
 # 사람 손끝(TIP: 21/17/13/9)은 대응에서 빠집니다 — 로봇에는 대응하는 링크 원점이 없고, 손끝은
 # _FT_PADS + _FT_OFF_R 로 접촉 비용에서 따로 다룹니다.
+# [smplx-kpts] SMPL-X 손 블록 로컬 인덱스 (왼손 base 25 / 오른손 base 40).
+# 블록 순서: index1,2,3  middle1,2,3  pinky1,2,3  ring1,2,3  thumb1,2,3  (각 MCP/PIP/DIP)
+# 손목은 SMPL-X 손 블록에 없고 몸통 20/21 이라 아래 _PALM 으로 따로 붙입니다.
+#
+# 엄지는 TJ 의 gr_env_cfg.py:110-113 (MANO↔Shadow, 검증된 매핑)과 같은 [thbase, thmiddle, thdistal]
+# 입니다. 로봇 엄지 체인에 퇴화 쌍이 둘 있습니다 — thbase/thproximal 이 좌표 동일(0.00 cm),
+# thhub/thmiddle 도 동일. TJ 는 각 쌍에서 하나씩만 취해 비퇴화 3점을 확보합니다. 뼈 길이 비
+# 실측 1.32 / 1.29 로 네 손가락 대역(1.08~1.64) 안입니다.
 _HAND_CHAIN = {
-    "wrist":  ([0], ["palm"]),
-    "index":  ([18, 19, 20], ["ffknuckle", "ffmiddle", "ffdistal"]),
-    "middle": ([14, 15, 16], ["mfknuckle", "mfmiddle", "mfdistal"]),
-    "ring":   ([10, 11, 12], ["rfknuckle", "rfmiddle", "rfdistal"]),
+    "index":  ([0, 1, 2], ["ffknuckle", "ffmiddle", "ffdistal"]),
+    "middle": ([3, 4, 5], ["mfknuckle", "mfmiddle", "mfdistal"]),
     "pinky":  ([6, 7, 8], ["lfknuckle", "lfmiddle", "lfdistal"]),
+    "ring":   ([9, 10, 11], ["rfknuckle", "rfmiddle", "rfdistal"]),
     # ── [ROLLBACK MARKER: hand-kpt-align] 엄지 대응 정정 (2026-08-15) ────────────────────────
     # 사람 엄지는 22, 23, 24 세 점이고 24 는 손끝입니다(fingertip_pad_pos[0] 과 0.33 cm 일치로 확인).
     # 옛 대응 [22,23,24] -> [thproximal, thmiddle, thdistal] 은 한 칸씩 밀려 있었습니다. 여기서는
@@ -125,7 +147,7 @@ _HAND_CHAIN = {
     # (로봇 knuckle/middle/distal 원점이 각각 MCP/PIP/DIP 에 있습니다).
     # env 의 HAND_CHAIN 도 같은 대응으로 맞췄습니다 — 두 곳이 어긋나면 리타게팅이 맞춘 것과
     # 보상이 재는 것이 달라집니다.
-    "thumb":  ([22, 23], ["thmiddle", "thdistal"]),
+    "thumb":  ([12, 13, 14], ["thbase", "thmiddle", "thdistal"]),
 }
 
 
@@ -137,9 +159,13 @@ _HAND_CHAIN = {
 # 그래서 대응 자체에 오프셋을 실어 global_align 하나로 처리합니다. FK 를 나눠 쓰고, 가중치도
 # gw 한 곳에서 다른 키포인트와 같은 방식으로 정해집니다.
 #
-# 목표는 사람 fingertip_pad_pos (F,10,3) 인데 joint_positions (F,73,3) 와 다른 배열이라,
-# main 에서 두 배열을 이어붙여 (F,83,3) 로 만들고 손끝은 뒤쪽 인덱스 73.. 를 가리킵니다.
-_PAD_BASE = 73                                   # jp(73) 뒤에 fingertip_pad_pos 10개를 이어붙인 시작
+# 목표는 사람 fingertip_pad_pos (F,10,3) 인데 smplx_joints (F,55,3) 와 다른 배열이라,
+# main 에서 두 배열을 이어붙여 (F,65,3) 로 만들고 손끝은 뒤쪽 인덱스 55.. 를 가리킵니다.
+_PAD_BASE = 55                                   # [smplx-kpts] smplx_joints(55) 뒤에 손끝 10개
+# [smplx-kpts] SMPL-X 손 블록에는 손목이 없습니다(몸통 20/21). 옛 _HAND_CHAIN 의 ("wrist",[0]→palm)
+# 을 대체합니다 — 같은 사람 관절이 wrist_yaw_link(_BODY)와 palm 두 링크에 대응하는데, 옛 ParaHome
+# 대응도 jWrist 를 몸통 10/14 와 손 로컬 0 두 곳에 쓰고 있었으므로 구조가 동일합니다.
+_PALM = [(20, "robot0_l_palm"), (21, "robot0_r_palm")]
 _PAD_ORDER = ("th", "ff", "mf", "rf", "lf")      # fingertip_pad_pos 의 손별 순서
 
 
@@ -149,7 +175,8 @@ def _build_correspondence():
     오프셋이 0 이 아닌 것은 손끝 10개뿐입니다(말단 링크 -> pad). 나머지는 링크 원점입니다.
     """
     pairs = [(p, l, [0.0, 0.0, 0.0]) for p, l in _BODY]
-    for side, off in (("l", 23), ("r", 48)):
+    pairs += [(p, l, [0.0, 0.0, 0.0]) for p, l in _PALM]     # [smplx-kpts] 손목 → palm
+    for side, off in (("l", 25), ("r", 40)):                 # [smplx-kpts] SMPL-X 손 블록 base
         for local, shadow in _HAND_CHAIN.values():
             for pl, sh in zip(local, shadow):
                 pairs.append((off + pl, f"robot0_{side}_{sh}", [0.0, 0.0, 0.0]))
@@ -162,13 +189,29 @@ def _build_correspondence():
     return pairs
 
 
-_FOOT_PLANT_H, _FOOT_PLANT_VZ, _FPS = 0.06, 0.15, 30.0
-_PARA_BALL_L, _PARA_BALL_R = 22, 18
+# ── [ROLLBACK MARKER: foot-plant-3d] 접지 판정을 SONIC 기준으로 (2026-09-04) ────────────────
+# SONIC/motionbricks 의 foot_detect_from_pos_and_vel(positions, velocity, skeleton, 0.15, 0.10)
+# (motionlib/core/motion_reps/tools/feet.py) 과 동일한 기준: 높이 임계 0.10 m, 속도 임계 0.15 m/s
+# 이며 속도는 수직 성분이 아니라 3D 노름입니다. 이전 값은 0.06 + |vz| 였는데, 수직 성분만 보면
+# 발을 낮게 둔 채 수평으로 미끄러지는 체중 이동이 전부 "접지"로 판정됩니다 (s101_seg29_pot 에서
+# 200 프레임 전부 접지 → floor_contact 가 양발을 클립 내내 바닥에 고정 → 스텝이 발 끌기로 나옴).
+# 되돌리려면 이 줄을 0.06 으로 바꾸고 _foot_contact 의 노름을 |Δz| 로 교체하십시오.
+# [foot-plant-3d 2026-09-04 갱신] 높이 0.05 m / 속도 1.25 m/s. SONIC 기본값(0.10 / 0.15)에서
+# 높이는 조이고 속도는 크게 풀었습니다 — 1.00 m/s 는 사람 발끝 속도 분포의 이봉 사이 골에 있어
+# 실질적으로 높이 단독 판정에 가깝고, 낮게 미끄러지는 체중 이동을 접지로 유지하면서 실제로
+# 발을 5 cm 이상 드는 구간만 스윙으로 잡습니다. 속도는 여전히 3D 노름입니다.
+_FOOT_PLANT_H, _FOOT_PLANT_V, _FPS = 0.05, 1.00, 30.0
+# [smplx-kpts] 발 접지 판정에 쓰는 "볼(ball) 발" 키포인트. ParaHome 은 jLeftBallFoot(22)/
+# jRightBallFoot(18) 이었고 SMPL-X 는 left_foot(10)/right_foot(11) 이 같은 역할(발가락 볼)입니다.
+_PARA_BALL_L, _PARA_BALL_R = 10, 11
 # G1 ankle_roll_link origin sits this far ABOVE the foot sole (URDF foot-corner contact spheres at
 # z=-0.031, r=0.005 → sole at -0.036). floor_contact targets the ANKLE, so its z target must be this
 # offset (not 0) — else pulling the ankle to z=0 drives the sole ~3.6 cm INTO the floor (feet penetrate
 # at high W_FLOOR) or, when weak, the balance leaves the foot floating. Target = sole-on-floor.
-_ANKLE_SOLE_OFF = 0.036
+# [ankle-sole-test 2026-09-04] 예제 12 는 floor_contact 목표 z 를 높이맵 투영값(평지=0)으로 두는데
+# 우리는 발목 원점이 발바닥보다 3.6 cm 위라서 이 값으로 덮어씁니다. 예제와 일치시키는(=0) 실험을
+# 위해 환경변수로 뺐습니다: W_ANKLESOLE=0 이면 예제와 동일.
+_ANKLE_SOLE_OFF = float(os.environ.get("W_ANKLESOLE", 0.036))
 _MOVE_LESS = ["left_hip_yaw_joint", "right_hip_yaw_joint", "waist_yaw_joint"]
 # ── [ROLLBACK MARKER: tendon-couple] 텐던 결합 J1<->J0 (2026-08-15) ──────────────────────────
 # 이 8개는 액추에이터가 없는 텐던 축 관절입니다. 예전에는 시뮬레이터에서 J0가 자체 USD 드라이브에
@@ -299,17 +342,19 @@ def _contact_signal(ftpad, obj_base, obj_name):
 
 
 def _foot_contact(jp, ball_idx):
-    z = jp[:, ball_idx, 2]
-    vz = onp.zeros_like(z); vz[1:] = (z[1:] - z[:-1]) * _FPS
-    return ((z < _FOOT_PLANT_H) & (onp.abs(vz) < _FOOT_PLANT_VZ)).astype(onp.float32)
+    # [ROLLBACK MARKER: foot-plant-3d] 속도는 3D 노름 (SONIC 기준). |Δz| 로 바꾸면 이전 동작.
+    p = jp[:, ball_idx, :]
+    v = onp.zeros(len(p), dtype=onp.float32)
+    v[1:] = onp.linalg.norm(p[1:] - p[:-1], axis=-1) * _FPS
+    return ((p[:, 2] < _FOOT_PLANT_H) & (v < _FOOT_PLANT_V)).astype(onp.float32)
 
 
 def _pelvis_target_R(jp):
     """Per-frame target pelvis orientation (world) from ParaHome body keypoints, in the G1 pelvis-link
     convention X=forward, Y=left, Z=up.  up = midshoulder→ (spine), left = right→left hip, forward = left×up.
     Constraining the free root to this removes the spurious roll that saturates hip_roll/waist_roll."""
-    p_rs, p_ls = jp[:, 8], jp[:, 12]      # right / left shoulder
-    p_rh, p_lh = jp[:, 15], jp[:, 19]     # right / left hip
+    p_rs, p_ls = jp[:, 17], jp[:, 16]     # [smplx-kpts] right / left shoulder
+    p_rh, p_lh = jp[:, 2], jp[:, 1]       # [smplx-kpts] right / left hip
     z = 0.5 * (p_ls + p_rs) - 0.5 * (p_lh + p_rh)          # up (hips → shoulders)
     z /= onp.linalg.norm(z, axis=1, keepdims=True) + 1e-9
     y = p_lh - p_rh                                        # left (right hip → left hip)
@@ -323,192 +368,12 @@ def _pelvis_target_R(jp):
 def _flat_heightmap(jp, bins=48, margin=0.6):
     """Flat floor (z=0) heightmap spanning the clip's body-keypoint xy extent — the ParaHome scene has
     no terrain, so world_collision just prevents the robot sinking below the floor (and lifts it up)."""
-    xy = jp[:, :23, :2].reshape(-1, 2)
+    xy = jp[:, :22, :2].reshape(-1, 2)
     lo = xy.min(0) - margin; hi = xy.max(0) + margin
     cx, cy = (lo + hi) / 2.0; dx, dy = (hi - lo)
     box = trimesh.creation.box(extents=[float(dx), float(dy), 0.1])
     box.apply_translation([float(cx), float(cy), -0.05])          # top face at z=0
     return pk.collision.Heightmap.from_trimesh(box, x_bins=bins, y_bins=bins)
-
-
-# [SCENE-COLLISION] ---------------------------------------------------------------------------
-def _context_boxes(sm, obj_key, jp_cloud, radius=1.0, support_radius=1.5,
-                   reach=float(os.environ.get("W_SCENEREACH", 0.2)),
-                   max_boxes=int(os.environ.get("W_SCENEMAXBOX", 64))):
-    """Boxes approximating the fixed scene the env spawns, for the world_collision cost.
-
-    The floor heightmap above was the ONLY thing the retarget collided against, so the counter, sink
-    and board simply were not in the problem. The solve happily put the LEFT hand inside the
-    countertop, and the sim then threw it out at up to 5.47 m/s (470 of 501 frames) — every bit of
-    that impulse lands on the robot, because the context spawns kinematic.
-
-    Geometry choice, measured on s101_seg12_knife (78 robot capsules x 301 frames):
-
-        one OBB per object     max penetration 36.6 cm, 21493 pairs — mostly the OBB's own slack
-                               (the sink mesh fills 31% of its OBB), and it traps the LEGS
-        per-hull OBBs          max  6.0 cm,  1813 pairs, and the deepest links are the LEFT HAND —
-                               which is the defect we are actually chasing
-        heightmap              max 117 cm, deepest links the ANKLES: a height field is solid all the
-                               way down, so a robot standing at a counter reads as buried in it
-
-    So: convex-decompose, then take each hull's OBB. pyroki has no hull primitive, but Capsule-Box
-    is native and `capsule_box` uses a real box SDF (inside, the depth is to the NEAREST FACE), which
-    is what keeps a pelvis grazing the counter edge at ~4 cm instead of the ~80 cm a height field
-    would report.
-
-    Hull count is NOT controllable here: trimesh delegates to `pyVHACD.compute_vhacd`, which takes no
-    keyword arguments, so the decomposition runs at its own default (~64 hulls on the sink). The
-    simulator converts with `max_convex_hulls=16`, so the two differ — the retarget sees a somewhat
-    tighter scene than PhysX does. Taking the OBB of each hull inflates it back, which pushes the
-    other way; the net is verified by measurement, not assumed. Aligning them properly means
-    re-converting the context USDs at a matching hull count.
-
-    Selection mirrors the env (proximity of the frame-0 centroid to the active object's swept path
-    + the below-object support), so both see the same scene.
-    """
-    act = sm[obj_key].astype(onp.float64)
-    act_xy, act0 = act[:, :2], act[0]
-    cands = []
-    for k in (kk for kk in sm.files if kk.startswith("ctx__") and kk.endswith("__base")):
-        pose0 = sm[k][0].astype(onp.float64)
-        dmin = float(onp.linalg.norm(act_xy - pose0[None, :2], axis=1).min())
-        cands.append((k.split("__")[1], pose0, dmin))
-    keep = {n for n, _, dm in cands if dm < radius}
-    below = [(float(onp.linalg.norm(act0[:2] - q[:2])), n) for n, q, _ in cands
-             if q[2] < act0[2] and float(onp.linalg.norm(act0[:2] - q[:2])) < support_radius]
-    if below:
-        keep.add(min(below)[1])
-
-    centres, extents = [], []
-    for name, q, _ in cands:
-        if name not in keep:
-            continue
-        src = _RAW_SCAN / name / "simplified" / "base.obj"
-        if not src.exists():
-            print(f"[pyroki-retarget] scene: no scan mesh for {name}, skipped")
-            continue
-        mesh = trimesh.load(str(src), process=False, force="mesh")
-        rot = trimesh.transformations.quaternion_matrix([q[3], q[4], q[5], q[6]])[:3, :3]
-        mesh.vertices = mesh.vertices @ rot.T + q[:3]
-        parts = mesh.convex_decomposition()                       # pyVHACD; takes no kwargs
-        parts = parts if isinstance(parts, list) else [parts]
-        if len(parts) <= 1:
-            # A single hull means the object collapsed to its own bounding volume, which for a
-            # counter is 3x its real volume and would trap the robot's legs. Loud on purpose: the
-            # earlier silent fallback to one OBB per object is what made the first run a no-op.
-            print(f"[pyroki-retarget] scene: WARNING {name} decomposed to {len(parts)} hull — its OBB "
-                  f"will be far larger than the object")
-        for prt in parts:
-            v = onp.asarray(prt.vertices)
-            lo, hi = v.min(0), v.max(0)
-            if (hi - lo).min() < 1e-4:                            # degenerate sliver
-                continue
-            centres.append((lo + hi) / 2.0)
-            extents.append(hi - lo)
-    if not centres:
-        return None
-    centres, extents = onp.asarray(centres), onp.asarray(extents)
-    # Prune to what the body can plausibly reach. This is not an optimisation nicety: the residual is
-    # (frames x capsules x boxes) and jaxls differentiates through all of it, so the unpruned 576
-    # boxes asked for 40 GB against a 27 GB device and the solve died. Distance is measured from the
-    # HUMAN body-keypoint cloud (the robot tracks it) to each box's surface, so a box is kept only if
-    # some body point passes within `reach` of it. At 0.3 m this keeps 179 of 576 — the cutting board
-    # and counter the hands work on — and drops the fridge/microwave the robot never approaches.
-    # The budget is tight because jaxls differentiates the whole (frames x capsules x boxes)
-    # block: 576 boxes needed 40 GB, 180 needed 21.6 GB, against a 32 GB device. 64 boxes at
-    # 0.2 m is the cutting board + countertop, which is exactly where the left hand sinks in;
-    # the legs that a larger set would also constrain were measured to be FALSE positives of
-    # the OBB slack, and grounding is already owned by the floor heightmap.
-    kp = jp_cloud.reshape(-1, 3)
-    gap = onp.abs(kp[:, None, :] - centres[None, :, :]) - extents[None, :, :] / 2.0
-    d = onp.linalg.norm(onp.clip(gap, 0.0, None), axis=-1).min(0)         # (K,) surface distance
-    m = d < reach
-    if m.sum() > max_boxes:                                              # keep the closest
-        m = onp.zeros_like(m); m[onp.argsort(d)[:max_boxes]] = True
-    centres, extents = centres[m], extents[m]
-    print(f"[pyroki-retarget] scene collision: {len(centres)} boxes (of {len(d)}) from {sorted(keep)} "
-          f"(kept within {reach} m of the body keypoints)")
-    return pk.collision.Box.from_extent(
-        extent=jnp.array(extents, jnp.float32),
-        position=jnp.array(centres, jnp.float32),
-        wxyz=jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0], jnp.float32), (len(centres), 1)))
-# [/SCENE-COLLISION] --------------------------------------------------------------------------
-
-
-# [OBJECT-COLLISION] ---------------------------------------------------------------------------
-def _object_boxes(obj_name, max_boxes=int(os.environ.get("W_OBJCOLLMAXBOX", 64))):
-    """Boxes approximating the MANIPULATED object, expressed in the OBJECT'S OWN frame.
-
-    The manipulated object was never in the retarget problem — only the floor (and optionally the
-    context furniture). Nothing stopped the solve from putting a finger INSIDE the knife, and it did:
-    measured on the reference poses of s101_seg12_knife, `robot0_r_ffmiddle` sits inside the knife
-    mesh in 60.9% of frames at 4.8 mm mean depth (every other right-hand link is under 1%). The sim
-    then has to resolve that overlap at episode start, which is the "hand stuck in the object" the
-    training runs show.
-
-    Local frame, not world: unlike the context furniture this object MOVES every frame, so the boxes
-    are built once here in the object's own frame and transformed per frame inside the cost, where
-    the frame index is already the vmapped axis.
-
-    Same geometry recipe as `_context_boxes` (convex-decompose, then take each hull's box) for the
-    same reason — one box per object is far larger than the object, and pyroki has no hull primitive.
-    The knife decomposes to 64 hulls of 8.5 mm median thickness, so the per-hull boxes stay thin
-    enough that a fingertip can rest ON the blade without the box claiming it is inside.
-    """
-    src = _RAW_SCAN / obj_name / "simplified" / "base.obj"
-    if not src.exists():
-        print(f"[pyroki-retarget] object collision: no scan mesh for {obj_name}, term disabled")
-        return None
-    mesh = trimesh.load(str(src), process=False, force="mesh")
-    parts = mesh.convex_decomposition()                       # pyVHACD; takes no kwargs
-    parts = parts if isinstance(parts, list) else [parts]
-    centres, extents, vols = [], [], []
-    for prt in parts:
-        v = onp.asarray(prt.vertices)
-        lo, hi = v.min(0), v.max(0)
-        if (hi - lo).min() < 1e-4:                            # degenerate sliver
-            continue
-        centres.append((lo + hi) / 2.0)
-        extents.append(hi - lo)
-        vols.append(float(onp.prod(hi - lo)))
-    if not centres:
-        return None
-    centres, extents, vols = onp.asarray(centres), onp.asarray(extents), onp.asarray(vols)
-    if len(centres) > max_boxes:                              # keep the bulkiest hulls
-        k = onp.argsort(-vols)[:max_boxes]
-        centres, extents = centres[k], extents[k]
-    inflate = float(extents.prod(1).sum() / max(sum(p.volume for p in parts), 1e-9))
-    print(f"[pyroki-retarget] object collision: {len(centres)} boxes for '{obj_name}' "
-          f"(hulls {len(parts)}, box volume {inflate:.1f}x the hulls')")
-    return onp.asarray(centres, onp.float32), onp.asarray(extents, onp.float32)
-# [/OBJECT-COLLISION] --------------------------------------------------------------------------
-
-
-def _give_hands_collision_geometry(urdf):
-    """Copy each hand link's VISUAL mesh into its (empty) collision slot, in place.
-
-    Without this the object-collision term below is aimed at nothing. The Shadow hand links in this
-    URDF carry no <collision> element at all, so pyroki fits them a ZERO-radius capsule — measured:
-    every `robot0_*` finger link has radius 0.0 mm, and the whole hand is represented by a single
-    65.2 mm-radius capsule on the palm (whose real thickness is 34 mm). Constraining that stand-in
-    made penetration WORSE, not better: it pushed the oversized palm ball clear of the knife and
-    drove the index finger — which the problem could not see — 4.6 mm -> 6.0 mm deeper.
-
-    The palm's own two boxes are left alone; its capsule is a poor fit either way (a capsule around
-    a flat palm is inflated no matter what it is fitted to), and the fingers are what penetrate.
-    """
-    n = 0
-    for name, link in urdf.link_map.items():
-        if not name.startswith("robot0_") or link.collisions or not link.visuals:
-            continue
-        for v in link.visuals:
-            if v.geometry is None or v.geometry.mesh is None:
-                continue
-            link.collisions.append(yourdfpy.Collision(name=f"{name}_coll", origin=v.origin,
-                                                      geometry=v.geometry))
-            n += 1
-    print(f"[pyroki-retarget] hand collision: filled {n} empty collision slots from the visual meshes")
-    return urdf
 
 
 def _hand_sets(robot):
@@ -519,9 +384,17 @@ def _hand_sets(robot):
     손가락이 안쪽으로 눌립니다 — 크기 차이를 흡수할 통로가 없었습니다. pyroki 11번 손 예제는
     바로 이 스케일 행렬로 그 차이를 흡수합니다.
     """
+    # [smplx-kpts] 오프셋을 SMPL-X 손 블록(왼 25 / 오른 40)으로. 그리고 palm 을 리스트 0번에
+    # 명시적으로 넣습니다 — 옛 _HAND_CHAIN 은 ("wrist",[0]->palm) 로 시작해 palm 이 0번이었고,
+    # wrist_orient 의 _t=[0,1,4](palm, ffknuckle, mfknuckle) 가 그 순서를 전제합니다. palm 을
+    # _PALM 으로 빼내면서 이 전제가 깨져 손목 프레임이 검지 한 줄에서 만들어졌습니다(방향 붕괴).
     out = {}
-    for side, off in (("l", 23), ("r", 48)):
+    _palm_of = {l: p for p, l in _PALM}
+    for side, off in (("l", 25), ("r", 40)):
         hp, hl = [], []
+        _pl_name = f"robot0_{side}_palm"
+        hp.append(_palm_of[_pl_name])                        # 0번 = 손목(사람) ↔ palm(로봇)
+        hl.append(robot.links.names.index(_pl_name))
         for local, shadow in _HAND_CHAIN.values():
             for pl, sh in zip(local, shadow):
                 hp.append(off + pl)
@@ -530,11 +403,11 @@ def _hand_sets(robot):
     return out
 
 
-def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, b_mask, a_para, a_link, a_off, gw, lw,
+def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_para, a_link, a_off, gw, lw,
           l_contact, r_contact, l_foot_kp, r_foot_kp, left_foot_idx, right_foot_idx,
-          left_knee_idx, right_knee_idx, root_R_target, root_z_target, ft_idx, ft_off, ft_margin, ft_target,
+          left_knee_idx, right_knee_idx, root_R_target, ft_idx, ft_off, ft_margin, ft_target,
           ft_mask, rest_w, weights,
-          obj_boxes_local=None, obj_pose=None, obj_capsule_idx=None, h_sets=None,
+          h_sets=None,
           s2_joints=None, s2_root=None, s2_offset=None, s2_lower_mask=None, s2_w=0.0):
     # STAGE 2 (s2_w>0): freeze the LOWER body (s2_lower_mask=1 joints) + root + offset at the stage-1
     # solution (s2_joints/s2_root/s2_offset) and warm-start from it, so only the UPPER body (waist+arms+
@@ -550,16 +423,24 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
     # [V2: hand-local-scale] 손 스케일. 한 손 체인의 노드 수만큼(현재 16) 정사각 행렬이고,
     # 양손과 전 프레임이 하나를 공유합니다 — 같은 하드웨어라 마디 길이가 같고(실측 좌우 차 0.047),
     # 손 크기는 클립 내내 안 변하기 때문입니다.
-    nh = len(h_sets["r"][0]) if h_sets else 1
-    class HandScaleVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.ones((nh, nh))): ...
-
     class OffsetVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros((3,))): ...
 
     var_joints = robot.joint_var_cls(jnp.arange(T))
     var_root = jaxls.SE3Var(jnp.arange(T))
     var_scale = ScaleVar(jnp.zeros(T))
-    var_hscale = HandScaleVar(jnp.zeros(T))       # [V2] 전 프레임 공유 (몸통 스케일과 같은 방식)
-    var_offset = OffsetVar(jnp.arange(T))         # per-frame world translation (feet-on-floor placement)
+    # ── [ROLLBACK MARKER: offset-shared] 오프셋을 클립 상수로 (2026-09-04) ────────────────────
+    # pyroki 예제 12 와 동일: OffsetVar(jnp.zeros(T)) — 모든 프레임이 같은 변수 id 라서 클립 전체가
+    # 3차원 오프셋 하나를 공유합니다. 예전에는 jnp.arange(T) 로 프레임마다 독립 오프셋을 뒀는데,
+    # 그러면 T 개의 자유도가 생기고 이를 묶는 항은 offset_reg(제거됨) 뿐이었습니다. floor_contact/
+    # skating 은 접지 프레임에서만 작동하므로 스윙 구간(pot 12% / pan 27%)의 오프셋이 무제약이 되어
+    # 최종 루트가 프레임당 118 mm 까지 튀었습니다(global_align/root_smooth 는 오프셋을 못 봅니다).
+    # 실측(공유로 전환): 루트 xy 튐 p99  pot 70.0->25.6 mm, pan 93.0->32.3 mm (최대 -70~-74%),
+    # 발바닥 높이 표준편차 pot 0.50->0.57 / pan 0.64->0.49 cm, 발슬립 p90 6.00->5.76 / 31.5->29.0 mm.
+    # 수직 접지는 var_root 의 z(프레임별)가 담당하므로 오프셋의 프레임별 자유도는 중복이었습니다.
+    _floor_sq = int(os.environ.get("W_FLOORSQ", 0))    # [floor-sq-test] 1 = 예제 12 의 제곱 잔차
+    _off_ids = onp.zeros(T, onp.int32)
+    var_offset = OffsetVar(jnp.asarray(_off_ids))
+    # ── [/ROLLBACK MARKER: offset-shared] ────────────────────────────────────────────────────
 
     # per-node local weight `lw` (nb,) → pairwise lw[i]*lw[j]: weakening the ARM nodes frees the arm's
     # relative structure so the contact cost can bend it UP to reach the (absolute) object once the body
@@ -586,12 +467,6 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
                                 jnp.clip(-s, min=0).flatten() * 100.0])
 
     # [V2] 손 스케일 정규화 — 몸통과 같은 형태(1 근처, 대칭, 음수 금지).
-    @jaxls.Cost.factory
-    def hand_scale_reg(vv, v_hs: HandScaleVar):
-        s = vv[v_hs]
-        return jnp.concatenate([(s - 1.0).flatten() * 1.0, (s - s.T).flatten() * 100.0,
-                                jnp.clip(-s, min=0).flatten() * 100.0]) * weights["hand_scale_reg"]
-
     # per-correspondence, PER-AXIS global weight `gw` (n_corr,3) built in main by body part: the only
     # ABSOLUTE-position anchors are hands (object grasp) + pelvis XY + feet (floor); torso/arm/leg and
     # pelvis-Z are weak/free so LOCAL (relative, scaled) align preserves the motion shape while the legs
@@ -605,6 +480,22 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         pos = T_wl.translation()[a_link] + jnp.einsum("nij,nj->ni", T_wl.rotation().as_matrix()[a_link], a_off)
         return ((pos - kp[a_para]) * gw).flatten()
 
+    # ── [ROLLBACK MARKER: root-xy] 오프셋을 포함한 골반 xy 를 SMPL-X 골반에 맞춤 (2026-09-04) ──
+    # global_align 에 이미 (0,"pelvis") 대응이 있지만 그 비용은 var_offset 을 보지 않으므로
+    # var_root 좌표계에서만 만족됩니다. 최종 루트는 SE3.from_translation(offset) @ var_root 이라
+    # 오프셋 xy 만큼 실제 골반이 밀려도 아무 항이 관측하지 못합니다. offset_reg/offset_xy(제거됨)가
+    # 하던 일이 그것이었고, 여기서는 0 으로 당기는 대신 "실제 골반 xy = 사람 골반 xy" 로 직접
+    # 겁니다. z 는 제외합니다 — 다리 길이 차이 때문에 골반 높이는 사람과 같을 수 없고, 접지가
+    # floor_contact + world_collision 으로 결정되어야 합니다. W_ROOTXY=0 이면 미적용.
+    _pelvis_link_idx = robot.links.names.index("pelvis")
+
+    @jaxls.Cost.factory
+    def root_xy(vv, v_root: jaxls.SE3Var, v_cfg, v_off: OffsetVar, kp):
+        T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
+        pos = T_wl.translation()[_pelvis_link_idx] + vv[v_off]      # 오프셋 포함 = 실제 골반
+        return ((pos[:2] - kp[0, :2]) * weights["root_xy"]).flatten()
+    # ── [/ROLLBACK MARKER: root-xy] ──────────────────────────────────────────────────────────
+
     @jaxls.Cost.factory
     def floor_contact(vv, v_root: jaxls.SE3Var, v_cfg, v_off: OffsetVar, lc, rc, lkp, rkp):
         T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
@@ -612,8 +503,14 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         lpos = T_wl.translation()[left_foot_idx] + off; rpos = T_wl.translation()[right_foot_idx] + off
         lz = T_wl.rotation().as_matrix()[left_foot_idx][2, 2]
         rz = T_wl.rotation().as_matrix()[right_foot_idx][2, 2]
+        # [floor-sq-test 2026-09-04] 예제 12 는 위치 잔차에 제곱을 넣습니다: is_contact*(pos-kp)**2.
+        # 최소제곱이 다시 제곱하므로 실질 4제곱이라 작은 오차는 거의 방치하고 큰 이탈만 강하게
+        # 당깁니다(오차 1 cm 에서 선형의 1/100, 10 cm 에서 10배). W_FLOORSQ=1 로 그 형태를 씁니다.
+        _dl, _dr = lpos - lkp, rpos - rkp
+        if _floor_sq:
+            _dl, _dr = _dl ** 2, _dr ** 2
         return jnp.concatenate([
-            (lc * (lpos - lkp)).flatten(), (rc * (rpos - rkp)).flatten(),
+            (lc * _dl).flatten(), (rc * _dr).flatten(),
             jnp.where(lc > 0.5, lz - 1, 0.0).flatten(), jnp.where(rc > 0.5, rz - 1, 0.0).flatten(),
         ]) * weights["floor_contact"]
 
@@ -647,7 +544,8 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
 
             for _side in ("l", "r"):
                 _hp, _hl = h_sets[_side]
-                _t = [0, 1, 4]                      # _HAND_CHAIN 순서: palm, ff*3, mf*3, ...
+                # h_sets 순서: 0=palm, 1..3=ff, 4..6=mf, ... (_hand_sets 에서 palm 을 0번에 둡니다)
+                _t = [0, 1, 4]                      # palm, ffknuckle, mfknuckle → 손 평면
                 R_h = _fr(kp[jnp.array([_hp[i] for i in _t])])
                 R_r = _fr(pos[jnp.array([_hl[i] for i in _t])])
                 out.append(jaxlie.SO3.from_matrix(R_h.T @ R_r).log() * weights["wrist_orient"])
@@ -679,13 +577,6 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         return (R_rob.inverse() @ jaxlie.SO3.from_matrix(R_tgt)).log().flatten() * weights["root_orientation"]
 
     @jaxls.Cost.factory
-    def root_height(vv, v_root: jaxls.SE3Var, z_tgt):
-        # Track pelvis HEIGHT at human_pelvis_z × leg_ratio (per frame): grounds the feet across ALL
-        # motions (squat/step/bob preserved proportionally) while keeping the body upright — no crouch
-        # collapse (free-z failure) and no floating (human-height tracking failure). z_tgt: scalar/frame.
-        return ((vv[v_root].translation()[2] - z_tgt) * weights["root_height"]).reshape(1)
-
-    @jaxls.Cost.factory
     def root_smooth(vv, v_root: jaxls.SE3Var, v_prev: jaxls.SE3Var):
         return (vv[v_root].inverse() @ vv[v_prev]).log().flatten() * weights["root_smoothness"]
 
@@ -700,60 +591,13 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         return jnp.stack([lsk, rsk]) * weights["foot_skating"]
 
     @jaxls.Cost.factory
-    def offset_reg(vv, v_off: OffsetVar):
-        # Pin the HORIZONTAL offset (xy) strongly so the free offset can't drift the whole robot off the
-        # keypoints (root xy already places the robot horizontally); leave Z governed by offset_reg so
-        # world_collision can lift the feet onto the floor (per-pose grounding, squat-preserving) when
-        # offset_reg (z) is small. offset_xy default high; set offset_reg=0 to free vertical grounding.
-        o = vv[v_off]
-        return jnp.concatenate([(o[..., :2] * weights["offset_xy"]).flatten(),
-                                (o[..., 2:3] * weights["offset_reg"]).flatten()])
-
-    @jaxls.Cost.factory
     def world_collision(vv, v_root: jaxls.SE3Var, v_cfg, v_off: OffsetVar):
         # Low weight: high enough to lift the robot up off the floor, low enough not to fight retargeting.
         transform = jaxlie.SE3.from_translation(vv[v_off]) @ vv[v_root]
         coll = robot_coll.at_config(robot, vv[v_cfg]).transform(transform)
-        res = [colldist_from_sdf(collide(coll, heightmap), activation_dist=0.005).flatten()]
-        # [SCENE-COLLISION] the context objects the env spawns kinematic. Without this term they are
-        # absent from the problem entirely, and the solve puts the left hand inside the countertop.
-        # coll is (T,B) capsules, scene_boxes is (K,) — broadcast to (T,B,K) via a trailing axis.
-        if scene_boxes is not None:
-            d = collide(coll.reshape(coll.get_batch_axes() + (1,)), scene_boxes)
-            res.append(colldist_from_sdf(d, activation_dist=0.005).flatten()
-                       * weights["scene_collision"])
-        return jnp.concatenate(res) * weights["world_collision"]
+        return (colldist_from_sdf(collide(coll, heightmap), activation_dist=0.005).flatten()
+                * weights["world_collision"])
 
-    # [OBJECT-COLLISION] the object the hand is grasping. `o_pose` is (7,) per frame (wxyz + xyz), so
-    # the boxes are rebuilt in world coordinates inside the vmapped frame axis.
-    if obj_boxes_local is not None:
-        _oc_ctr = jnp.asarray(obj_boxes_local[0])                      # (K,3) object frame
-        _oc_ext = jnp.asarray(obj_boxes_local[1])                      # (K,3)
-        _oc_idx = jnp.asarray(obj_capsule_idx)                         # capsules we constrain
-        _oc_tol = weights["object_collision_tol"]
-
-    @jaxls.Cost.factory
-    def object_collision(vv, v_root: jaxls.SE3Var, v_cfg, v_off: OffsetVar, o_pose):
-        transform = jaxlie.SE3.from_translation(vv[v_off]) @ vv[v_root]
-        coll = robot_coll.at_config(robot, vv[v_cfg]).transform(transform)
-        # Only the hand capsules are constrained. The residual is (capsules x boxes) per frame and
-        # jaxls differentiates all of it (the scene term needed 21.6 GB at 78 capsules x 180 boxes);
-        # nothing but a hand is ever inside a hand-held object, so the rest is memory for no term.
-        coll = jax.tree.map(lambda x: x[_oc_idx] if getattr(x, "ndim", 0) >= 1
-                            and x.shape[0] == robot_coll.num_links else x, coll)
-        o_wxyz, o_xyz = o_pose[:4], o_pose[4:]
-        R = jaxlie.SO3(o_wxyz).as_matrix()                             # object frame -> world
-        boxes = pk.collision.Box.from_extent(
-            extent=_oc_ext, position=_oc_ctr @ R.T + o_xyz,
-            wxyz=jnp.broadcast_to(o_wxyz, (_oc_ctr.shape[0], 4)))
-        d = collide(coll.reshape(coll.get_batch_axes() + (1,)), boxes)
-        # One-sided: `colldist_from_sdf(., 0)` is min(d, 0), so a link that merely TOUCHES the object
-        # costs exactly nothing and only overlap is charged. That is what lets this term carry a big
-        # weight — the scene-collision term had to stay at 1.0 because its 5 mm activation margin
-        # pushed on hands that were correctly resting on the surface, and it lost to the keypoint
-        # costs anyway. `tol` is the overlap we are willing to leave (the sim resolves that much
-        # itself through its contact offset).
-        return colldist_from_sdf(d + _oc_tol, activation_dist=0.0).flatten() * weights["object_collision"]
     # [/OBJECT-COLLISION]
 
     costs = [
@@ -762,15 +606,13 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         global_align(var_root, var_joints, keypoints),
         floor_contact(var_root, var_joints, var_offset, l_contact, r_contact, l_foot_kp, r_foot_kp),
         root_orient(var_root, root_R_target),
-        root_height(var_root, root_z_target),
         knee_separation(var_root, var_joints),
         # [V2: contact-stage2-only] 접촉 비용은 아래에서 단계별로 붙입니다.
         root_smooth(jaxls.SE3Var(jnp.arange(1, T)), jaxls.SE3Var(jnp.arange(0, T - 1))),
         skating(jaxls.SE3Var(jnp.arange(1, T)), robot.joint_var_cls(jnp.arange(1, T)),
-                OffsetVar(jnp.arange(1, T)), jaxls.SE3Var(jnp.arange(0, T - 1)),
-                robot.joint_var_cls(jnp.arange(0, T - 1)), OffsetVar(jnp.arange(0, T - 1)),
+                OffsetVar(jnp.asarray(_off_ids[1:])), jaxls.SE3Var(jnp.arange(0, T - 1)),
+                robot.joint_var_cls(jnp.arange(0, T - 1)), OffsetVar(jnp.asarray(_off_ids[:-1])),
                 l_contact[:-1], r_contact[:-1]),
-        offset_reg(var_offset),
         pk.costs.smoothness_cost(robot.joint_var_cls(jnp.arange(1, T)),
                                  robot.joint_var_cls(jnp.arange(0, T - 1)),
                                  jnp.array([weights["joint_smoothness"]])),
@@ -783,7 +625,8 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
     # drops the whole robot ~10 cm to plant feet and corrupts body+hand keypoint tracking 2–3× (8→19 cm) for
     # our tall-human→short-G1 embodiment — but STAGE 2 resolves this: stage 1 grounds the lower body, then the
     # frozen-legs upper-body re-solve re-reaches the hand keypoints, so grounding no longer costs hand accuracy.
-    # offset_xy pins the horizontal offset (no drift); offset_reg (z) is free so feet plant. W_WORLDCOLL=0 →
+    # var_offset 은 정규화 없이 자유입니다 (pyroki 예제 12 와 동일 — offset_reg/offset_xy 는 2026-09-04
+    # 제거). 접지는 floor_contact + skating + world_collision 이 잡습니다. W_WORLDCOLL=0 →
     # faithful-tracking baseline (no grounding). To disable grounding entirely: W_WORLDCOLL=0.0.
     # [ROLLBACK MARKER: tendon-ineq] J0 가 구동 목록에 있을 때만 (pre_mimic URDF) 의미가 있다.
     if weights["tendon_ineq"] > 0:
@@ -799,55 +642,16 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
                   f"w={weights['tendon_ineq']:.1f}  (actuated {len(_an)}개)")
         else:
             print("[tendon-ineq] J0 가 구동 목록에 없음 (mimic URDF?) — 비용 미적용")
+    if weights["root_xy"] > 0:
+        costs.append(root_xy(var_root, var_joints, var_offset, keypoints))
     if weights["world_collision"] > 0:
         costs.append(world_collision(var_root, var_joints, var_offset))
-    if obj_boxes_local is not None and weights["object_collision"] > 0:
-        costs.append(object_collision(var_root, var_joints, var_offset, jnp.asarray(obj_pose)))
     # [V2: hand-local-scale] 손 체인의 국소 정렬 + 스케일. 몸통 local_align 과 같은 형태이되
     # 대상이 한 손이고, 스케일 행렬을 양손이 공유합니다. 절대 위치가 아니라 마디 사이 상대 벡터를
     # 맞추므로, 로봇 손이 1.2배 커도 손가락을 눌러 접지 않고 "같은 모양"을 만들 수 있습니다.
     # 양손 국소정렬 + 양손 손목방향을 하나의 비용으로 묶습니다. 비용을 4개로 나누면 jaxls가
     # 비용마다 순기구학을 따로 미분해서 프레임당 FK 야코비안이 4벌 생기고(65자유도 x 78링크)
     # 호스트 RAM이 터집니다. FK를 한 번만 계산해 네 잔차가 나눠 쓰면 그 4배가 사라집니다.
-    def _make_hand_costs(hs_l, hs_r, mask_l, mask_r, w_local, w_ori):
-        idx = {s: (jnp.array(hp), jnp.array(hl)) for s, (hp, hl) in (("l", hs_l), ("r", hs_r))}
-        masks = {"l": mask_l, "r": mask_r}
-        i_w, i_ff, i_mf = 0, 1, 4          # _HAND_CHAIN 순서: palm, ff*3, mf*3, rf*3, lf*3, th*3
-
-        def _frame(p):                     # p (3,3): 손목 / 검지 knuckle / 중지 knuckle
-            z = p[2] - p[0]
-            z = z / (jnp.linalg.norm(z) + 1e-9)
-            x = jnp.cross(z, p[1] - p[0])
-            x = x / (jnp.linalg.norm(x) + 1e-9)
-            return jnp.stack([x, jnp.cross(z, x), z], axis=-1)
-
-        @jaxls.Cost.factory
-        def hand_costs(vv, v_root: jaxls.SE3Var, v_cfg, v_hs: HandScaleVar, kp):
-            T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
-            pos = T_wl.translation()
-            scale = vv[v_hs][..., None]
-            pw_eye = 1 - jnp.eye(nh)
-            res = []
-            for side in ("l", "r"):
-                hp_j, hl_j = idx[side]
-                s_pos, r_pos = kp[hp_j], pos[hl_j]
-                if w_local > 0:
-                    d_s = s_pos[:, None] - s_pos[None, :]
-                    d_r = r_pos[:, None] - r_pos[None, :]
-                    pw = pw_eye * masks[side]
-                    res_pos = (d_s - d_r * scale) * pw[..., None]
-                    ds_n = d_s / jnp.linalg.norm(d_s + 1e-6, axis=-1, keepdims=True)
-                    dr_n = d_r / jnp.linalg.norm(d_r + 1e-6, axis=-1, keepdims=True)
-                    res_ang = (1 - (ds_n * dr_n).sum(-1)) * pw
-                    res += [res_pos.flatten() * w_local, res_ang.flatten() * w_local]
-                if w_ori > 0:
-                    tri = jnp.array([i_w, i_ff, i_mf])
-                    R_h, R_r = _frame(s_pos[tri]), _frame(r_pos[tri])
-                    res.append(jaxlie.SO3.from_matrix(R_h.T @ R_r).log() * w_ori)
-            return jnp.concatenate(res)
-
-        return hand_costs
-
     # [V2: contact-stage2-only] 손을 물체로 당기는 비용은 STAGE 2 에만 겁니다.
     # 1단계의 일은 접지입니다(발 평평 / 무릎 / 발미끄러짐 / 바닥 충돌 / 루트 높이). 거기에 손을
     # 물체로 당기는 힘까지 같이 걸면 그 자세를 왜곡하는데, 2단계에서 하반신을 얼리고 상반신을 다시
@@ -858,13 +662,7 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
     if (s2_w > 0.0) or (not _c_s2_only):
         costs.append(contact_grasp(var_root, var_joints, ft_target, ft_mask, keypoints))
     # [V2] 손 관련 항은 STAGE 2 전용입니다 — 1단계는 접지가 일이고 손은 2단계에서 다시 풀립니다.
-    # 손목 방향은 contact_grasp 안으로 들어갔습니다(FK 공유). 여기 남은 것은 실험용 hand_local 뿐입니다.
-    _w_hl = weights["hand_local"]
-    if s2_w > 0.0 and h_sets is not None and _w_hl > 0:
-        _m = {s: create_conn_tree(robot, jnp.array(h_sets[s][1])) for s in ("l", "r")}
-        costs.append(_make_hand_costs(h_sets["l"], h_sets["r"], _m["l"], _m["r"], _w_hl, 0.0)(
-            var_root, var_joints, var_hscale, keypoints))
-        costs.append(hand_scale_reg(var_hscale))
+    # 손목 방향은 contact_grasp 안으로 들어갔습니다(FK 공유).
 
     init_vals = None
     if s2_w > 0.0:
@@ -872,7 +670,8 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
         # up-weighted hand global_align (gw hands) then drives the free UPPER body to the hand keypoints.
         _pin_j = jnp.asarray(s2_joints)                       # (T, nJ)
         _pin_root = jnp.asarray(s2_root)                      # (T, 7) wxyz_xyz (stage-1 baked root)
-        _pin_off = jnp.asarray(s2_offset)                     # (T, 3)
+        # [offset-shared] 오프셋 변수가 1개이므로 프레임 0 값만 씁니다.
+        _pin_off = jnp.asarray(s2_offset[:1])                 # (1,3)
         _lmask = jnp.asarray(s2_lower_mask)                   # (nJ,) 1=freeze, 0=free
 
         @jaxls.Cost.factory
@@ -887,12 +686,11 @@ def solve(robot, robot_coll, heightmap, scene_boxes, keypoints, b_para, b_link, 
             var_joints.with_value(_pin_j),
             var_root.with_value(jaxlie.SE3(_pin_root)),
             var_scale.with_value(jnp.ones((T, nb, nb))),
-            var_hscale.with_value(jnp.ones((T, nh, nh))),
             var_offset.with_value(_pin_off),
         ])
 
     prob = jaxls.LeastSquaresProblem(
-        costs=costs, variables=[var_joints, var_root, var_scale, var_hscale, var_offset]).analyze()
+        costs=costs, variables=[var_joints, var_root, var_scale, var_offset]).analyze()
     sol = prob.solve() if init_vals is None else prob.solve(initial_vals=init_vals)
     root = jaxlie.SE3.from_translation(sol[var_offset]) @ sol[var_root]   # bake floor offset into root
     return root, sol[var_joints]
@@ -906,14 +704,14 @@ def main():
 
     urdf = yourdfpy.URDF.load(str(_URDF))
     robot = pk.Robot.from_urdf(urdf)
-    # [OBJECT-COLLISION] the hand needs real collision shapes before anything can be kept out of the
-    # object; only pay for them when a term actually uses them.
-    if float(os.environ.get("W_OBJCOLL", 0.0)) > 0:
-        _give_hands_collision_geometry(urdf)
     robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
     sm = onp.load(_PROC / "smplx" / args.cls / args.clip / "0" / "trajectory.npz", allow_pickle=True)
-    jp = sm["joint_positions"].astype(onp.float32)
+    # [smplx-kpts] SMPL-X 관절(55)을 씁니다. 없으면 parahome.py 를 --overwrite 로 다시 돌려야
+    # 합니다(smplx_joints 키 추가). 옛 ParaHome 스트림으로 되돌리려면 joint_positions 로.
+    if "smplx_joints" not in sm.files:
+        raise KeyError(f"[smplx-kpts] {args.clip}: smplx_joints 없음 — parahome.py --overwrite 필요")
+    jp = sm["smplx_joints"].astype(onp.float32)
     F = jp.shape[0]
 
     pairs = _build_correspondence()
@@ -1038,7 +836,10 @@ def main():
     # global_align 손끝(오프셋 1.9cm → J0 0.1rad 당 1.9mm, 레버암이 짧아 약함), contact_grasp
     # (접촉 프레임만, 칼 링크당 22.4%), smoothness(방향은 안 정해줌) 뿐입니다. W_HANDTIP 인상이나
     # 텐던 slack 항과 함께 쓰는 것을 전제로 합니다.
-    _rest_j0 = float(os.environ.get("W_RESTJ0", -1.0))
+    # [cost-cleanup 2026-09-04] 기본값 -1(미적용) -> 0(rest 당김 제거). tendon_ineq 가 기본 ON 이 되면
+    # J0 가 구동 목록에 들어와 기본 rest 0.2 가 J0 를 한계 중간값 0.785 에 묶습니다(위 설명). 둘은 같이
+    # 가야 합니다. 예전 거동으로 되돌리려면 W_RESTJ0=-1.
+    _rest_j0 = float(os.environ.get("W_RESTJ0", 0.0))
     if _rest_j0 >= 0.0:
         _n = 0
         for nm in _HOLD_ZERO:
@@ -1052,41 +853,50 @@ def main():
     # keypoint tracking wins over object-surface pull (validated: left thumb ~0.12, hand mean ~0.04 on pan).
     # Every weight stays env-overridable for experiments (e.g. W_STAGE2=0 → single-stage; W_WORLDCOLL=0 →
     # no grounding / faithful-tracking baseline). See the sweep notes for the local/contact trade-off.
-    weights = dict(tendon_ineq=_w("W_TENDONINEQ", 0.0), tendon_gear_ineq=_w("W_TENDONGEAR", 1.0),
+    # [cost-cleanup 2026-09-04] 기본값을 실제 사용 값으로 올렸습니다 (배치 실행 시 매번
+    # W_TENDONINEQ=50.0 을 넘기고 있었습니다). 부등식을 끄려면 W_TENDONINEQ=0.
+    weights = dict(tendon_ineq=_w("W_TENDONINEQ", 50.0), tendon_gear_ineq=_w("W_TENDONGEAR", 1.0),
                    local_alignment=_w("W_LOCAL", 2.0), global_alignment=_w("W_GLOBAL", 1.0),
                    hand_alignment=_w("W_HAND", 1.0), floor_contact=_w("W_FLOOR", 3.0),
-                   world_collision=_w("W_WORLDCOLL", 1.0), root_orientation=_w("W_ROOTORI", 5.0),
+                   world_collision=_w("W_WORLDCOLL", 1.0),
+                   # [cost-cleanup 2026-09-04] root_orientation / knee_separation 기본값 5.0 -> 0.0.
+                   # s101_seg29_pot / s100_seg00_pan 실측에서 끄는 쪽이 전 지표 우세였습니다
+                   # (pot: 허리 모멘트 15.48->12.80 Nm, torso 피치 4.5->0.3도, 손끝 p90 29.6->24.5 mm,
+                   #  손목 회전오차 p90 15.6->12.4도, tip 접촉간격 2.1->1.6 cm, 골반 롤 3.4->2.8도).
+                   # root_orient 의 근거였던 "허위 골반 롤"은 SMPL-X 대응 수정 후 global_align 만으로
+                   # 잡히고, knee_separation 은 무릎 간격 21.7~23.5 cm 로 하한 14 cm 를 한참 웃돌아
+                   # 애초에 활성되지 않았습니다. 되살리려면 W_ROOTORI=5 / W_KNEESEP=5.
+                   root_orientation=_w("W_ROOTORI", 0.0),
                    root_smoothness=_w("W_ROOTSMOOTH", 1.0), foot_skating=_w("W_SKATE", 1.0),
-                   offset_reg=_w("W_OFFSETREG", 0.0), offset_xy=_w("W_OFFSETXY", 1000.0),
                    contact=_w("W_CONTACT", 2.0), contact_margin=_w("W_CONTACTMARGIN", 0.005),
-                   knee_separation=_w("W_KNEESEP", 5.0), knee_min=_w("W_KNEEMIN", 0.14),
-                   root_height=_w("W_ROOTHEIGHT", 0.0), joint_smoothness=_w("W_SMOOTH", 1.0),
-                   # [SCENE-COLLISION] OFF by default. Tried on s101_seg12_knife: the term is added and the solve
-                   # converges, but it does not move the result — penetration against its OWN box set went
-                   # 1813 -> 1963 pairs (6.03 -> 6.38 cm), and in sim the left hand got WORSE (5.47 -> 6.66
-                   # m/s). It is outweighed by the keypoint-tracking costs, which target human hand
-                   # positions that sit ON the surface, so matching them necessarily buries the thicker
-                   # robot hand. Raising the weight or changing the box set does not address that.
-                   # W_SCENECOLL=1 re-enables it; see _context_boxes for the geometry study.
-                   scene_collision=_w("W_SCENECOLL", 0.0),
-                   # [OBJECT-COLLISION] OFF by default until measured; W_OBJCOLL=50 to enable. The
-                   # weight can be large because the residual is one-sided (0 unless links overlap
-                   # the object), so at the pose we want the term contributes nothing at all.
-                   object_collision=_w("W_OBJCOLL", 0.0),
-                   object_collision_tol=_w("W_OBJCOLLTOL", 0.002),
+                   knee_separation=_w("W_KNEESEP", 0.0), knee_min=_w("W_KNEEMIN", 0.14),
+                   # [cost-cleanup 2026-09-04] joint_smoothness = 1.0 (예제 12 는 0.2 이지만 우리는 다름).
+                   # 0.2 로 내렸다가 스윕(0.1/0.2/0.5/1.0/2.0)으로 되돌렸습니다. 예상했던
+                   # "평활 ↑ → 정확도 ↓" 트레이드오프가 나타나지 않고, 오히려 1.0 에서 정확도가
+                   # 계단식으로 좋아집니다 (s101_seg12_knife: 손목 회전오차 p90 17.8->14.8도,
+                   # 손끝 거리 p90 23.7->21.6 mm; 2.0 에서 추가 이득 없음). 관절 가속도(2차 차분)
+                   # p95 는 0.2 대비 pot 22.4->9.0, knife 22.2->13.2 mrad 로 개선됩니다.
+                   # 이유: 절대 위치 대응이 55개(예제는 13개)라 서로 충돌하는데 평활이 그 충돌을
+                   # 시간축으로 평균해 더 나은 해를 찾습니다. 대가는 루트 회전 튐 3.18->4.04도.
+                   # 2.0 은 발바닥 표준편차가 0.57->0.66 cm 로 나빠져 채택하지 않았습니다.
+                   joint_smoothness=_w("W_SMOOTH", 1.0),
+                   # [root-xy] 오프셋 포함 골반 xy ↔ SMPL-X 골반 xy. 스윕(0~100, knife/pot) 결과 5.0.
+                   # 0 에서는 골반이 사람 골반에서 6.8~7.6 cm 어긋나 있었습니다 — global_align 의
+                   # (0,"pelvis") 대응이 var_offset 을 보지 못해 var_root 좌표계에서만 만족되기 때문.
+                   # 5.0: 골반 오차 1.7 cm(-77%), knife 손목 회전오차 p90 14.8->9.8도(-34%),
+                   #      손끝 p90 21.6->18.1 mm, pot 손끝 p90 24.4->23.2 mm(구간 최소),
+                   #      pot 루트 튐 p99 25.1->19.1 mm, knife 부양 8->4%.
+                   # 8~20 은 골반 오차를 0.2~0.8 cm 까지 줄이고 pot 루트 튐을 16.1 mm 로 더 내리지만
+                   # pot 손목 p90 이 11.6->12.6~13.0 도로 나빠지고, 8 은 knife 에서 국소해에 빠집니다
+                   # (손끝 p90 23.0, 손목 p90 12.3 — 4/5/12/16 보다 나쁨).
+                   # 100 은 pot 이 붕괴합니다: 오프셋 z -0.094->-0.253 m, 발바닥 -5.34 cm, 관통 96%,
+                   # 손목 회전오차 43.4도. 5.0 은 그 지점까지 20배 여유입니다.
+                   root_xy=_w("W_ROOTXY", 5.0),
                    # [V2] STAGE 2 전용 손 항목.
-                   #
-                   # hand_local(손 체인 상대벡터 + 공유 스케일)은 측정 결과 OFF 입니다. 손이 이미
-                   # 전역 정렬(절대 위치)과 접촉 비용(물체 표면)에 묶여 있는데 여기에 "상대 모양"까지
-                   # 얹으면 같은 링크를 세 방향으로 당기고, 자유로운 스케일 행렬이 손 전체를 돌려
-                   # 버립니다. s53_seg19_knife 실측 (손 항 OFF -> hand_local ON):
-                   #     손목 회전오차  24.1도 -> 50.6도      손끝-사람 거리  39.7 -> 57.2 mm
-                   #     VRAM 피크      11.0 -> 19.0 GB
-                   # 애초에 이 항의 근거였던 "손가락마다 크기 비가 제각각"은 어긋난 대응표가 만든
-                   # 허상이었고, 대응을 고친 뒤 비율이 1.06~1.46으로 균일해져 흡수할 것이 거의
-                   # 남지 않았습니다. 실험용으로만 W_HANDLOCAL=1 로 켭니다.
-                   hand_local=_w("W_HANDLOCAL", 0.0),
-                   hand_scale_reg=_w("W_HANDSCALEREG", 1.0),
+                   # hand_local(손 체인 상대벡터 + 공유 스케일)은 실측에서 해로워 2026-09-04 제거했습니다
+                   # (s53_seg19_knife: 손목 회전오차 24.1->50.6도, 손끝 거리 39.7->57.2 mm, VRAM 11->19 GB).
+                   # 근거였던 "손가락별 크기 비 불균일"은 어긋난 대응표의 허상이었고 대응을 고친 뒤
+                   # 비율이 1.06~1.46으로 균일해졌습니다. 복원은 .pre_costcleanup.bak 참고.
                    # wrist_orient 은 채택. v1에는 손목 회전 목표가 아예 없어서(retarget npz 에
                    # 손바닥 쿼터니언이 없음) 손목 방향이 다른 항들의 부산물이었습니다. 사람과 로봇
                    # 양쪽에서 손 키포인트로 같은 방식의 프레임을 만들어 비교하므로 좌표 규약에
@@ -1096,73 +906,81 @@ def main():
 
     # per-axis, per-body-part global weights (n_corr,3): body order = pelvis(0) torso(1) arms(2-7)
     # legs(8-13) hands(14+). Default = uniform full tracking; the low-weight decoupling is opt-in via env.
-    w_pxy, w_pz = _w("W_PELVISXY", 1.0), _w("W_PELVISZ", 0.0)   # pelvis-Z tracked by root_height (scaled), not global
+    # [cost-cleanup 2026-09-04] 골반을 축별로 나눠 두던 것(W_PELVISXY / W_PELVISZ, Z 만 0.0)을
+    # 없애고 다른 부위와 같은 단일 가중치로 통일했습니다. Z 를 0 으로 뺐던 이유는 골반 높이를
+    # root_height 가 담당한다는 전제였는데 그 항을 제거했고, 실측에서 Z 를 1.0 으로 켜도 결과가
+    # 바뀌지 않습니다 — global_align 은 var_offset 을 보지 않아서(최종 루트 = offset ∘ var_root)
+    # 골반 z 목표가 오프셋에 그대로 흡수됩니다. 즉 축별 구분 자체가 의미가 없었습니다.
+    w_pelvis = _w("W_PELVIS", 1.0)
     w_trunk, w_arm, w_leg = _w("W_TRUNK", 1.0), _w("W_ARM", 1.0), _w("W_LEG", 1.0)
+    # ── [ROLLBACK MARKER: smplx-kpts] 부위 판별을 위치 인덱스 -> 링크 이름으로 ───────────────
+    # 옛 코드는 gw[1]=torso, gw[2:8]=arms, gw[8:14]=legs, gw[14:]=hands 처럼 _BODY 의 고정 순서를
+    # 전제했습니다. SMPL-X 전환에서 torso 대응을 빼고 순서를 바꾸자 어깨에 몸통 가중치가, 고관절에
+    # 팔 가중치가, palm 에 다리 가중치가 걸렸습니다(조용히 통과 — 길이가 우연히 맞았습니다).
+    # 이름으로 판별하면 대응표를 고쳐도 가중치가 따라옵니다.
+    def _part(link: str) -> str:
+        if link.startswith("robot0_"):
+            return "hand"
+        if "torso" in link:
+            return "trunk"
+        if any(k in link for k in ("shoulder", "elbow", "wrist")):
+            return "arm"
+        if any(k in link for k in ("hip", "knee", "ankle")):
+            return "leg"
+        return "pelvis"
+    _a_names = [l for _, l, _ in pairs]
     gw = onp.zeros((len(a_para), 3), onp.float32)
-    gw[0] = [w_pxy, w_pxy, w_pz]                        # pelvis: xy anchor, z free (grounding sets height)
-    gw[1] = w_trunk * weights["global_alignment"]       # torso
-    gw[2:8] = w_arm * weights["global_alignment"]       # arms — weak (free to reach the object)
-    gw[8:14] = w_leg * weights["global_alignment"]      # legs — weak (grounded by floor + local, not absolute)
-    gw[14:] = weights["hand_alignment"]                 # hands — strong absolute (object grasp)
+    _gwv = {"pelvis": w_pelvis * weights["global_alignment"],
+            "trunk": w_trunk * weights["global_alignment"],
+            "arm": w_arm * weights["global_alignment"],
+            "leg": w_leg * weights["global_alignment"],
+            "hand": weights["hand_alignment"]}
+    for _i, _ln in enumerate(_a_names):
+        gw[_i] = _gwv[_part(_ln)]
+    # [s1-nohand-test 2026-09-04] STAGE 1 의 일은 접지이고, 2단계가 하반신을 얼린 뒤 상반신을 다시
+    # 풀기 때문에 1단계가 만든 손 자세는 어차피 버려집니다. 그런데 손 대응 42개(손당 21개)가 각각
+    # 사람 손 위치(식탁 높이)를 향해 절대 위치로 당기고 있어서, 접지를 방해하는 상시 상향 압력이
+    # 됩니다 — 예제 12 의 절대 정렬은 몸통 13개뿐입니다. 기본 ON 이고 W_S1NOHAND=0 으로 끕니다
+    # (gw 의 hand 행 = 0). 손끝 접촉(contact_grasp)은 이미 2단계 전용입니다.
+    # 실측(s101_seg29_pot): 손끝 거리 p90 26.3->23.3 mm, 손목 회전오차 p90 12.3->10.8도, 접지·발
+    # 미끄러짐 불변. s100_seg00_pan 은 손끝 중앙 14.3->15.0 mm 로 0.7 mm 나빠지고 p90 은 동일.
+    # 1단계 절대 정렬 잔차가 165->39 개로 줄어 예제 12 와 같은 구성이 됩니다.
+    if int(os.environ.get("W_S1NOHAND", 1)):     # [s1-nohand] 기본 ON (아래 실측 근거)
+        _nh_off = 0
+        for _i, _ln in enumerate(_a_names):
+            if _part(_ln) == "hand":
+                gw[_i] = 0.0; _nh_off += 1
+        print(f"[s1-nohand] STAGE 1 에서 손 대응 {_nh_off}개 비활성 (몸통 {len(_a_names)-_nh_off}개만)")
     # [ROLLBACK MARKER: fingertip-align] 손끝 10개/손은 각 손 블록의 뒤쪽에 붙어 있습니다.
     # 기본값은 다른 손 키포인트와 동일(균일)입니다. 참고로 env 보상은 손끝을 더 중시합니다
     # (rew_fingertip -6.0 vs rew_hand_kpts -1.5, 둘 다 그룹 평균이라 점당 4:1). 최소제곱에서
     # 중요도는 가중치의 제곱이므로 그 비율을 재현하려면 W_HANDTIP = 2.0 x W_HAND 입니다.
     # 올리면 손끝이 다른 손 키포인트를 밀어낼 수 있으니 스윕으로 확인하고 쓰십시오.
-    _n_hand = sum(len(v[0]) for v in _HAND_CHAIN.values())   # 손당 관절 대응 수 15 (손끝 제외)
+    # [smplx-kpts] 손끝은 위치가 아니라 "링크-로컬 오프셋이 0 이 아닌 대응"으로 식별합니다
+    # (_build_correspondence 에서 손끝만 pad 오프셋을 갖습니다) — 블록 경계에 의존하지 않습니다.
     _wtip = _w("W_HANDTIP", 0.0) or weights["hand_alignment"]
-    for _b in (14, 14 + _n_hand + 5):                   # 왼손 블록 끝 5개, 오른손 블록 끝 5개
-        gw[_b + _n_hand: _b + _n_hand + 5] = _wtip
+    _tip_rows = onp.abs(a_off).sum(axis=1) > 1e-9
+    gw[_tip_rows] = _wtip
 
     # per-node LOCAL weight (nb=14 body): arms weak so the arm's relative structure yields to the contact
     # cost (reach the object from the grounded-lower body); pelvis/torso/legs keep full local.
     w_armlocal = _w("W_ARMLOCAL", 1.0)                   # default full; lower (env) frees the arm for grounding
     lw = onp.ones(len(b_para), onp.float32)
-    lw[2:8] = w_armlocal                                 # _BODY idx 2-7 = r/l shoulder,elbow,wrist
+    for _i, (_, _ln) in enumerate(_BODY):                # [smplx-kpts] 이름으로 팔 판별
+        if _part(_ln) == "arm":
+            lw[_i] = w_armlocal
 
     root_R_target = _pelvis_target_R(jp)     # (F,3,3) keypoint-derived pelvis orientation target
-    # scaled pelvis-height target: human pelvis z × leg_ratio (per frame). Grounds feet (feet_z≈0 scales to
-    # ~0) while preserving vertical dynamics (squat/step/bob) — a per-frame track, NOT a fixed height.
-    leg_ratio = _w("W_LEGRATIO", 0.86)
-    root_z_tgt = (jp[:, 0, 2] * leg_ratio).astype(onp.float32)     # (F,) pelvis keypoint z × ratio
     heightmap = _flat_heightmap(jp)          # flat z=0 floor spanning the clip
-    scene_boxes = (_context_boxes(sm, bk[0], jp[:, :23, :]) if weights["scene_collision"] > 0 else None)
-
-    # [OBJECT-COLLISION] keep the hands out of the object they are grasping. The stored object pose is
-    # [xyz, wxyz]; the solve uses jaxlie's wxyz-then-xyz order everywhere else, so reorder here.
-    obj_boxes_local, obj_pose, obj_caps = None, None, None
-    if weights["object_collision"] > 0 and obj_name:
-        obj_boxes_local = _object_boxes(obj_name)
-        if obj_boxes_local is not None:
-            op = sm[bk[0]].astype(onp.float32)                      # (F,7) xyz + wxyz
-            obj_pose = onp.concatenate([op[:, 3:7], op[:, :3]], axis=1)
-            g2l = onp.asarray(robot_coll._geom_to_link_idx)
-            lnames = list(robot_coll.link_names)
-            # The palm is EXCLUDED by default. Its capsule has a 65.2 mm radius against a real palm
-            # thickness of 34 mm, so keeping that ball out of the knife shoves the whole hand away —
-            # and the palm barely penetrates to begin with (measured 6.3% of frames at 1.8 mm, versus
-            # 89% at 4.7 mm for the index finger). Constraining the well-fitted finger capsules and
-            # leaving the palm out buys the penetration fix at a far smaller tracking cost.
-            # W_OBJCOLLSKIP="" constrains every hand link including the palm.
-            skip = os.environ.get("W_OBJCOLLSKIP", "palm")
-            skip_parts = [s for s in skip.split(",") if s]
-            obj_caps = onp.asarray([i for i, g in enumerate(g2l)
-                                    if lnames[g].startswith("robot0_")
-                                    and not any(s in lnames[g] for s in skip_parts)], onp.int32)
-            print(f"[pyroki-retarget] object collision: {len(obj_caps)} hand capsules "
-                  f"x {len(obj_boxes_local[0])} boxes x {len(obj_pose)} frames, "
-                  f"weight {weights['object_collision']}, tolerance "
-                  f"{weights['object_collision_tol'] * 1000:.0f} mm")
 
     t0 = time.time()
-    Ts_root, joints = solve(robot, robot_coll, heightmap, scene_boxes, jnp.array(jp_ext), b_para, b_link, b_mask, a_para,
+    Ts_root, joints = solve(robot, robot_coll, heightmap, jnp.array(jp_ext), b_para, b_link, b_mask, a_para,
                             a_link, jnp.array(a_off), jnp.array(gw), jnp.array(lw), jnp.array(l_c), jnp.array(r_c),
                             jnp.array(l_kp), jnp.array(r_kp), left_foot_idx, right_foot_idx,
                             left_knee_idx, right_knee_idx,
-                            jnp.array(root_R_target), jnp.array(root_z_tgt), jnp.array(ft_idx), jnp.array(ft_off),
+                            jnp.array(root_R_target), jnp.array(ft_idx), jnp.array(ft_off),
                             jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
                             jnp.array(rest_w), weights,
-                            obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps,
                             h_sets=h_sets)
     joints = onp.array(joints); root = onp.array(Ts_root.wxyz_xyz)
     print(f"[pyroki-retarget] stage-1 solved in {time.time()-t0:.1f}s")
@@ -1175,22 +993,27 @@ def main():
     if w_stage2 > 0.0:
         lower_mask = onp.array([1.0 if any(k in nm for k in ("hip", "knee", "ankle")) else 0.0
                                 for nm in an], onp.float32)      # freeze legs; waist+arms+fingers stay free
+        # [smplx-kpts] 여기도 위치 인덱스 -> 이름 기반. 옛 gw2[8:14]/gw2[14:] 는 _BODY 순서 전제였습니다.
         gw2 = gw.copy()
-        gw2[0] = 0.0                                             # pelvis pinned → don't track
-        gw2[8:14] = 0.0                                          # legs pinned → don't track
-        gw2[2:8] = _w("W_STAGE2ARM", 1.0)                       # arms incl. WRIST_yaw_link (anchor hand base)
-        gw2[14:] = _w("W_STAGE2HAND", 5.0)                      # hands STRONG (pull arms up to keypoints)
+        _s2arm, _s2hand = _w("W_STAGE2ARM", 1.0), _w("W_STAGE2HAND", 5.0)
+        for _i, _ln in enumerate(_a_names):
+            _p = _part(_ln)
+            if _p in ("pelvis", "leg"):
+                gw2[_i] = 0.0                                    # 하체+골반 고정 → 추종 안 함
+            elif _p == "arm":
+                gw2[_i] = _s2arm                                 # 팔 (wrist_yaw = 손 기준점)
+            elif _p == "hand":
+                gw2[_i] = _s2hand                                # 손 강하게 (팔을 키포인트로 끌어올림)
         s2_off = onp.zeros((F, 3), onp.float32)                 # stage-1 root already baked → pin offset→0
         t1 = time.time()
-        Ts_root, joints2 = solve(robot, robot_coll, heightmap, scene_boxes, jnp.array(jp_ext), b_para, b_link, b_mask, a_para,
+        Ts_root, joints2 = solve(robot, robot_coll, heightmap, jnp.array(jp_ext), b_para, b_link, b_mask, a_para,
                                  a_link, jnp.array(a_off), jnp.array(gw2), jnp.array(lw), jnp.array(l_c), jnp.array(r_c),
                                  jnp.array(l_kp), jnp.array(r_kp), left_foot_idx, right_foot_idx,
                                  left_knee_idx, right_knee_idx,
-                                 jnp.array(root_R_target), jnp.array(root_z_tgt), jnp.array(ft_idx),
+                                 jnp.array(root_R_target), jnp.array(ft_idx),
                                  jnp.array(ft_off), jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
                                  jnp.array(rest_w), weights,
-                                 obj_boxes_local=obj_boxes_local, obj_pose=obj_pose, obj_capsule_idx=obj_caps,
-                                 h_sets=h_sets,
+                                      h_sets=h_sets,
                                  s2_joints=jnp.array(joints), s2_root=jnp.array(root),
                                  s2_offset=jnp.array(s2_off), s2_lower_mask=jnp.array(lower_mask), s2_w=w_stage2)
         joints = onp.array(joints2); root = onp.array(Ts_root.wxyz_xyz)

@@ -105,11 +105,23 @@ def _get_smplx_model(gender: str):
     return _smplx_model_cache[gender]
 
 
-def _seq_fingertip_pad_pos(smplx_pose: dict, betas_np: np.ndarray, gender: str):
-    """Per-frame world positions of the 10 SMPL-X fingertip pad vertices → (F,10,3), or
-    None if smplx is unavailable (pipeline still runs, just omits fingertip_pad_pos)."""
+# ── [ROLLBACK MARKER: smplx-joints] SMPL-X 관절도 함께 내보냅니다 (2026-09-04) ────────────
+# 이 파일 상단 서술대로 SMPL-X 가 "리타게팅 표준 입력"인데, 실제 리타게팅과 env 보상은
+# ParaHome 자체 스트림(joint_positions, Xsens 계열 23+25+25=73)을 쓰고 있었습니다. 사용자 의도가
+# SMPL-X 였으므로 전환합니다. joint_positions 는 대조/롤백용으로 계속 저장합니다.
+#   SMPL-X 관절 0..54 = 몸통 22 (0 pelvis, 1/2 hip, 3 spine1, 4/5 knee, 6 spine2, 7/8 ankle,
+#   9 spine3, 10/11 foot, 12 neck, 13/14 collar, 15 head, 16/17 shoulder, 18/19 elbow,
+#   20/21 wrist) + jaw/eyes 3 + 손 30 (25..39 왼손, 40..54 오른손: index/middle/pinky/ring/thumb
+#   각 1,2,3). 55 이후는 얼굴 랜드마크라 버립니다.
+N_SMPLX_JOINTS = 55
+
+
+def _seq_smplx_fk(smplx_pose: dict, betas_np: np.ndarray, gender: str):
+    """SMPL-X FK 한 번으로 (fingertip pad (F,10,3), joints (F,55,3)) 둘 다. 없으면 (None, None).
+
+    두 값을 한 패스에서 뽑습니다 — FK 를 두 번 돌리면 시퀀스당 수 초가 그대로 두 배입니다."""
     if not _HAS_SMPLX:
-        return None
+        return None, None
     model = _get_smplx_model(gender)
     go = smplx_pose["global_orient"].to(_FK_DEVICE).float()
     bp = smplx_pose["body_pose"].to(_FK_DEVICE).float()
@@ -118,6 +130,7 @@ def _seq_fingertip_pad_pos(smplx_pose: dict, betas_np: np.ndarray, gender: str):
     F = go.shape[0]
     betas = torch.as_tensor(betas_np, dtype=torch.float32, device=_FK_DEVICE).reshape(1, -1)
     out = np.empty((F, 10, 3), dtype=np.float32)
+    jts = np.empty((F, N_SMPLX_JOINTS, 3), dtype=np.float32)
     CHUNK = 2048
     z = lambda n, d: torch.zeros(n, d, device=_FK_DEVICE)  # noqa: E731
     with torch.no_grad():
@@ -130,7 +143,8 @@ def _seq_fingertip_pad_pos(smplx_pose: dict, betas_np: np.ndarray, gender: str):
                       left_hand_pose=hp[s:e, :45], right_hand_pose=hp[s:e, 45:], transl=tr[s:e],
                       expression=z(n, 10), jaw_pose=z(n, 3), leye_pose=z(n, 3), reye_pose=z(n, 3))
             out[s:e] = o.vertices[:, SMPLX_FINGERTIP_VIDS, :].detach().cpu().numpy()
-    return out
+            jts[s:e] = o.joints[:, :N_SMPLX_JOINTS, :].detach().cpu().numpy()
+    return out, jts
 
 
 # ----------------------------------------------------------------------------- #
@@ -247,7 +261,8 @@ def process_sequence(seq: str, joint_info: dict, overwrite: bool = False) -> lis
     hand_pose = _to_np(smplx_pose["hand_pose"])        # (F,90)
     betas = _to_np(smplx_params["beta"]).reshape(-1).astype(np.float32)  # (20,)
     gender = str(smplx_params["gender"])
-    fingertip_pad_seq = _seq_fingertip_pad_pos(smplx_pose, betas, gender)  # (F,10,3) | None
+    # [smplx-joints] FK 한 번으로 손끝 pad 와 관절 55개를 함께 받습니다.
+    fingertip_pad_seq, smplx_joint_seq = _seq_smplx_fk(smplx_pose, betas, gender)
 
     # Frame alignment: object_transformations keys are contiguous ints from 0 and
     # SMPL-X / joint_positions are frame-aligned. Use the common valid length.
@@ -287,6 +302,8 @@ def process_sequence(seq: str, joint_info: dict, overwrite: bool = False) -> lis
             root_transl=body_gt[fidx, :3, 3].astype(np.float32),       # (F,3) pelvis world
             frame_indices=fidx,                                        # (F,)
         )
+        if smplx_joint_seq is not None:                      # [smplx-joints]
+            arrays["smplx_joints"] = smplx_joint_seq[fidx].astype(np.float32)   # (F,55,3)
         if fingertip_pad_seq is not None:
             # (F,10,3) SMPL-X fingertip pad vertices — LEFT[th,ff,mf,rf,lf] then RIGHT.
             arrays["fingertip_pad_pos"] = fingertip_pad_seq[fidx].astype(np.float32)
