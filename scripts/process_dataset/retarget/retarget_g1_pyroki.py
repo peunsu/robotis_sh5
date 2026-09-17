@@ -408,7 +408,8 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
           left_knee_idx, right_knee_idx, root_R_target, ft_idx, ft_off, ft_margin, ft_target,
           ft_mask, rest_w, weights,
           h_sets=None,
-          s2_joints=None, s2_root=None, s2_offset=None, s2_lower_mask=None, s2_w=0.0):
+          s2_joints=None, s2_root=None, s2_offset=None, s2_lower_mask=None, s2_w=0.0,
+          stage3=False):
     # STAGE 2 (s2_w>0): freeze the LOWER body (s2_lower_mask=1 joints) + root + offset at the stage-1
     # solution (s2_joints/s2_root/s2_offset) and warm-start from it, so only the UPPER body (waist+arms+
     # hands) moves to reach the hand keypoints — fixes the embodiment "hands below" without un-grounding.
@@ -600,27 +601,41 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
 
     # [/OBJECT-COLLISION]
 
-    costs = [
-        local_align(var_root, var_joints, var_scale, keypoints),
-        scale_reg(var_scale),
-        global_align(var_root, var_joints, keypoints),
-        floor_contact(var_root, var_joints, var_offset, l_contact, r_contact, l_foot_kp, r_foot_kp),
-        root_orient(var_root, root_R_target),
-        knee_separation(var_root, var_joints),
-        # [V2: contact-stage2-only] 접촉 비용은 아래에서 단계별로 붙입니다.
-        root_smooth(jaxls.SE3Var(jnp.arange(1, T)), jaxls.SE3Var(jnp.arange(0, T - 1))),
-        skating(jaxls.SE3Var(jnp.arange(1, T)), robot.joint_var_cls(jnp.arange(1, T)),
-                OffsetVar(jnp.asarray(_off_ids[1:])), jaxls.SE3Var(jnp.arange(0, T - 1)),
-                robot.joint_var_cls(jnp.arange(0, T - 1)), OffsetVar(jnp.asarray(_off_ids[:-1])),
-                l_contact[:-1], r_contact[:-1]),
-        pk.costs.smoothness_cost(robot.joint_var_cls(jnp.arange(1, T)),
-                                 robot.joint_var_cls(jnp.arange(0, T - 1)),
-                                 jnp.array([weights["joint_smoothness"]])),
-        pk.costs.rest_cost(var_joints, var_joints.default_factory()[None], rest_w[None]),
-        # NOTE: self_collision_cost dropped for the 65-DOF composite — 2926 pairs × 151 frames
-        # blows up to ~42 GB / int32-overflow. Re-add with a restricted pair set (hand↔body only) later.
-        pk.costs.limit_constraint(jax.tree.map(lambda x: x[None], robot), var_joints),
-    ]
+    # ── [ROLLBACK MARKER: stage1-hand] 3단계(팔만 자유)에서는 접지·루트·접촉 비용이 전부 고정 변수만
+    # 보는 상수라서 만들지 않습니다 — 비용마다 FK 야코비안이 한 벌씩 생기므로 시간·RAM 절약.
+    if stage3:
+        costs = [
+            scale_reg(var_scale),
+            global_align(var_root, var_joints, keypoints),
+            pk.costs.smoothness_cost(robot.joint_var_cls(jnp.arange(1, T)),
+                                     robot.joint_var_cls(jnp.arange(0, T - 1)),
+                                     jnp.array([weights["joint_smoothness"]])),
+            pk.costs.rest_cost(var_joints, var_joints.default_factory()[None], rest_w[None]),
+            pk.costs.limit_constraint(jax.tree.map(lambda x: x[None], robot), var_joints),
+        ]
+    else:
+        costs = [
+            local_align(var_root, var_joints, var_scale, keypoints),
+            scale_reg(var_scale),
+            global_align(var_root, var_joints, keypoints),
+            floor_contact(var_root, var_joints, var_offset, l_contact, r_contact, l_foot_kp, r_foot_kp),
+            root_orient(var_root, root_R_target),
+            knee_separation(var_root, var_joints),
+            # [V2: contact-stage2-only] 접촉 비용은 아래에서 단계별로 붙입니다.
+            root_smooth(jaxls.SE3Var(jnp.arange(1, T)), jaxls.SE3Var(jnp.arange(0, T - 1))),
+            skating(jaxls.SE3Var(jnp.arange(1, T)), robot.joint_var_cls(jnp.arange(1, T)),
+                    OffsetVar(jnp.asarray(_off_ids[1:])), jaxls.SE3Var(jnp.arange(0, T - 1)),
+                    robot.joint_var_cls(jnp.arange(0, T - 1)), OffsetVar(jnp.asarray(_off_ids[:-1])),
+                    l_contact[:-1], r_contact[:-1]),
+            pk.costs.smoothness_cost(robot.joint_var_cls(jnp.arange(1, T)),
+                                     robot.joint_var_cls(jnp.arange(0, T - 1)),
+                                     jnp.array([weights["joint_smoothness"]])),
+            pk.costs.rest_cost(var_joints, var_joints.default_factory()[None], rest_w[None]),
+            # NOTE: self_collision_cost dropped for the 65-DOF composite — 2926 pairs × 151 frames
+            # blows up to ~42 GB / int32-overflow. Re-add with a restricted pair set (hand↔body only) later.
+            pk.costs.limit_constraint(jax.tree.map(lambda x: x[None], robot), var_joints),
+        ]
+    # ── [/ROLLBACK MARKER: stage1-hand] ──
     # world_collision + var_offset (feet-on-floor) are ON by default. Naively grounding a single-stage solve
     # drops the whole robot ~10 cm to plant feet and corrupts body+hand keypoint tracking 2–3× (8→19 cm) for
     # our tall-human→short-G1 embodiment — but STAGE 2 resolves this: stage 1 grounds the lower body, then the
@@ -629,7 +644,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     # 제거). 접지는 floor_contact + skating + world_collision 이 잡습니다. W_WORLDCOLL=0 →
     # faithful-tracking baseline (no grounding). To disable grounding entirely: W_WORLDCOLL=0.0.
     # [ROLLBACK MARKER: tendon-ineq] J0 가 구동 목록에 있을 때만 (pre_mimic URDF) 의미가 있다.
-    if weights["tendon_ineq"] > 0:
+    if weights["tendon_ineq"] > 0 and not stage3:    # [stage1-hand] 3단계는 손이 고정 → 불필요
         _an = robot.joints.actuated_names
         _pairs = [(_an.index(f"robot0_{sd}_{fg}J0"), _an.index(f"robot0_{sd}_{fg}J1"))
                   for sd in "lr" for fg in ("FF", "MF", "RF", "LF")
@@ -642,9 +657,9 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
                   f"w={weights['tendon_ineq']:.1f}  (actuated {len(_an)}개)")
         else:
             print("[tendon-ineq] J0 가 구동 목록에 없음 (mimic URDF?) — 비용 미적용")
-    if weights["root_xy"] > 0:
+    if weights["root_xy"] > 0 and not stage3:
         costs.append(root_xy(var_root, var_joints, var_offset, keypoints))
-    if weights["world_collision"] > 0:
+    if weights["world_collision"] > 0 and not stage3:
         costs.append(world_collision(var_root, var_joints, var_offset))
     # [V2: hand-local-scale] 손 체인의 국소 정렬 + 스케일. 몸통 local_align 과 같은 형태이되
     # 대상이 한 손이고, 스케일 행렬을 양손이 공유합니다. 절대 위치가 아니라 마디 사이 상대 벡터를
@@ -659,7 +674,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     # 12번(전신)에는 접촉 비용이 없고, 11번(손)에만 있습니다.
     # V2_CONTACT_STAGE2_ONLY=0 이면 v1처럼 두 단계 모두에 겁니다.
     _c_s2_only = os.environ.get("V2_CONTACT_STAGE2_ONLY", "1") == "1"
-    if (s2_w > 0.0) or (not _c_s2_only):
+    if ((s2_w > 0.0) or (not _c_s2_only)) and not stage3:
         costs.append(contact_grasp(var_root, var_joints, ft_target, ft_mask, keypoints))
     # [V2] 손 관련 항은 STAGE 2 전용입니다 — 1단계는 접지가 일이고 손은 2단계에서 다시 풀립니다.
     # 손목 방향은 contact_grasp 안으로 들어갔습니다(FK 공유).
@@ -696,10 +711,227 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     return root, sol[var_joints]
 
 
+# ── [ROLLBACK MARKER: stage1-hand] STAGE 3 — 1단계(떠 있는 양손 정책) 롤아웃의 손을 이식 (2026-09-09) ──
+# 입력: rollout.py --dump_hand_traj 가 쓴 hand_traj_best.npz (50 Hz, ParaHome 월드 좌표).
+# 하는 일: (1) 손 관절 44개(구동 36 + J0 8)를 롤아웃 값으로 덮어쓰고 하반신·허리와 함께 고정,
+#          (2) 롤아웃 손바닥 자세(palm_pos/palm_quat)에 URDF-FK 로 재고정한 손 링크 위치 42개를
+#              global_align 의 손 목표로, SMPL-X 어깨/팔꿈치를 팔 목표로 두고 팔 14관절만 다시 풉니다.
+#          wrist_yaw 대응 2개는 손바닥과 같은 SMPL-X 열(20/21)을 쓰므로 롤아웃 손바닥과 일관된
+#          위치(강체 오프셋)로 별도 열에 둡니다 — 사람 손목과 로봇 손바닥 목표가 서로 당기지 않도록.
+# 시간: 30 fps 프레임 f ↔ 50 Hz 인덱스 f·fps/30 (선형보간, 마지막 프레임은 마지막 기록값 유지).
+def _s3_resample(x, k):
+    """x (T1,...) 50 Hz 기록 → 30 fps 인덱스 k (F,) 에서 선형보간 (범위 밖은 끝값 유지)."""
+    i0 = onp.clip(onp.floor(k).astype(int), 0, len(x) - 1); i1 = onp.clip(i0 + 1, 0, len(x) - 1)
+    w = onp.clip(k - i0, 0.0, 1.0).reshape((-1,) + (1,) * (x.ndim - 1))
+    return (1.0 - w) * x[i0] + w * x[i1]
+
+
+def _s3_nlerp(q, k):
+    """(T1,...,4) wxyz 사원수를 부호 정렬 후 정규화 선형보간 (프레임 간격이 작아 slerp 와 차이 없음)."""
+    i0 = onp.clip(onp.floor(k).astype(int), 0, len(q) - 1); i1 = onp.clip(i0 + 1, 0, len(q) - 1)
+    w = onp.clip(k - i0, 0.0, 1.0).reshape((-1,) + (1,) * (q.ndim - 1))
+    q0, q1 = q[i0], q[i1]
+    q1 = onp.where((q0 * q1).sum(-1, keepdims=True) < 0, -q1, q1)
+    out = (1.0 - w) * q0 + w * q1
+    return out / onp.linalg.norm(out, axis=-1, keepdims=True)
+
+
+def _s3_rot_angle_deg(Ra, Rb):
+    """(...,3,3) 두 회전 사이 각도(도)."""
+    tr = onp.einsum("...ij,...ij->...", Ra, Rb)
+    return onp.degrees(onp.arccos(onp.clip((tr - 1.0) / 2.0, -1.0, 1.0)))
+
+
+def _stage3_load_base(path, an, F):
+    """기존 trajectory_pyroki.npz → (joints (F,nJ) an 순서, root (F,7) wxyz_xyz). 없으면 None."""
+    if not path.exists():
+        print(f"[stage1-hand] {path.name} 없음 — 1·2단계를 새로 풉니다")
+        return None
+    b = onp.load(path, allow_pickle=True)
+    names = [str(n) for n in b["joint_names"]]
+    assert b["g1_joint_pos"].shape[0] == F, f"[stage1-hand] 프레임 수 불일치 {b['g1_joint_pos'].shape[0]} != {F}"
+    joints = onp.zeros((F, len(an)), onp.float32)
+    for i, nm in enumerate(an):
+        joints[:, i] = b["g1_joint_pos"][:, names.index(nm)]
+    rp = b["g1_root_pose"].astype(onp.float32)
+    root = onp.concatenate([rp[:, 3:7], rp[:, 0:3]], axis=1)
+    return joints, root
+
+
+def _stage3_run(args, robot, robot_coll, heightmap, an, joints, root, F, pairs, a_para, a_link, a_off, jp_ext, sm,
+                b_para, b_link, b_mask, lw, l_c, r_c, l_kp, r_kp, left_foot_idx, right_foot_idx, left_knee_idx,
+                right_knee_idx, root_R_target, ft_idx, ft_off, ft_margin, ft_pad, ft_mask, rest_w, weights, h_sets, _w):
+    hd = onp.load(args.stage1_hand, allow_pickle=True)
+    fps = float(hd["control_fps"]); fr = onp.asarray(hd["frame"]).astype(int); T1 = len(fr)
+    assert (fr == onp.arange(T1)).all(), "[stage1-hand] frame 열이 0..T-1 연속이어야 합니다"
+    k = onp.arange(F) * fps / 30.0                                  # 30 fps 프레임 → 50 Hz 인덱스
+    valid = k <= fr[-1] + 1e-6                                       # 기록 범위 안 (마지막 프레임은 유지값)
+    print(f"[stage1-hand] {Path(args.stage1_hand).name}: 롤아웃 {int(hd['rollout_idx'])} 보상합 "
+          f"{float(hd['reward_sum']):.1f}, {T1} 스텝 @ {fps:.0f} Hz → 30 fps {F} 프레임 (유효 {int(valid.sum())})")
+
+    # (1) 손 관절 이식 + 고정 마스크 -------------------------------------------------------------
+    names_side = {"l": [str(n) for n in hd["joint_names_all_l"]], "r": [str(n) for n in hd["joint_names_all_r"]]}
+    jpa = _s3_resample(onp.asarray(hd["joint_pos_all"], onp.float64), k)   # (F,2,28) 손목 6 + 손 22
+    s3_joints = onp.asarray(joints, onp.float32).copy()
+    s3_mask = onp.zeros(len(an), onp.float32); n_hand = 0
+    for i, nm in enumerate(an):
+        if nm.startswith("robot0_"):
+            sd = nm[7]
+            s3_joints[:, i] = jpa[:, 0 if sd == "l" else 1, names_side[sd].index(nm)]
+            s3_mask[i] = 1.0; n_hand += 1
+        elif any(kw in nm for kw in ("hip", "knee", "ankle")):
+            s3_mask[i] = 1.0
+        elif "waist" in nm and not int(os.environ.get("S3_FREE_WAIST", 0)):   # S3_FREE_WAIST=1 → 허리 3관절도 자유
+            s3_mask[i] = 1.0
+    free = onp.where(s3_mask < 0.5)[0]
+    # 시뮬레이션은 접촉으로 관절이 한계를 조금 넘을 수 있습니다(예: r_LFJ1 1.73 > 1.571 rad). 그대로 고정하면
+    # limit_constraint 와 pin 이 싸워 잔차가 남으므로 URDF 한계 안으로 잘라 넣습니다(잘린 개수 출력).
+    _lo = onp.asarray(robot.joints.lower_limits); _hi = onp.asarray(robot.joints.upper_limits)
+    _cl = onp.clip(s3_joints, _lo[None], _hi[None]); _ncl = int((onp.abs(_cl - s3_joints) > 1e-6).sum())
+    _clmax = float(onp.abs(_cl - s3_joints).max()); s3_joints = _cl.astype(onp.float32)
+    print(f"[stage1-hand] 고정: 손 {n_hand} + 하반신/허리 {int(s3_mask.sum()) - n_hand} 관절 "
+          f"(URDF 한계로 잘린 값 {_ncl}개, 최대 {_clmax:.3f} rad), "
+          f"자유 {len(free)}: {[an[i] for i in free]}")
+
+    # (2) 손 링크 목표: URDF-FK(손 관절 = 롤아웃 값)를 롤아웃 손바닥 자세에 재고정 ---------------------
+    palm_pos = _s3_resample(onp.asarray(hd["palm_pos"], onp.float64), k)   # (F,2,3) [L,R] 월드
+    palm_quat = _s3_nlerp(onp.asarray(hd["palm_quat"], onp.float64), k)    # (F,2,4) wxyz
+    ft_s1 = _s3_resample(onp.asarray(hd["ft_pos"], onp.float64), k)         # (F,10,3) 기록 손끝(패드)
+    ft_names = [str(n) for n in hd["fingertip_body_names"]]
+    fk = onp.asarray(jax.vmap(robot.forward_kinematics)(jnp.asarray(s3_joints)))   # (F,nl,7) wxyz_xyz 루트 기준
+    Rl = onp.asarray(jaxlie.SO3(jnp.asarray(fk[..., :4])).as_matrix()); pl = fk[..., 4:7].astype(onp.float64)
+    Rs_all = onp.asarray(jaxlie.SO3(jnp.asarray(palm_quat)).as_matrix())           # (F,2,3,3)
+    kp3 = onp.concatenate([jp_ext, onp.zeros((F, 2, 3), onp.float32)], axis=1)      # + wrist_yaw 목표 2열
+    a_para3 = list(a_para); n_rep = 0; tip_err = []
+    for si, sd in enumerate("lr"):
+        pidx = robot.links.names.index(f"robot0_{sd}_palm")
+        A = onp.einsum("fij,fkj->fik", Rs_all[:, si], Rl[:, pidx])            # R_s1palm · R_fkpalm^T
+        wy = f"{'left' if sd == 'l' else 'right'}_wrist_yaw_link"
+        for row, (p, lname, off) in enumerate(pairs):
+            if not (lname.startswith(f"robot0_{sd}_") or lname == wy):
+                continue
+            li = robot.links.names.index(lname)
+            Rw = onp.einsum("fij,fjk->fik", A, Rl[:, li])
+            pw = onp.einsum("fij,fj->fi", A, pl[:, li] - pl[:, pidx]) + palm_pos[:, si]
+            tgt = pw + onp.einsum("fij,j->fi", Rw, onp.asarray(off, onp.float64))
+            if lname == wy:
+                a_para3[row] = jp_ext.shape[1] + si
+            kp3[:, a_para3[row]] = tgt; n_rep += 1
+            if lname in ft_names and onp.abs(onp.asarray(off)).sum() > 1e-9:
+                tip_err.append(onp.linalg.norm(tgt - ft_s1[:, ft_names.index(lname)], axis=-1)[valid])
+    tip_err = onp.concatenate(tip_err) * 1000.0
+    print(f"[stage1-hand] global_align 목표 교체 {n_rep}개 (손 {n_rep - 2} + wrist_yaw 2) | USD↔URDF 일치 검사 "
+          f"(재고정 FK 손끝 vs 기록 손끝): p50 {onp.percentile(tip_err, 50):.2f} p95 {onp.percentile(tip_err, 95):.2f} "
+          f"max {tip_err.max():.2f} mm")
+
+    # (3) 가중치: 손 5.0(롤아웃 목표) / 팔 1.0(SMPL-X 어깨·팔꿈치, wrist_yaw 는 롤아웃 일관 목표) / 나머지 0 ---
+    w3_hand, w3_arm, w3_pin = _w("W_STAGE3HAND", 5.0), _w("W_STAGE3ARM", 1.0), _w("W_STAGE3", 100.0)
+    gw3 = onp.zeros((len(pairs), 3), onp.float32)
+    for i, (_, lname, _) in enumerate(pairs):
+        if lname.startswith("robot0_"):
+            gw3[i] = w3_hand
+        elif any(kk in lname for kk in ("shoulder", "elbow", "wrist")):
+            gw3[i] = w3_arm
+    weights3 = dict(weights)
+    for kk in ("local_alignment", "floor_contact", "root_orientation", "knee_separation", "root_smoothness",
+               "foot_skating", "world_collision", "root_xy", "contact", "wrist_orient"):
+        if kk in weights3:
+            weights3[kk] = 0.0
+    print(f"[stage1-hand] 가중치: 손 {w3_hand} (손끝 포함) / 팔 {w3_arm} / 고정 pin {w3_pin} / rest·smoothness 는 기존값")
+    t3 = time.time()
+    Ts_root3, joints3 = solve(robot, robot_coll, heightmap, jnp.array(kp3), b_para, b_link, b_mask, a_para3,
+                              a_link, jnp.array(a_off), jnp.array(gw3), jnp.array(lw), jnp.array(l_c), jnp.array(r_c),
+                              jnp.array(l_kp), jnp.array(r_kp), left_foot_idx, right_foot_idx,
+                              left_knee_idx, right_knee_idx,
+                              jnp.array(root_R_target), jnp.array(ft_idx), jnp.array(ft_off),
+                              jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
+                              jnp.array(rest_w), weights3, h_sets=h_sets,
+                              s2_joints=jnp.array(s3_joints), s2_root=jnp.array(root),
+                              s2_offset=jnp.zeros((F, 3), jnp.float32), s2_lower_mask=jnp.array(s3_mask),
+                              s2_w=w3_pin, stage3=True)
+    joints3 = onp.asarray(joints3, onp.float32)
+    pin_res = onp.abs(joints3 - s3_joints)[:, s3_mask > 0.5]
+    root3 = onp.asarray(Ts_root3.wxyz_xyz)
+    root_res = onp.linalg.norm(root3[:, 4:7] - root[:, 4:7], axis=-1)
+    # 고정 열(하반신·허리·손)과 루트는 정확히 고정값으로 되돌립니다 — pin 은 소프트 제약이라 1e-4 수준 잔차가 남습니다.
+    joints_out = onp.where(s3_mask[None] > 0.5, s3_joints, joints3).astype(onp.float32)
+    print(f"[stage1-hand] STAGE 3 solved in {time.time()-t3:.1f}s | pin 잔차 max 관절 {pin_res.max():.2e} rad, "
+          f"루트 {root_res.max()*1000:.3f} mm → 고정값으로 덮어씀")
+
+    # (4) 지표 ---------------------------------------------------------------------------------
+    def _world(jn):
+        f_ = onp.asarray(jax.vmap(robot.forward_kinematics)(jnp.asarray(jn)))
+        R_ = onp.asarray(jaxlie.SO3(jnp.asarray(f_[..., :4])).as_matrix()); p_ = f_[..., 4:7].astype(onp.float64)
+        Tr = jaxlie.SE3(jnp.asarray(root)); Rr = onp.asarray(Tr.rotation().as_matrix()); pr = onp.asarray(Tr.translation())
+        return onp.einsum("fij,fljk->flik", Rr, R_), onp.einsum("fij,flj->fli", Rr, p_) + pr[:, None]
+    R_prev, p_prev = _world(joints); R_new, p_new = _world(joints_out)
+    pct = lambda a, q: float(onp.percentile(a, q))
+    rows = []
+    for si, sd in enumerate("lr"):
+        pidx = robot.links.names.index(f"robot0_{sd}_palm")
+        e_pos = onp.linalg.norm(p_new[:, pidx] - palm_pos[:, si], axis=-1)[valid] * 1000.0
+        e_rot = _s3_rot_angle_deg(R_new[:, pidx], Rs_all[:, si])[valid]
+        e_prev = onp.linalg.norm(p_prev[:, pidx] - palm_pos[:, si], axis=-1)[valid] * 1000.0
+        rows.append(f"  손바닥 {sd}: 위치 p50 {pct(e_pos,50):.1f} p95 {pct(e_pos,95):.1f} max {e_pos.max():.1f} mm "
+                    f"(2단계 대비 이전 p50 {pct(e_prev,50):.0f} mm) | 회전 p50 {pct(e_rot,50):.2f} p95 {pct(e_rot,95):.2f} "
+                    f"max {e_rot.max():.2f} deg")
+    _tsel = [j for j, i in enumerate(onp.asarray(ft_idx)) if robot.links.names[i] in ft_names]   # 접촉점 중 손끝 10개만
+    _tl = onp.asarray(ft_idx)[_tsel]
+    cp = p_new[:, _tl] + onp.einsum("flij,lj->fli", R_new[:, _tl], onp.asarray(ft_off, onp.float64)[_tsel])
+    e_tip = onp.linalg.norm(cp - ft_s1[:, [ft_names.index(robot.links.names[i]) for i in _tl]], axis=-1)[valid] * 1000.0
+    rows.append(f"  손끝 10개 vs 롤아웃 손끝: p50 {pct(e_tip,50):.1f} p95 {pct(e_tip,95):.1f} max {e_tip.max():.1f} mm")
+    # 팔 관절: 2단계 해와의 차이, 한계 근접, 속도
+    d_arm = onp.degrees(joints_out[:, free] - joints[:, free])
+    lo = onp.asarray(robot.joints.lower_limits)[free]; hi = onp.asarray(robot.joints.upper_limits)[free]
+    margin = onp.degrees(onp.minimum(joints_out[:, free] - lo, hi - joints_out[:, free]))
+    v_prev = onp.abs(onp.diff(onp.degrees(joints[:, free]), axis=0)) * 30.0
+    v_new = onp.abs(onp.diff(onp.degrees(joints_out[:, free]), axis=0)) * 30.0
+    worst = onp.argsort(-onp.abs(d_arm).max(0))[:4]
+    rows.append(f"  팔 관절 변화(3단계-2단계): |Δ| p50 {pct(onp.abs(d_arm),50):.1f} p95 {pct(onp.abs(d_arm),95):.1f} "
+                f"max {onp.abs(d_arm).max():.1f} deg — 최대 4개: "
+                + ", ".join(f"{an[free[j]]} {onp.abs(d_arm[:, j]).max():.1f}" for j in worst))
+    rows.append(f"  팔 관절 한계 여유: 최소 {margin.min():.1f} deg, 1 deg 이내 프레임·관절 {(margin < 1.0).sum()}개 "
+                f"| 관절 속도 p95 {pct(v_prev,95):.0f} → {pct(v_new,95):.0f} deg/s, max {v_prev.max():.0f} → {v_new.max():.0f}")
+    # SMPL-X 어깨/팔꿈치(팔 목표 1.0) 및 사람 손목 vs 로봇 wrist_yaw (참고)
+    for tag, keys in (("어깨·팔꿈치", ("shoulder", "elbow")), ("사람 손목↔wrist_yaw", ("wrist",))):
+        sel = [i for i, (_, l, _) in enumerate(pairs) if not l.startswith("robot0_") and any(kk in l for kk in keys)]
+        ep = onp.stack([onp.linalg.norm(p_prev[:, a_link[i]] - jp_ext[:, a_para[i]], axis=-1) for i in sel], 1) * 100.0
+        en = onp.stack([onp.linalg.norm(p_new[:, a_link[i]] - jp_ext[:, a_para[i]], axis=-1) for i in sel], 1) * 100.0
+        rows.append(f"  SMPL-X {tag} 오차: 평균 {ep.mean():.1f} → {en.mean():.1f} cm, p95 {pct(ep,95):.1f} → {pct(en,95):.1f} cm")
+    # 롤아웃 물체 vs ParaHome 물체 (참고: 손 목표는 롤아웃 좌표를 그대로 씀)
+    okey = [kk for kk in sm.files if kk.startswith("obj__") and kk.endswith("__base")]
+    cf = onp.linalg.norm(onp.asarray(hd["contact_force_w"]), axis=-1).max(1) > 1.0          # (T1,) 어느 링크든 > 1 N
+    c30 = cf[onp.clip(onp.rint(k).astype(int), 0, T1 - 1)]
+    if okey:
+        ref = onp.asarray(sm[okey[0]], onp.float64)
+        os1 = _s3_resample(onp.asarray(hd["obj_pos"], onp.float64), k)
+        oq1 = _s3_nlerp(onp.asarray(hd["obj_quat"], onp.float64), k)
+        e_o = onp.linalg.norm(os1 - ref[:, :3], axis=-1)[valid] * 100.0
+        e_oq = _s3_rot_angle_deg(onp.asarray(jaxlie.SO3(jnp.asarray(oq1)).as_matrix()),
+                                 onp.asarray(jaxlie.SO3(jnp.asarray(ref[:, 3:7])).as_matrix()))[valid]
+        rows.append(f"  롤아웃 물체 vs ParaHome 물체: 위치 p50 {pct(e_o,50):.1f} p95 {pct(e_o,95):.1f} max {e_o.max():.1f} cm, "
+                    f"회전 p50 {pct(e_oq,50):.1f} p95 {pct(e_oq,95):.1f} deg | 접촉(>1 N) 프레임 {c30[valid].mean()*100:.0f}%")
+    print("[stage1-hand] 지표 (유효 프레임 기준):\n" + "\n".join(rows))
+
+    pl_idx = [robot.links.names.index(f"robot0_{sd}_palm") for sd in "lr"]
+    palm_q_out = onp.asarray(jaxlie.SO3.from_matrix(jnp.asarray(R_new[:, pl_idx])).wxyz)      # (F,2,4)
+    return dict(_joints=joints_out, _root=onp.asarray(root, onp.float32),
+                g1_palm_quat=palm_q_out.astype(onp.float32), g1_palm_pos=p_new[:, pl_idx].astype(onp.float32),
+                g1_hand_target=_s3_resample(onp.asarray(hd["finger_target"], onp.float64), k).astype(onp.float32),
+                hand_target_names=onp.array([str(n) for n in hd["joint_names"]], dtype=object),
+                stage1_palm_pos=palm_pos.astype(onp.float32), stage1_palm_quat=palm_quat.astype(onp.float32),
+                stage1_valid=valid, stage1_contact=c30, stage1_source=onp.array(str(args.stage1_hand)))
+# ── [/ROLLBACK MARKER: stage1-hand] ──
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", default="s100_seg00_pan")
     ap.add_argument("--class", dest="cls", default="single_rigid")
+    # [stage1-hand] 1단계(떠 있는 양손) 롤아웃 hand_traj_best.npz 를 주면 3단계를 추가로 풉니다(아래 STAGE 3).
+    ap.add_argument("--stage1_hand", default="", help="[stage1-hand] hand_traj_best.npz 경로 (없으면 기존 동작)")
+    ap.add_argument("--stage1_reuse", type=int, default=1,
+                    help="[stage1-hand] 1 = 기존 trajectory_pyroki.npz 를 1·2단계 결과로 재사용(재계산 생략)")
     args = ap.parse_args()
 
     urdf = yourdfpy.URDF.load(str(_URDF))
@@ -973,8 +1205,15 @@ def main():
     root_R_target = _pelvis_target_R(jp)     # (F,3,3) keypoint-derived pelvis orientation target
     heightmap = _flat_heightmap(jp)          # flat z=0 floor spanning the clip
 
+    # [stage1-hand] 기존 결과 재사용이면 1·2단계 solve 를 건너뜁니다.
+    _s3_base = _stage3_load_base(_PROC / "g1_shadow" / args.cls / args.clip / "0" / "trajectory_pyroki.npz", an, F) \
+        if (args.stage1_hand and args.stage1_reuse) else None
     t0 = time.time()
-    Ts_root, joints = solve(robot, robot_coll, heightmap, jnp.array(jp_ext), b_para, b_link, b_mask, a_para,
+    if _s3_base is not None:
+        joints, root = _s3_base
+        print("[stage1-hand] 1·2단계 재계산 생략 — 기존 trajectory_pyroki.npz 사용")
+    else:
+      Ts_root, joints = solve(robot, robot_coll, heightmap, jnp.array(jp_ext), b_para, b_link, b_mask, a_para,
                             a_link, jnp.array(a_off), jnp.array(gw), jnp.array(lw), jnp.array(l_c), jnp.array(r_c),
                             jnp.array(l_kp), jnp.array(r_kp), left_foot_idx, right_foot_idx,
                             left_knee_idx, right_knee_idx,
@@ -982,15 +1221,15 @@ def main():
                             jnp.array(ft_margin), jnp.array(ft_pad), jnp.array(ft_mask),
                             jnp.array(rest_w), weights,
                             h_sets=h_sets)
-    joints = onp.array(joints); root = onp.array(Ts_root.wxyz_xyz)
-    print(f"[pyroki-retarget] stage-1 solved in {time.time()-t0:.1f}s")
+      joints = onp.array(joints); root = onp.array(Ts_root.wxyz_xyz)
+      print(f"[pyroki-retarget] stage-1 solved in {time.time()-t0:.1f}s")
 
     # ---- STAGE 2 (W_STAGE2>0 = pin weight; ON by default): freeze LOWER body (legs) + root + offset at the
     # stage-1 solution and re-solve the UPPER body (waist+arms+hands) with STRONG hand keypoint alignment, so
     # the arms reach UP to the human hand keypoints without un-grounding the (stage-1) feet. W_STAGE2=0 → skip
     # (single-stage baseline). ----
     w_stage2 = _w("W_STAGE2", 100.0)
-    if w_stage2 > 0.0:
+    if w_stage2 > 0.0 and _s3_base is None:
         lower_mask = onp.array([1.0 if any(k in nm for k in ("hip", "knee", "ankle")) else 0.0
                                 for nm in an], onp.float32)      # freeze legs; waist+arms+fingers stay free
         # [smplx-kpts] 여기도 위치 인덱스 -> 이름 기반. 옛 gw2[8:14]/gw2[14:] 는 _BODY 순서 전제였습니다.
@@ -1019,6 +1258,16 @@ def main():
         joints = onp.array(joints2); root = onp.array(Ts_root.wxyz_xyz)
         print(f"[pyroki-retarget] STAGE 2 (freeze lower + reach hands) solved in {time.time()-t1:.1f}s")
 
+    # ── [ROLLBACK MARKER: stage1-hand] STAGE 3: 1단계 롤아웃의 손을 이식하고 팔만 다시 풀기 ──
+    _s3_extra = {}
+    if args.stage1_hand:
+        _s3_extra = _stage3_run(args, robot, robot_coll, heightmap, an, joints, root, F, pairs, a_para, a_link,
+                                a_off, jp_ext, sm, b_para, b_link, b_mask, lw, l_c, r_c, l_kp, r_kp,
+                                left_foot_idx, right_foot_idx, left_knee_idx, right_knee_idx, root_R_target,
+                                ft_idx, ft_off, ft_margin, ft_pad, ft_mask, rest_w, weights, h_sets, _w)
+        joints = _s3_extra.pop("_joints"); root = _s3_extra.pop("_root")
+        os.environ.setdefault("W_OUTSUFFIX", "_stage1")
+    # ── [/ROLLBACK MARKER: stage1-hand] ──
     solved = {name: joints[:, i] for i, name in enumerate(an)}
     act = list(_ORDER["action_joint_names"])
     # [ROLLBACK MARKER: tendon-ineq] 부등식 모드에서는 J0 8개가 자유 변수로 풀립니다. 65열 액션
@@ -1069,7 +1318,7 @@ def main():
     # middle finger driven by the thumb). With the names alongside, the env matches by name.
     onp.savez(out, g1_joint_pos=g1_joint_pos.astype(onp.float32),
               g1_root_pose=g1_root_pose.astype(onp.float32),
-              joint_names=onp.array(act, dtype=object))
+              joint_names=onp.array(act, dtype=object), **_s3_extra)   # [stage1-hand] 추가 키
     print(f"[pyroki-retarget] wrote {out}  ({nmap}/{len(act)} action joints solved)")
 
 

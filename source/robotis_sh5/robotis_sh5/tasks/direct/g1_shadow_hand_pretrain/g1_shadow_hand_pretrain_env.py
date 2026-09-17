@@ -47,10 +47,12 @@ from __future__ import annotations
 import math
 import json
 import os
-import glob  # [stage1-hand]
 
 import numpy as np
 import torch
+
+# [hand-pretrain] 손목 6D 회전 -> 축각. workspaceTJ 의 gr_env 가 쓰는 것과 같은 구현입니다.
+from pytorch3d.transforms import matrix_to_axis_angle, rotation_6d_to_matrix
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
@@ -60,8 +62,8 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
-from . import cws as CWS
-from .g1_shadow_sonic_residual_env_cfg import (
+from ..g1_shadow_sonic_residual import cws as CWS
+from ..g1_shadow_sonic_residual.g1_shadow_sonic_residual_env_cfg import (
     _ROBOT_USD,
     BODY_KPT_OFFSETS,
     BODY_KPTS,
@@ -74,8 +76,9 @@ from .g1_shadow_sonic_residual_env_cfg import (
     N_BODY_KPTS,
     N_HAND_KPTS_PER_HAND,
     N_LINK_CONTACT,
-    G1ShadowSonicResidualEnvCfg,
+    G1ShadowSonicResidualEnvCfg,   # noqa: F401  (부모 타입, 아래에서 교체)
 )
+from .g1_shadow_hand_pretrain_env_cfg import G1ShadowHandPretrainEnvCfg
 
 # Fixed-point rounds for the spawn-declear settle (see _solve_spawn_declear). Not a cfg knob:
 # 1 round already converges for compact objects and 3 is enough for ones that tip as they
@@ -98,34 +101,11 @@ def _canon(q: torch.Tensor) -> torch.Tensor:
     return torch.where(q[..., :1] < 0, -q, q)
 
 
-# ── [ROLLBACK MARKER: stage1-hand] 1단계 롤아웃(control_fps 행) → 레퍼런스 프레임 시간축 보간 ─────
-def _s1_resample(x, k):
-    """x (T,...) 를 실수 행 인덱스 k (N,) 에서 선형 보간합니다. 양끝은 첫/마지막 값을 유지합니다."""
-    x = np.asarray(x, np.float32)
-    i0 = np.clip(np.floor(k).astype(int), 0, len(x) - 1)
-    i1 = np.clip(i0 + 1, 0, len(x) - 1)
-    w = np.clip(k - i0, 0.0, 1.0).reshape((-1,) + (1,) * (x.ndim - 1)).astype(np.float32)
-    return ((1.0 - w) * x[i0] + w * x[i1]).astype(np.float32)
-
-
-def _s1_nlerp(q, k):
-    """(T,...,4) wxyz 사원수: 부호를 맞춘 뒤 선형 보간·정규화 (인접 프레임이라 slerp 와 차이 없음)."""
-    q = np.asarray(q, np.float32)
-    i0 = np.clip(np.floor(k).astype(int), 0, len(q) - 1)
-    i1 = np.clip(i0 + 1, 0, len(q) - 1)
-    w = np.clip(k - i0, 0.0, 1.0).reshape((-1,) + (1,) * (q.ndim - 1)).astype(np.float32)
-    a, b = q[i0], q[i1]
-    b = np.where((a * b).sum(-1, keepdims=True) < 0, -b, b)
-    o = (1.0 - w) * a + w * b
-    return (o / np.clip(np.linalg.norm(o, axis=-1, keepdims=True), 1e-9, None)).astype(np.float32)
-# ── [/ROLLBACK MARKER: stage1-hand] ──
-
-
-class G1ShadowSonicResidualEnv(DirectRLEnv):
-    cfg: G1ShadowSonicResidualEnvCfg
+class G1ShadowHandPretrainEnv(DirectRLEnv):
+    cfg: G1ShadowHandPretrainEnvCfg
 
     # ------------------------------------------------------------------ init
-    def __init__(self, cfg: G1ShadowSonicResidualEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: G1ShadowHandPretrainEnvCfg, render_mode: str | None = None, **kwargs):
         # [ROLLBACK MARKER: body-kpt-off] 몸 키포인트 감독 비활성화(실험): 보상·종료·캐시 bar 일괄
         # 적용. super() 이전에 cfg를 고쳐 두므로 exp 가중치 테이블(_post_init_buffers의 _lw 정규화 —
         # body 몫이 나머지 항에 자동 재배분)과 params/env.yaml 덤프 모두 적용된 값을 본다. 관측
@@ -134,128 +114,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         if not cfg.body_kpt_supervision:
             cfg.rew_body_kpts = 0.0        # 코어 몸 10kpt 보상 제거 (ee/hand/link/fingertip/root/obj 유지)
             cfg.term_body_kpt_err = 1.0e6  # body 종료 게이트 무력화 → 루트 게이트가 낙상 담당
-        # ── [ROLLBACK MARKER: waist-gain-mult] ────────────────────────────────────────────
-        # 허리 3관절의 PD 게인만 배수로 올립니다. 액션 스케일은 건드리지 않습니다.
-        #
-        # 왜 스케일을 안 건드리나: SONIC 은 얼어 있고, `scale = 0.25*effort/k` 라는 규약 위에서
-        # 학습됐습니다. 이 규약은 k 가 약분되어 tau = 0.25*effort*a 가 되도록 만든 것이라
-        # "|a|=1 = 최대 토크의 25%" 가 전 관절에서 같습니다. 스케일을 1.0 으로 바꾸면 허리만
-        # |a|=0.333 에서 토크 한계에 닿고 나머지는 |a|=4 라, 전신 제어기 안에서 관절 하나만
-        # 12배 다른 규칙을 쓰게 됩니다. 반대로 k 에 맞춰 스케일을 재계산하면(0.0833) 허리 권한이
-        # 5배 줄어 SONIC 이 기대하는 것보다 훨씬 덜 움직입니다. 둘 다 얼어 있는 망을 분포 밖으로
-        # 밀어냅니다. 그래서 스케일은 sonic_prior 값(roll/pitch 0.4386, yaw 0.5475) 그대로 둡니다.
-        #
-        # 이건 상류 SONIC v1.1 배포 튜닝과 같은 성격입니다 (README:164):
-        #     ./deploy.sh --motor-kp-scale 4,10=1.5 --motor-kd-scale 4,10=1.5 real
-        # 하드웨어 모터 4/10 = 좌우 ankle_pitch. 모터 게인만 올리고 액션 스케일은 안 건드립니다.
-        # 의미: 명령 각도는 그대로, 거기 도달하는 힘만 세짐 -> 추종 오차 감소. 그 오차는
-        # proprioception 으로 SONIC 에 되먹는 값이라 분포 이탈을 줄이는 방향입니다.
-        #
-        # k 와 d 를 같은 배수로 올리면 w_n 은 sqrt(s)배, zeta 는 sqrt(s)배가 됩니다.
-        #   1.5배 -> w_n 10.0 -> 12.2 Hz,  zeta 2.00 -> 2.45 (더 단단하고 더 감쇠)
-        # 되돌리기: cfg.waist_gain_scale = 1.0 (아래 블록 전체가 건너뛰어집니다).
-        _wgs = float(getattr(cfg, "waist_gain_scale", 1.0))
-        if abs(_wgs - 1.0) > 1e-9:
-            import copy as _copy, math as _math
-            from isaaclab.actuators import ImplicitActuatorCfg as _IAC
-            _rc = _copy.deepcopy(cfg.robot_cfg)
-            _acts = dict(_rc.actuators)
-            # 허리를 기존 두 그룹에서 떼어낸다 (발목/힙요는 원래 게인 유지)
-            _acts["sonic_ankle_waist"].joint_names_expr = [".*_ankle_pitch_joint", ".*_ankle_roll_joint"]
-            _acts["sonic_hipyaw_waistyaw"].joint_names_expr = [".*_hip_yaw_joint"]
-            # 원래 그룹 값 x 배수. effort/velocity/armature 는 그대로 — 토크 한계를 바꾸면
-            # 위의 "|a|=1 = 25% 토크" 규약이 다시 깨진다.
-            for _nm, _joints, _k0, _d0, _eff, _vel, _arm in (
-                ("waist_gm", ["waist_roll_joint", "waist_pitch_joint"],
-                 28.5013, 1.8143, 50.0, 37.0, 0.00721945),
-                ("waist_yaw_gm", ["waist_yaw_joint"],
-                 40.1795, 2.5579, 88.0, 32.0, 0.010177520),
-            ):
-                _k, _d = _k0 * _wgs, _d0 * _wgs
-                _acts[_nm] = _IAC(joint_names_expr=_joints, effort_limit_sim=_eff,
-                                  velocity_limit_sim=_vel, stiffness=_k, damping=_d, armature=_arm)
-                print(f"[waist-gain] {_nm}: k {_k0:.4f} -> {_k:.4f}   d {_d0:.4f} -> {_d:.4f}"
-                      f"   w_n {_math.sqrt(_k / _arm) / (2 * _math.pi):.1f} Hz"
-                      f"   zeta {_d / (2 * _math.sqrt(_k * _arm)):.2f}")
-            _rc.actuators = _acts
-            cfg.robot_cfg = _rc
-            print(f"[waist-gain] 배수 {_wgs}, 액션 스케일은 변경 없음 (roll/pitch 0.4386, yaw 0.5475)")
-        # ── [/ROLLBACK MARKER: waist-gain-mult] ───────────────────────────────────────────
-        # ── [ROLLBACK MARKER: ankle-gain-mult] ────────────────────────────────────────────
-        # 좌우 ankle_pitch 의 PD 게인만 배수로 올립니다. 액션 스케일은 건드리지 않습니다
-        # (waist-gain-mult 와 같은 이유 — 그 블록 주석 참조).
-        #
-        # 출처: 상류 SONIC v1.1 의 실기 배포 튜닝 (README:164, docs/source/model_card.md:110).
-        #     ./deploy.sh --motor-kp-scale 4,10=1.5 --motor-kd-scale 4,10=1.5 real
-        #     "increasing their control gains improves whole-body stability and, in practice,
-        #      wrist tracking"
-        # 인덱스 공간 확인 (robot_parameters.hpp:90 enum G1JointIndex):
-        #     LeftAnklePitch = 4,  RightAnklePitch = 10
-        # 적용 지점은 motor_gain_scaling.cpp:174 의 command.kp[index] *= factor — 하드웨어 모터
-        # 배열이라 시뮬레이션 관절 순서(G1_ISAACLab_ORDER)가 아닙니다. 그 순서였다면 4/10 은
-        # right_hip_roll / right_knee 로 전혀 다른 관절을 가리킵니다.
-        #
-        # ankle_roll 은 대상이 아닙니다 (5, 11 번이고 플래그에 없음). 그래서 pitch 만 떼어냅니다.
-        # 실기 발목은 병렬 링크(A/B 모터)라 pitch/roll 이 한 쌍의 모터에서 나오지만, 시뮬레이션은
-        # 독립 관절로 모델링합니다. 실기 이식 때 다시 볼 지점입니다.
-        #
-        # 참고 실측(agent_26000, s101_seg29_pot): ankle_pitch 포화율 33.9% / 37.2% 로 허리 다음으로
-        # 높았습니다. 게인을 올리면 명령 추종이 좋아져 proprioception 으로 되먹는 오차가 줍니다.
-        # 되돌리기: cfg.ankle_gain_scale = 1.0.
-        _ags = float(getattr(cfg, "ankle_gain_scale", 1.0))
-        if abs(_ags - 1.0) > 1e-9:
-            import copy as _copy, math as _math
-            from isaaclab.actuators import ImplicitActuatorCfg as _IAC
-            _rc = _copy.deepcopy(cfg.robot_cfg)
-            _acts = dict(_rc.actuators)
-            # 현재 내용이 무엇이든 ankle_pitch 만 빼낸다 (waist 블록 실행 여부와 무관하게 동작)
-            _aw = _acts["sonic_ankle_waist"]
-            _aw.joint_names_expr = [n for n in _aw.joint_names_expr if n != ".*_ankle_pitch_joint"]
-            _k0, _d0, _arm = 28.5013, 1.8143, 0.00721945
-            _k, _d = _k0 * _ags, _d0 * _ags
-            _acts["ankle_pitch_gm"] = _IAC(
-                joint_names_expr=[".*_ankle_pitch_joint"], effort_limit_sim=50.0,
-                velocity_limit_sim=37.0, stiffness=_k, damping=_d, armature=_arm)
-            _rc.actuators = _acts
-            cfg.robot_cfg = _rc
-            print(f"[ankle-gain] ankle_pitch: k {_k0:.4f} -> {_k:.4f}   d {_d0:.4f} -> {_d:.4f}"
-                  f"   w_n {_math.sqrt(_k / _arm) / (2 * _math.pi):.1f} Hz"
-                  f"   zeta {_d / (2 * _math.sqrt(_k * _arm)):.2f}")
-            print(f"[ankle-gain] 배수 {_ags}, 액션 스케일 변경 없음 (0.4386), ankle_roll 은 대상 아님"
-                  f"  남은 sonic_ankle_waist={_aw.joint_names_expr}")
-        # ── [/ROLLBACK MARKER: ankle-gain-mult] ───────────────────────────────────────────
             cfg.cache_body_bar = 1.0e6     # 캐시 body bar 무력화 (root/fingertip bar는 유지)
             print("[body-kpt-off] body keypoint supervision DISABLED: rew_body_kpts=0, "
                   "body termination/cache-bar off, root fall gate on "
                   f"(term_root_pos_err={cfg.term_root_pos_err}, term_root_rot_err={cfg.term_root_rot_err})")
-        # ── [ROLLBACK MARKER: joint-residual] 상체 관절 잔차 블록 (NVIDIA video_to_data 의 JOINT_RESIDUAL).
-        # RL 이 SONIC 디코더 출력 뒤에 관절 잔차를 더한다. 액션 +N, 관측(prev_action) +N — super() 이전에
-        # 고쳐야 관측/액션 공간과 params/env.yaml 덤프가 함께 맞는다. 끄면 원래 차원 그대로.
-        self._upper_on = (bool(getattr(cfg, "sonic_upper_residual", False)) and bool(getattr(cfg, "use_sonic", True)))
-        # "all" = 몸 29관절 전부(다리 12 + 허리 3 + 팔 14, video_to_data 의 ReconBody 방식),
-        # "upper" = sonic_upper_residual_joints 의 17관절만(ReconHand 방식). 29 는 액션 관절의
-        # 앞 29개가 몸이라는 이 env 의 불변식이다(_action_joint_ids[:29]).
-        self._res_mode = str(getattr(cfg, "sonic_residual_joints_mode", "upper"))
-        if self._upper_on:
-            _n_up = 29 if self._res_mode == "all" else len(list(cfg.sonic_upper_residual_joints))
-            cfg.action_space = int(cfg.action_space) + _n_up
-            cfg.observation_space = int(cfg.observation_space) + _n_up
-            print(f"[joint-residual] ON: 상체 {_n_up}관절 = SONIC 출력 + "
-                  f"{cfg.sonic_upper_residual_scale}·u (SONIC 액션 단위, tanh/EMA 없음); "
-                  f"action {cfg.action_space - _n_up}→{cfg.action_space}, "
-                  f"obs {cfg.observation_space - _n_up}→{cfg.observation_space}")
-        # 잠재 잔차 z_res 를 끄면 액션에서 그 블록을 통째로 뺀다. SONIC 디코더에는 0 벡터를 넘기므로
-        # latent + lambda*0 = latent 가 되어 순수 SONIC 디코드가 된다. 몸은 관절 잔차만으로 움직인다.
-        self._zres_on = (bool(getattr(cfg, "sonic_latent_residual", True)) and bool(getattr(cfg, "use_sonic", True)))
-        self._act_z = int(cfg.sonic_action_dim) if self._zres_on else 0
-        assert self._zres_on or not bool(getattr(cfg, "sonic_latent_delta", False)), \
-            "[joint-residual] sonic_latent_delta 는 잠재 잔차가 켜져 있을 때만 쓸 수 있다 (적분기 폭이 안 맞는다)"
-        if bool(getattr(cfg, "use_sonic", True)) and not self._zres_on:
-            cfg.action_space = int(cfg.action_space) - int(cfg.sonic_action_dim)
-            cfg.observation_space = int(cfg.observation_space) - int(cfg.sonic_action_dim)
-            print(f"[joint-residual] 잠재 잔차 OFF: 액션에서 z_res {cfg.sonic_action_dim}차원 제거 "
-                  f"(SONIC 은 순수 디코드); action →{cfg.action_space}, obs →{cfg.observation_space}")
-        # ── [/ROLLBACK MARKER: joint-residual] ──
         self._load_reference_trajectories(cfg)          # numpy buffers (pre-super: no device yet) → sets _ref_len
         self._build_object_cfg(cfg)                     # guarded: only if converted USD exists
         # EPISODE = RSI start frame → END OF THE REFERENCE SEQUENCE (or a termination). The horizon is
@@ -442,6 +304,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # optional per-frame retargeted G1 joints (seed reset pose if present)
         rt = os.path.join(cfg.dataset_root, cfg.retarget_subdir, cfg.clip_class,
                           os.path.basename(os.path.dirname(clip_dir)), "0", cfg.retarget_file)
+        # [hand-state-cache] 리타게팅 산출물 디렉터리를 그대로 보관합니다. wrist_ref.npz 를 읽는
+        # 곳과 같은 디렉터리이고, train.py 가 학습 종료 시 상태 캐시를 여기에 씁니다.
+        # cfg 필드로 재구성하면 clip_name="" (env 가 자동 선택) 인 경우 어긋납니다.
+        self._retarget_dir = os.path.dirname(rt)
         self._np_ref_joints = None
         self._np_ref_palm_quat = None
         self._ref_joint_names: list[str] | None = None
@@ -460,6 +326,37 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 self._np_root_pos = rp[:, :3]
                 self._np_root_quat = rp[:, 3:7]
                 self._recompute_root_vel()
+            # ── [hand-pretrain] 리타게팅 손목 pose (RSI 초기 자세) ──────────────────────────
+            # 자유부유 손의 루트는 골반이 아니라 손목입니다. 리타게팅 npz 에는 손목 pose 가 없고
+            # (g1_joint_pos + g1_root_pose 로부터 FK 로만 얻어짐) g1_palm_quat 도 재생성 클립에는
+            # 없어서, scripts/process_dataset/retarget/export_wrist_ref.py 가 pinocchio FK 로 미리
+            # 뽑아 둔 사이드카를 읽습니다. 없으면 RSI 가 손목을 어디에 둘지 알 수 없으므로 실패시킵니다.
+            # 리타게팅 산출물과 같은 디렉터리(g1_shadow 트리)에 있습니다 — clip_dir 은 smplx 쪽입니다.
+            _wr = os.path.join(os.path.dirname(rt), "wrist_ref.npz")
+            if not os.path.exists(_wr):
+                raise FileNotFoundError(
+                    f"{_wr} 없음 — scripts/process_dataset/retarget/export_wrist_ref.py 를 먼저 실행하세요")
+            _wd = np.load(_wr, allow_pickle=True)
+            self._np_wrist_pose = np.stack([_wd["wrist_pose_l"], _wd["wrist_pose_r"]], axis=0)  # (2,F,7)
+            # [wrist6] 관절 모드는 pose 대신 6-DoF 관절값을 추종 목표로 쓴다. 같은 pose 를
+            # export_wrist_dof6.py 가 YZX 로 분해해 저장한 것이고, 순방향 사상은 sim 에서
+            # 0.0005 mm 로 검증됐다. 저장된 rot_seq 를 에셋 축 순서와 대조한다 — 어긋나면
+            # pose 가 조용히 틀어진다.
+            self._np_wrist_dof6 = None
+            if str(getattr(cfg, "wrist_mode", "wrench")) == "joint6":
+                _w6p = os.path.join(os.path.dirname(rt), "wrist_dof6.npz")
+                if not os.path.exists(_w6p):
+                    raise FileNotFoundError(
+                        f"{_w6p} 없음 — scripts/process_dataset/retarget/export_wrist_dof6.py 를 "
+                        f"먼저 실행하세요 (wrist_mode='joint6')")
+                _d6 = np.load(_w6p, allow_pickle=True)
+                _seq = str(_d6["rot_seq"]) if "rot_seq" in _d6.files else "?"
+                if _seq != "YZX":
+                    raise ValueError(
+                        f"{_w6p} 의 rot_seq={_seq!r} 가 에셋(YZX)과 다릅니다 — "
+                        f"export_wrist_dof6.py 를 --overwrite 로 다시 실행하세요")
+                self._np_wrist_dof6 = np.stack(
+                    [_d6["wrist_dof_l"], _d6["wrist_dof_r"]], axis=0).astype(np.float32)  # (2,F,6)
             if "g1_palm_quat" in rd.files:
                 # reference palm/wrist orientation per hand [L,R] wxyz (Kabsch palm pose = the
                 # robot0_{l,r}_palm body frame) → wrist-rotation termination gate.
@@ -524,8 +421,18 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 self._np_link_contact_target = _rl(self._np_link_contact_target)   # (N,L,3) object-local target
             if self._np_ref_joints is not None:
                 self._np_ref_joints = _rl(self._np_ref_joints)
+            # [hand-pretrain] 손목 pose 도 같은 격자로 — 위치는 선형, 쿼터니언은 slerp
+            self._np_wrist_pose = np.stack(
+                [np.concatenate([_rl(self._np_wrist_pose[k][:, :3]),
+                                 _rq(self._np_wrist_pose[k][:, 3:7])], axis=1) for k in (0, 1)], axis=0)
             if self._np_ref_palm_quat is not None:
                 self._np_ref_palm_quat = _rq(self._np_ref_palm_quat)
+            # [wrist6] 6-DoF 관절값은 6개 성분 전부 **선형** 보간이다. exporter 가 branch 를
+            # 이전 프레임 최근접으로 골라 연속으로 저장하므로(재구성 오차 5e-14도) 선형이
+            # 안전하다 — 그게 branch 선택을 넣은 이유다. 각도를 wrap 된 상태로 보간하면 안 된다.
+            if self._np_wrist_dof6 is not None:
+                self._np_wrist_dof6 = np.stack(
+                    [_rl(self._np_wrist_dof6[k]) for k in (0, 1)], axis=0).astype(np.float32)
             # root velocity at the NEW rate (finite diff of the resampled root; quat-log for angvel)
             self._np_root_linvel = np.zeros_like(self._np_root_pos)
             self._np_root_linvel[1:] = (self._np_root_pos[1:] - self._np_root_pos[:-1]) * tgt_fps
@@ -539,7 +446,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
 
         self._ref_len = int(F)
         self._n_obj_parts = int(self._np_obj_dof.shape[1])
-        self._load_stage1_hand(cfg, clip_dir)      # [ROLLBACK MARKER: stage1-hand]
 
         # object reference velocity (finite-diff of the FINAL, rate-matched _np_obj_base) — mirrors the
         # root velocity above; seeds the RSI reset object velocity on the reference path so a mid-motion
@@ -677,204 +583,19 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         return None
     # ── [/ROLLBACK MARKER: cws-rc-mesh] ────────────────────────────────────────────────────
 
-    # ── [ROLLBACK MARKER: stage1-hand] 1단계(떠 있는 양손) 롤아웃 로드 (2026-09-09) ─────────────
-    def _load_stage1_hand(self, cfg, clip_dir: str) -> None:
-        """hand_traj_best.npz(1단계 롤아웃) 를 레퍼런스 시간축(N=_ref_len)에 맞춰 numpy 로 들고 있습니다.
-        cfg 주석(hand_kpt_from_stage1 / sonic_hand_residual) 참조. 파일이 없으면 self._np_s1 = None."""
-        self._np_s1 = None
-        self._stage1_contact_map_loaded = False   # [stage1-contact-map]
-        self._has_link_contact_human = False      # [cws-human-ref] 사람 맵 보관 여부 (1단계 맵으로 교체될 때 채움)
-        want_kpt = bool(getattr(cfg, "hand_kpt_from_stage1", False))
-        want_base = (bool(getattr(cfg, "sonic_hand_residual", False))
-                     and str(getattr(cfg, "sonic_hand_residual_base", "reference")).startswith("stage1"))
-        if not (want_kpt or want_base):
-            return
-        clip = os.path.basename(os.path.dirname(clip_dir))
-        base_dir = os.path.join(cfg.dataset_root, cfg.stage1_subdir, cfg.clip_class, clip, "0")
-        cands = [os.path.join(base_dir, cfg.stage1_hand_file)]
-        cands += sorted(glob.glob(os.path.join(base_dir, "evaluation_*", cfg.stage1_hand_file)),
-                        key=os.path.getmtime, reverse=True)
-        path = next((p for p in cands if os.path.exists(p)), None)
-        if path is None:
-            print(f"[stage1-hand] 1단계 롤아웃 파일이 없습니다 ({base_dir}/[evaluation_*/]{cfg.stage1_hand_file}) "
-                  f"— 손 목표는 SMPL-X 그대로, 잔차 기준은 레퍼런스로 둡니다.")
-            return
-        hd = np.load(path, allow_pickle=True)
-        N = int(self._ref_len)
-        fps_env = 1.0 / float(cfg.ref_dt)
-        s1_fps = float(hd["control_fps"])
-        fr = np.asarray(hd["frame"], np.float64)                   # 기록된 행마다의 레퍼런스 프레임(롤아웃 시간축)
-        assert np.all(np.diff(fr) == 1.0), "[stage1-hand] frame 열이 연속이 아닙니다"
-        # 레퍼런스 프레임 i (fps_env) 의 시각 = 롤아웃 프레임 i*s1_fps/fps_env; 행 = 프레임 - fr[0]
-        k = np.arange(N) * (s1_fps / fps_env) - fr[0]
-        valid = (k >= 0.0) & (k <= fr[-1] - fr[0])
-        S = {"path": path, "valid": valid.astype(np.float32)}
-        S["palm_pos_raw"] = _s1_resample(hd["palm_pos"], k)         # (N,2,3) [L,R] env-local (ParaHome 좌표)
-        S["palm_quat_raw"] = _s1_nlerp(hd["palm_quat"], k)          # (N,2,4) wxyz = robot0_{l,r}_palm 바디 프레임
-        # 손 관절 (손목 6자유도 제외, J0 포함) — 이름으로 골라 두고 _apply_stage1_hand_kpts 에서 로봇 관절에 맞춤
-        qa = np.asarray(hd["joint_pos_all"], np.float32)            # (T,2,28)
-        names_l = [str(n) for n in hd["joint_names_all_l"]]
-        names_r = [str(n) for n in hd["joint_names_all_r"]]
-        cols_l = [i for i, n in enumerate(names_l) if "wrist" not in n]
-        cols_r = [i for i, n in enumerate(names_r) if "wrist" not in n]
-        S["hand_q_names"] = [names_l[i] for i in cols_l] + [names_r[i] for i in cols_r]
-        S["hand_q"] = _s1_resample(np.concatenate([qa[:, 0, cols_l], qa[:, 1, cols_r]], -1), k)   # (N,44)
-        # 잔차 기준 후보 (롤아웃 액션 순서; _setup_stage1_hand 에서 이 env 의 손 액션 순서로 재배열)
-        S["base_names"] = [str(n) for n in hd["joint_names"]]
-        S["finger_target"] = _s1_resample(hd["finger_target"], k)   # (N,36) 1단계 정책의 손가락 PD 목표
-        S["finger_qpos"] = _s1_resample(hd["finger_qpos"], k)       # (N,36) 실측 관절각
-        S["ft_names"] = [str(n) for n in hd["fingertip_body_names"]]
-        S["ft_pos"] = _s1_resample(hd["ft_pos"], k)                 # (N,10,3) 기록된 손끝(pad) — USD 정합 검사용
-        # ── [ROLLBACK MARKER: stage1-vertex] 1단계 pad 를 1단계 물체 좌표로 — 접촉 프레임 손끝 목표용 (2026-09-09).
-        #    물체 좌표로 쓰기 때문에 손바닥 보정(stage1_obj_correction)과 무관하게 "1단계 손 대비 물체" 관계가 정확하다.
-        S["ft_obj_local"] = None
-        if bool(getattr(cfg, "stage1_contact_vertex", False)) and self._obj_name and "obj_pos" in hd.files:
-            _op = torch.from_numpy(_s1_resample(hd["obj_pos"], k)).float()                     # (N,3) 1단계 물체
-            _oq = torch.from_numpy(_s1_nlerp(hd["obj_quat"], k)).float()                       # (N,4)
-            _ft = torch.from_numpy(S["ft_pos"]).float()                                          # (N,10,3)
-            _qc = math_utils.quat_conjugate(_oq).unsqueeze(1).expand(-1, _ft.shape[1], -1)
-            S["ft_obj_local"] = math_utils.quat_apply(_qc, _ft - _op.unsqueeze(1)).numpy().astype(np.float32)
-        # ── [/ROLLBACK MARKER: stage1-vertex] ──
-        # ── [ROLLBACK MARKER: stage1-contact-map] 32링크 접촉 맵(mask/normal/target)을 1단계 롤아웃에서 만든 파일로
-        #    교체 (2026-09-09, cfg 주석 참조). 이 시점의 _np_link_contact_* 는 사람 맵을 레퍼런스 시간축(N)으로
-        #    리샘플한 상태다. 파일 행은 frame 열로 롤아웃 시간축에 놓이므로 다른 1단계 배열과 같은 k 로 맞추되,
-        #    마스크·목표·법선은 선형 혼합 없이 최근접 행을 쓴다(사람 맵 30→50 Hz 선형 리샘플의 경계 결함 회피).
-        #    target 은 coord="object"(1단계 물체 로컬)를 기대하고 "world" 면 1단계 물체 자세로 변환한다
-        #    (레퍼런스 물체 자세로 변환하면 두 물체 궤적의 편차가 접촉점에 섞인다). normal 은 hand_contact.npz 와
-        #    같이 항상 물체 로컬 바깥 법선. 로드되면 stage1_contact_vertex(손끝 행만 pad 로 교체)는 건너뛴다.
-        #    하류(σ_h, 손끝 접촉 목표, force 게이트, 32링크 접촉 예정 관측)는 _ref_link_contact_* 를 읽으므로 자동 반영.
-        if bool(getattr(cfg, "stage1_contact_map", False)) and want_kpt and self._obj_name:
-            mp = os.path.join(os.path.dirname(path), str(getattr(cfg, "stage1_contact_map_file", "hand_contact_stage1.npz")))
-            cm = np.load(mp, allow_pickle=True) if os.path.exists(mp) else None
-            if cm is None:
-                print(f"[stage1-contact-map] 파일이 없습니다 ({mp}) — 사람 접촉 맵(hand_contact.npz)"
-                      f"{' + stage1_contact_vertex' if S.get('ft_obj_local') is not None else ''} 로 둡니다.")
-            elif not all(x in cm.files for x in ("link_names", "mask", "normal", "target")):
-                print(f"[stage1-contact-map] 스키마 불일치 ({mp}: {list(cm.files)}) — 사람 접촉 맵으로 둡니다.")
-            else:
-                fr_m = np.asarray(cm["frame"], np.float64) if "frame" in cm.files else fr.copy()
-                cmask = np.asarray(cm["mask"], np.float32)                                  # (T_m,L_m)
-                cnrm = np.asarray(cm["normal"], np.float32)                                 # (T_m,L_m,3) 물체 로컬
-                ctgt = np.asarray(cm["target"], np.float32)                                 # (T_m,L_m,3)
-                coord = str(cm["coord"]) if "coord" in cm.files else "world"
-                ok = (len(fr_m) == cmask.shape[0] == cnrm.shape[0] == ctgt.shape[0])
-                if not ok:
-                    print(f"[stage1-contact-map] frame({len(fr_m)}) / mask({cmask.shape[0]}) / normal({cnrm.shape[0]}) / "
-                          f"target({ctgt.shape[0]}) 길이가 다릅니다 — 사람 접촉 맵으로 둡니다.")
-                elif coord != "object" and "obj_pos" not in hd.files:
-                    ok = False
-                    print("[stage1-contact-map] target 이 월드 좌표인데 롤아웃에 obj_pos 가 없습니다 — 사람 접촉 맵으로 둡니다.")
-                elif coord != "object":
-                    hr = np.clip(np.rint(fr_m - fr[0]).astype(int), 0, len(fr) - 1)                # 맵 행 → 롤아웃 행
-                    _op = torch.from_numpy(np.asarray(hd["obj_pos"], np.float32)[hr])                # (T_m,3) 1단계 물체
-                    _oq = torch.from_numpy(np.asarray(hd["obj_quat"], np.float32)[hr])               # (T_m,4)
-                    _qc = math_utils.quat_conjugate(_oq).unsqueeze(1).expand(-1, ctgt.shape[1], -1)
-                    ctgt = math_utils.quat_apply(_qc, torch.from_numpy(ctgt) - _op.unsqueeze(1)).numpy()
-                    ctgt = np.where(cmask[..., None] > 0.5, ctgt, 0.0).astype(np.float32)            # 비접촉 행은 0 유지
-                if ok:
-                    k_m = np.arange(N) * (s1_fps / fps_env) - fr_m[0]
-                    rows = np.clip(np.rint(k_m).astype(int), 0, len(fr_m) - 1)                      # 최근접 행
-                    mln = {str(n): i for i, n in enumerate(cm["link_names"])}
-                    new_mask = np.zeros((N, N_LINK_CONTACT), np.float32)
-                    new_nrm = np.zeros((N, N_LINK_CONTACT, 3), np.float32)
-                    new_tgt = np.zeros((N, N_LINK_CONTACT, 3), np.float32)
-                    miss = []
-                    for j, n in enumerate(LINK_CONTACT_NAMES):
-                        i = mln.get(n)
-                        if i is None:
-                            miss.append(n)
-                            continue
-                        new_mask[:, j] = cmask[rows, i]
-                        new_nrm[:, j] = cnrm[rows, i]
-                        new_tgt[:, j] = ctgt[rows, i]
-                    _nn = np.linalg.norm(new_nrm, axis=-1, keepdims=True)
-                    new_nrm = np.where(_nn > 1e-6, new_nrm / np.clip(_nn, 1e-6, None), new_nrm).astype(np.float32)
-                    # 진단: 사람 맵(이미 N 프레임) 대비 마스크 비교
-                    old_mask = (self._np_link_contact_mask > 0.5) if self._has_link_contact else np.zeros(new_mask.shape, bool)
-                    if old_mask.shape != new_mask.shape:
-                        old_mask = np.zeros(new_mask.shape, bool)
-                    nm = new_mask > 0.5
-                    _dist = np.array([n.endswith("distal") for n in LINK_CONTACT_NAMES])
-
-                    def _iou(a, b):
-                        u = int((a | b).sum())
-                        return float((a & b).sum() / u) if u > 0 else float("nan")
-
-                    # [cws-human-ref] 교체 직전의 사람 맵(N 프레임)을 보관 — CWS σ_h 는 이것으로 계산할 수 있다
-                    self._np_link_contact_mask_human = self._np_link_contact_mask
-                    self._np_link_contact_normal_human = self._np_link_contact_normal
-                    self._np_link_contact_target_human = self._np_link_contact_target
-                    self._has_link_contact_human = bool(self._has_link_contact) and old_mask.shape == new_mask.shape
-                    self._np_link_contact_mask = new_mask
-                    self._np_link_contact_normal = new_nrm
-                    self._np_link_contact_target = new_tgt
-                    self._has_link_contact = True
-                    self._stage1_contact_map_loaded = True
-                    ns = str(cm["normal_source"]) if "normal_source" in cm.files else "?"
-                    print(f"[stage1-contact-map] {mp}\n"
-                          f"    {len(fr_m)} 행 @ {s1_fps:.0f} Hz → 레퍼런스 {N} 프레임 (최근접 행, target coord={coord}, "
-                          f"normal_source={ns}); 접촉 프레임 {int(nm.any(1).sum())}/{N} (사람 맵 {int(old_mask.any(1).sum())}); "
-                          f"프레임당 접촉 링크 {nm.sum(1).mean():.1f} (사람 {old_mask.sum(1).mean():.1f})\n"
-                          f"    사람 맵과 마스크 IoU 전체 {_iou(nm, old_mask):.2f} / 손끝 {_iou(nm[:, _dist], old_mask[:, _dist]):.2f}"
-                          + (f"; 파일에 없는 링크 {miss}" if miss else ""))
-                    if S.get("ft_obj_local") is not None:
-                        S["ft_obj_local"] = None
-                        print("[stage1-contact-map] stage1_contact_vertex 는 건너뜁니다 (맵이 손끝 행을 포함).")
-        # ── [/ROLLBACK MARKER: stage1-contact-map] ──
-        # 손별 접촉 게이트 (어느 링크든 접촉력 > thresh) → 보간 → ±blend 프레임 상자 평균 → [0,1]
-        cf = np.linalg.norm(np.asarray(hd["contact_force_w"], np.float32), axis=-1)   # (T,32)
-        lnames = [str(n) for n in hd["link_contact_names"]]
-        thr = float(cfg.stage1_contact_force_thresh)
-        b = int(cfg.stage1_blend_frames)
-        w = np.zeros((N, 2), np.float32)
-        for s, tag in enumerate(("robot0_l_", "robot0_r_")):
-            m = np.array([n.startswith(tag) for n in lnames])
-            c_n = _s1_resample((cf[:, m] > thr).any(-1).astype(np.float32), k)
-            if b > 0:
-                c_n = np.convolve(np.pad(c_n, b, mode="edge"),
-                                  np.ones(2 * b + 1, np.float32) / (2 * b + 1), mode="valid")
-            w[:, s] = np.clip(c_n, 0.0, 1.0)
-        S["contact_w"] = w
-        # 물체 기준 보정 (cfg 주석): T_corr = T_obj_ref · T_obj_s1^-1 을 접촉 가중치만큼 손바닥 자세에 적용
-        pp, pq = S["palm_pos_raw"].copy(), S["palm_quat_raw"].copy()
-        S["obj_dev_pos"] = S["obj_dev_rot_deg"] = None
-        if bool(cfg.stage1_obj_correction) and self._obj_name and "obj_pos" in hd.files:
-            op = torch.from_numpy(_s1_resample(hd["obj_pos"], k))                    # (N,3) 롤아웃 물체
-            oq = torch.from_numpy(_s1_nlerp(hd["obj_quat"], k))                      # (N,4)
-            rp = torch.from_numpy(np.ascontiguousarray(self._np_obj_base[:, :3]))    # (N,3) ParaHome 물체
-            rq = torch.from_numpy(np.ascontiguousarray(self._np_obj_base[:, 3:7]))
-            qc = math_utils.quat_mul(rq, math_utils.quat_conjugate(oq))              # (N,4)
-            P, Q = torch.from_numpy(pp), torch.from_numpy(pq)
-            W = torch.from_numpy(w).unsqueeze(-1)                                    # (N,2,1)
-            qc2 = qc.unsqueeze(1).expand(-1, 2, -1)
-            P_c = math_utils.quat_apply(qc2, P - op.unsqueeze(1)) + rp.unsqueeze(1)
-            Q_c = math_utils.quat_mul(qc2, Q)
-            Q_c = torch.where((Q_c * Q).sum(-1, keepdim=True) < 0, -Q_c, Q_c)
-            Q_b = (1.0 - W) * Q + W * Q_c
-            pp = (P + W * (P_c - P)).numpy().astype(np.float32)
-            pq = (Q_b / Q_b.norm(dim=-1, keepdim=True).clamp_min(1e-9)).numpy().astype(np.float32)
-            S["obj_dev_pos"] = (op - rp).norm(dim=-1).numpy()
-            S["obj_dev_rot_deg"] = (2.0 * torch.arcsin(_canon(qc)[:, 1:].norm(dim=-1).clamp(max=1.0))
-                                    * 180.0 / math.pi).numpy()
-        S["palm_pos"], S["palm_quat"] = pp, pq
-        self._np_s1 = S
-        _v = int(valid.sum())
-        msg = (f"[stage1-hand] {path}\n"
-               f"    롤아웃 {len(fr)} 행 @ {s1_fps:.0f} Hz → 레퍼런스 {N} 프레임 @ {fps_env:.0f} Hz "
-               f"(유효 {_v}, 마지막 값 유지 {N - _v}); 접촉 가중치 평균 L {w[:, 0].mean():.2f} / R {w[:, 1].mean():.2f}")
-        if S["obj_dev_pos"] is not None:
-            dp = S["obj_dev_pos"][valid] * 100.0
-            dr = S["obj_dev_rot_deg"][valid]
-            msg += (f"\n    물체 보정 ON: 롤아웃 물체 vs ParaHome 물체 위치 p50 {np.median(dp):.1f} / max {dp.max():.1f} cm, "
-                    f"회전 p50 {np.median(dr):.1f} / max {dr.max():.1f} deg (접촉 가중치만큼 적용)")
-        else:
-            msg += "\n    물체 보정 OFF"
-        print(msg)
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
-
     def _setup_scene(self) -> None:
-        self.robot = Articulation(self.cfg.robot_cfg)
-        self.scene.articulations["robot"] = self.robot
+        # ── [hand-pretrain] 단일 복합 G1 → 자유부유 손 2개 ─────────────────────────────────
+        # Isaac Lab 의 Articulation 은 루트가 하나뿐이라 양손을 한 articulation 으로 묶을 수
+        # 없습니다. 가상 링크로 이으면 한쪽 손의 반작용이 다른 손에 전달되는 인공적 결합이
+        # 생기므로, 손마다 독립 articulation 으로 스폰합니다.
+        # self.robot 은 부모 코드 76곳이 참조하므로 왼손을 대표로 두되, 손 특정 접근은
+        # self._hands / self.hand_l / self.hand_r 를 씁니다.
+        self.hand_l = Articulation(self.cfg.hand_l_cfg)
+        self.hand_r = Articulation(self.cfg.hand_r_cfg)
+        self._hands = (self.hand_l, self.hand_r)
+        self.scene.articulations["hand_l"] = self.hand_l
+        self.scene.articulations["hand_r"] = self.hand_r
+        self.robot = self.hand_l          # 부모 코드 호환용 별칭 (손 특정 경로에서는 쓰지 말 것)
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
@@ -896,8 +617,12 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._link_contact_sensors: list[ContactSensor] = []
         obj_filter = ["/World/envs/env_.*/Object"] if self._object_cfg is not None else []
         for name in LINK_CONTACT_NAMES:
+            # [hand-pretrain] articulation 이 둘로 나뉘었으므로 프림 경로만 손별로 바꿉니다.
+            # LINK_CONTACT_NAMES 는 robot0_l_* / robot0_r_* 로 좌우를 이미 담고 있고, 리스트
+            # 순서가 그대로 유지되므로 _link_contact_forces() 의 위치 인덱싱은 수정 불필요합니다.
+            _hp = "HandL" if "_l_" in name else "HandR"
             s = ContactSensor(ContactSensorCfg(
-                prim_path=f"/World/envs/env_.*/Robot/{name}",
+                prim_path=f"/World/envs/env_.*/{_hp}/{name}",
                 filter_prim_paths_expr=obj_filter, history_length=1, update_period=_ctrl_dt,
                 # [ROLLBACK MARKER: cws-contact] contact_pos_w = 이 링크와 물체 사이 접촉점들의 평균
                 # 위치(월드). 접촉 렌치의 모멘트 팔이 이 위치라서 필요합니다. 링크 원점을 대신 쓰면
@@ -914,14 +639,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # foot contact sensors (2) for the feet-contact-match reward. FILTERED on the ground so force_matrix_w
         # reports ONLY the foot↔ground contact force. Ground is a single flat plane → ≤4 manifold points → no
         # buffer-overflow (default cap). history_length=1. Ordered [left, right] to match _ref_foot_contact.
+        # [hand-pretrain] 발 접촉 센서 제거 — 발이 없습니다. _foot_force() /
+        # _foot_contact_actual() 도 아래에서 상수 0 을 돌려주도록 바꿉니다
+        # (호출 지점을 지우는 대신: rew_feet_contact_match=0.0 이라 값이 쓰이지 않습니다).
         self._foot_sensors: list[ContactSensor] = []
-        for name in ("left_ankle_roll_link", "right_ankle_roll_link"):
-            s = ContactSensor(ContactSensorCfg(
-                prim_path=f"/World/envs/env_.*/Robot/{name}",
-                filter_prim_paths_expr=["/World/ground/GroundPlane/CollisionPlane"],   # actual ground collider prim
-                history_length=1, update_period=_ctrl_dt, track_air_time=False, track_contact_points=False))
-            self._foot_sensors.append(s)
-            self.scene.sensors[f"foot_{name}"] = s
 
         # context / support objects: spawn each selected scene object (support surface / nearby
         # furniture) as a KINEMATIC-frozen collider at its reference pose, BEFORE clone_environments
@@ -1000,8 +721,16 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 return
             with open(jpath) as f:
                 src = json.load(f)["action_joint_names"]
-        jn = self.robot.data.joint_names
-        env_order = [jn[i] for i in self._action_joint_ids]
+        # ── [hand-pretrain] 손별 articulation 이라 관절 이름 목록이 둘로 나뉩니다 ──────────────
+        # 부모는 단일 로봇의 65개 액션 관절 순서로 리타게팅 열을 재배열했습니다. 여기서는 손마다
+        # 18개씩 따로 재배열하고 결과를 (F,36) 으로 이어붙입니다 — 왼손 18 다음 오른손 18.
+        # 이름 기준 매칭이라는 성질은 그대로이므로 부모의 방어 논리(열 순서 드리프트 방지)를
+        # 잃지 않습니다.
+        _jn = {sd: self._hands[i].data.joint_names for i, sd in enumerate("lr")}
+        _order = {sd: [_jn[sd][i] for i in getattr(self, f"_finger_joint_ids_{sd}").tolist()]
+                  for sd in "lr"}
+        env_order = _order["l"] + _order["r"]
+        jn = _jn["l"]                       # 아래 J0 경로에서 손별로 다시 고릅니다
         missing = [n for n in env_order if n not in src]
         if missing or len(src) != self._ref_joints.shape[1]:
             raise RuntimeError(
@@ -1021,13 +750,16 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._ref_j0_ids = None
         if all(n in src for n in _j0n):
             _c = torch.tensor([src.index(n) for n in _j0n], device=self.device, dtype=torch.long)
-            self._ref_j0 = self._ref_joints[:, _c].clone()                       # (F,8)
-            self._ref_j0_ids = torch.tensor([jn.index(n) for n in _j0n],
-                                            device=self.device, dtype=torch.long)
+            self._ref_j0 = self._ref_joints[:, _c].clone()                       # (F,8) [l×4, r×4]
+            # [hand-pretrain] J0 인덱스도 손별로 — 왼손 4개는 hand_l, 오른손 4개는 hand_r 의
+            # DOF 인덱스입니다. _reset_idx 가 손별로 나눠 씁니다.
+            self._ref_j0_ids = {
+                sd: torch.tensor([_jn[sd].index(n) for n in _j0n if f"_{sd}_" in n],
+                                 device=self.device, dtype=torch.long) for sd in "lr"}
             print(f"[ref-j0] 리타게팅이 푼 J0 8개 보존 — 중앙값 "
                   f"{self._ref_j0.median(dim=0).values.cpu().numpy().round(3).tolist()}")
         # [/ROLLBACK MARKER: ref-j0] --------------------------------------------------------
-        perm = torch.tensor([src.index(n) for n in env_order], device=self.device, dtype=torch.long)
+        perm = torch.tensor([src.index(n) for n in env_order], device=self.device, dtype=torch.long)  # (36,)
         n_moved = int((perm != torch.arange(len(perm), device=self.device)).sum())
         self._ref_joints = self._ref_joints[:, perm]
         origin = "npz joint_names" if self._ref_joint_names is not None else "g1_shadow_joint_order.json"
@@ -1107,8 +839,11 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             self._object.write_root_pose_to_sim(pose)
             self._object.write_root_velocity_to_sim(torch.zeros(n, 6, device=dev))
             for _ in range(int(c.declear_settle_steps)):
-                self.robot.write_root_pose_to_sim(park)
-                self.robot.write_root_velocity_to_sim(zero6)
+                # [hand-pretrain] 두 손 모두 치워야 합니다. 왼손만 치우면 오른손이 그대로 남아
+                # 물체 침하량 측정을 오염시킵니다.
+                for _hh in self._hands:
+                    _hh.write_root_pose_to_sim(park)
+                    _hh.write_root_velocity_to_sim(zero6)
                 self.scene.write_data_to_sim()
                 self.sim.step(render=False)
                 self.scene.update(dt=self.physics_dt)
@@ -1238,21 +973,31 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         dev = self.device
         c = self.cfg
 
-        # ---- action joint index map (group order legs→waist→arms→hands) ----
-        self._action_joint_ids: list[int] = []
-        self._group_slices: dict[str, slice] = {}
-        off = 0
-        for gname, g in JOINT_GROUPS.items():
-            ids, _ = self.robot.find_joints(g["expr"])
-            assert len(ids) == g["dof"], f"group {gname}: expected {g['dof']} joints, got {len(ids)}"
-            self._action_joint_ids += ids
-            self._group_slices[gname] = slice(off, off + g["dof"])
-            off += g["dof"]
-        self._action_joint_ids_t = torch.tensor(self._action_joint_ids, device=dev, dtype=torch.long)
+        # ── [hand-pretrain] 액션 관절: 몸통 29개가 사라지고 손당 18개만 남습니다 ──────────────
+        # 부모는 JOINT_GROUPS(legs→waist→arms→hands, 65) 를 한 articulation 에서 찾았지만 여기서는
+        # articulation 이 손별로 나뉘어 있으므로 각 손에서 18개씩 따로 찾습니다. 정규식은
+        # JOINT_GROUPS["hands"] 와 같은 것을 쓰되 (l|r) 교대를 해당 손으로 고정합니다.
+        _hand_expr = JOINT_GROUPS["hands"]["expr"]
+        self._finger_joint_ids_l, self._finger_joint_ids_r = None, None
+        for _side, _hand in (("l", self.hand_l), ("r", self.hand_r)):
+            _e = [x.replace("(l|r)", _side) for x in _hand_expr]
+            _ids, _ = _hand.find_joints(_e)
+            assert len(_ids) == 18, f"{_side}손 구동 관절 {len(_ids)}개 (기대 18): {_e}"
+            setattr(self, f"_finger_joint_ids_{_side}",
+                    torch.tensor(_ids, device=dev, dtype=torch.long))
+        # 부모 코드가 참조하는 이름들은 왼손 기준으로 채워 둡니다 — 손 특정 경로는
+        # _finger_joint_ids_{l,r} 을 쓰고, 아래 두 개는 호환용입니다.
+        self._action_joint_ids = self._finger_joint_ids_l.tolist()
+        self._group_slices = {"hands": slice(0, 18)}
+        self._action_joint_ids_t = self._finger_joint_ids_l
+        off = 18
         # [ROLLBACK MARKER: failure-dump] 액션 관절의 실제 이름 순서. find_joints 는 정규식 순서가
         # 아니라 아티큘레이션 내부 순서로 돌려주므로 밖에서 추측할 수 없습니다. 덤프를 나중에
         # 해석하려면 반드시 함께 저장해야 합니다.
-        self._action_joint_names = [self.robot.joint_names[i] for i in self._action_joint_ids]
+        # [hand-pretrain] 36열(왼손 18 → 오른손 18)의 실제 이름 순서.
+        self._action_joint_names = [self._hands[_h].joint_names[i]
+                                    for _h, _sd in enumerate("lr")
+                                    for i in getattr(self, f"_finger_joint_ids_{_sd}").tolist()]
         if bool(getattr(c, "failure_dump", False)) or bool(os.environ.get("PRINT_ACTION_JOINTS")):
             print("[action-joints] " + " ".join(f"{i}:{n}" for i, n in
                                                 enumerate(self._action_joint_names)))
@@ -1266,48 +1011,153 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 1.705 m/s 로 튑니다 — 리셋 직후 손 속도(0.35~0.57 m/s)의 3배입니다. J0 를 제약에 맞춰
         # 써주면 그 과도응답이 사라집니다(같은 실측에서 J0 시작값이 곧 목표값).
         # 되돌리기: tendon_reset_couple=False.
-        _tj1n = [f"robot0_{s}_{f}J1" for s in "lr" for f in ("FF", "MF", "RF", "LF")]
-        _jn = self.robot.data.joint_names
-        _tp = [(_jn.index(a), _jn.index(a[:-1] + "0")) for a in _tj1n
-               if a in _jn and (a[:-1] + "0") in _jn]
-        self._tendon_j1_ids = torch.tensor([a for a, _b in _tp], device=dev, dtype=torch.long)
-        self._tendon_j0_ids = torch.tensor([b for _a, b in _tp], device=dev, dtype=torch.long)
+        # [hand-pretrain] 텐던 쌍은 손 articulation(22 DOF) 기준 인덱스라 손별 dict 입니다.
+        self._tendon_j1_ids, self._tendon_j0_ids, _npair = {}, {}, 0
+        for _h, _sd in enumerate("lr"):
+            _jn2 = self._hands[_h].data.joint_names
+            _tj1n = [f"robot0_{_sd}_{f}J1" for f in ("FF", "MF", "RF", "LF")]
+            _tp = [(_jn2.index(a), _jn2.index(a[:-1] + "0")) for a in _tj1n
+                   if a in _jn2 and (a[:-1] + "0") in _jn2]
+            self._tendon_j1_ids[_sd] = torch.tensor([a for a, _b in _tp], device=dev, dtype=torch.long)
+            self._tendon_j0_ids[_sd] = torch.tensor([b for _a, b in _tp], device=dev, dtype=torch.long)
+            _npair += len(_tp)
         self._tendon_gear = float(c.tendon_gear_ratio)
         print(f"[tendon-reset] {'ON' if c.tendon_reset_couple else 'OFF'} — "
-              f"텐던 쌍 {len(_tp)}개, gear={self._tendon_gear:.5f}")
+              f"텐던 쌍 {_npair}개(양손), gear={self._tendon_gear:.5f}")
         self._group_alpha = {n: float(g["ema_alpha"]) for n, g in JOINT_GROUPS.items()}
         # per-group residual scale, (1,65) so it broadcasts with the (E,65) action: hands wider, body tighter
-        _res_scale = torch.full((self._n_act,), float(c.residual_scale_body), device=dev)
-        _res_scale[self._group_slices["hands"]] = float(c.residual_scale_hands)
-        self._residual_scale_t = _res_scale.unsqueeze(0)               # (1,65)
+        # [hand-pretrain] 손 관절 36개(왼 18 + 오른 18) 기준. 몸통 배율은 쓰이지 않습니다.
+        self._n_act = 36
+        _res_scale = torch.full((36,), float(c.residual_scale_hands), device=dev)
+        self._residual_scale_t = _res_scale.unsqueeze(0)               # (1,36)
 
-        # per-action joint limits (in action order) for scale/unscale + delta clamp
-        # ── [ROLLBACK MARKER: soft-limit-hands] 손가락 관절 soft 한계를 별도 factor 로 재계산 (cfg 주석 참조) ──
-        self._soft_hands_info = None
-        _fh = float(getattr(c, "soft_joint_pos_limit_factor_hands", 0.0) or 0.0)
+        # per-action joint limits: 손별 articulation 에서 각각 읽어 왼손→오른손 순서로 이어붙입니다.
+        # _unscale/_scale 과 리셋의 36열 버퍼가 모두 이 순서를 전제합니다.
+        # ── [ROLLBACK MARKER: soft-limit-hands] 손가락 관절 soft 한계를 2단계와 같은 factor 로 재계산 (2단계 cfg 주석 참조).
+        #    손 articulation 의 factor(기본 1.0)와 무관하게 cfg.soft_joint_pos_limit_factor_hands 하나가 두 단계의 손 범위를 정한다.
+        #    wrist6 관절은 제외(손가락 이름 패턴만).
+        _fh = float(getattr(self.cfg, "soft_joint_pos_limit_factor_hands", 0.0) or 0.0)
         if _fh > 0.0:
             import re as _re
-            _hj = torch.tensor([i for i, n in enumerate(self.robot.joint_names)
-                                if _re.match(r"robot0_[lr]_(FF|MF|RF|LF|TH)J\d", n)], device=dev, dtype=torch.long)
-            _hard = self.robot.data.joint_pos_limits[:, _hj]                              # (E,n,2) PhysX 하드 한계
-            _mid = 0.5 * (_hard[..., 0] + _hard[..., 1]); _rng = _hard[..., 1] - _hard[..., 0]
-            _old = self.robot.data.soft_joint_pos_limits[0, _hj].clone()
-            self.robot.data.soft_joint_pos_limits[:, _hj, 0] = _mid - 0.5 * _rng * _fh
-            self.robot.data.soft_joint_pos_limits[:, _hj, 1] = _mid + 0.5 * _rng * _fh
-            _new = self.robot.data.soft_joint_pos_limits[0, _hj]
-            _fb = getattr(getattr(self.robot, "cfg", None), "soft_joint_pos_limit_factor", None)   # articulation 의 factor (몸에 적용된 값)
-            self._soft_hands_info = (_fh, int(_hj.numel()))
-            print(f"[soft-limit-hands] Shadow 손가락 {int(_hj.numel())}관절 soft 한계 factor {_fb}→{_fh} 재계산: "
-                  f"범위 변화 평균 {float(((_new[:, 1] - _new[:, 0]) - (_old[:, 1] - _old[:, 0])).mean()) * 180 / math.pi:+.2f} deg "
-                  f"(몸 관절은 articulation factor {_fb} 유지)")
+            _n_done = 0
+            for _h in self._hands:
+                _fj = torch.tensor([i for i, n in enumerate(_h.joint_names)
+                                    if _re.match(r"robot0_[lr]_(FF|MF|RF|LF|TH)J\d", n)], device=self.device, dtype=torch.long)
+                _hard = _h.data.joint_pos_limits[:, _fj]
+                _mid = 0.5 * (_hard[..., 0] + _hard[..., 1]); _rng = _hard[..., 1] - _hard[..., 0]
+                _h.data.soft_joint_pos_limits[:, _fj, 0] = _mid - 0.5 * _rng * _fh
+                _h.data.soft_joint_pos_limits[:, _fj, 1] = _mid + 0.5 * _rng * _fh
+                _n_done += int(_fj.numel())
+            print(f"[soft-limit-hands] 손가락 {_n_done}관절 soft 한계 factor → {_fh} 재계산 (하드 한계 기준, wrist6 제외)")
         # ── [/ROLLBACK MARKER: soft-limit-hands] ──
-        lim = self.robot.data.soft_joint_pos_limits[0, self._action_joint_ids_t]       # (65,2)
+        _lims = [self._hands[i].data.soft_joint_pos_limits[
+                     0, getattr(self, f"_finger_joint_ids_{sd}")]
+                 for i, sd in enumerate("lr")]
+        lim = torch.cat(_lims, dim=0)                                  # (36,2)
+        assert lim.shape == (36, 2), f"관절 한계 형상 {tuple(lim.shape)} != (36,2)"
         self._ctrl_lower = lim[:, 0].clone()
         self._ctrl_upper = lim[:, 1].clone()
+        # [residual] 손가락 최종 목표의 EMA 상태 (관절 단위 36열). _smoothed_actions 는 정규화
+        # 액션 단위이고 델타/절대 경로가 쓰므로 별 버퍼로 둔다. 리셋에서 레퍼런스로 씨딩한다.
+        self._hand_target_ema = torch.zeros(self.num_envs, 36, device=dev)
+        self._fing_margin = str(getattr(c, "finger_residual_mode", "margin")) == "margin"
+        # [ROLLBACK MARKER: fres] 손가락 잔차 전용 EMA 상태 (정규화 액션 단위, cfg.finger_ema_on_residual
+        # 일 때만 사용). 손목의 _wrist6_res_ema 와 같은 배치 — 레퍼런스는 지연 없이 통과, 잔차만 평활.
+        # 마진 매핑은 매 스텝 그 프레임의 여유로 다시 계산하므로 |res|≤1 이면 목표가 한계 안이다.
+        self._fing_ema_res = bool(getattr(c, "finger_ema_on_residual", False))
+        self._hand_res_ema = torch.zeros(self.num_envs, 36, device=dev)
+        # [/ROLLBACK MARKER: fres]
+        self._group_slices = {"hands": slice(0, 36)}
+
+        # ── [hand-pretrain] 손목 임피던스 버퍼 ────────────────────────────────────────────
+        # 이동평균 상태(손별 힘/토크). TJ 의 prev_forces / prev_torques 에 대응합니다.
+        self._wrist_force = [torch.zeros(self.num_envs, 3, device=dev) for _ in range(2)]
+        self._wrist_torque = [torch.zeros(self.num_envs, 3, device=dev) for _ in range(2)]
+        # 외력을 걸 루트 바디 인덱스(손별). 루트 링크는 robot0_{s}_palm 입니다
+        # (2026-09-07 에 zero-DOF wrist 링크를 제거하면서 root 가 wrist -> palm 으로 옮겨졌습니다).
+        self._wrist_root_body = []
+        self._wrist_root_body_t = []          # WrenchComposer 용 (1,) 인덱스 텐서
+        for _h, _sd in enumerate("lr"):
+            _ids, _ = self._hands[_h].find_bodies([f"robot0_{_sd}_palm"])
+            assert len(_ids) == 1, f"{_sd} 손 루트 바디 조회 실패: {_ids}"
+            self._wrist_root_body.append(int(_ids[0]))
+            self._wrist_root_body_t.append(
+                torch.tensor([int(_ids[0])], device=dev, dtype=torch.long))
+        # 6D 회전 항등 바이어스 (cfg 주석의 측정 근거 참조). False 면 0 벡터라 TJ 원문과 같습니다.
+        _idn = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] if bool(getattr(c, "wrist_rot6d_identity", True)) \
+            else [0.0] * 6
+        self._rot6d_bias = torch.tensor(_idn, device=dev).unsqueeze(0)          # (1,6)
+        print(f"[wrist-imp] rot6d 항등 바이어스 "
+              f"{'ON' if bool(getattr(c, 'wrist_rot6d_identity', True)) else 'OFF'}")
+        print(f"[wrist-imp] K_pos={c.wrist_k_pos} K_rot={c.wrist_k_rot} "
+              f"ema={c.wrist_force_ema} action_dt={c.wrist_action_dt:.5f} "
+              f"루트 바디={self._wrist_root_body}")
+        # 정책 액션 사본(관측 prev_action + action_rate 보상). SONIC 경로가 꺼져 있어도
+        # 필요하므로 가드 밖에서 할당합니다. 폭은 액션 그대로 54.
+        self._cur_policy_action = torch.zeros(self.num_envs, int(c.action_space), device=dev)
+        self._prev_policy_action = torch.zeros(self.num_envs, int(c.action_space), device=dev)
+        self._cur_policy_action_bnd = torch.zeros(self.num_envs, int(c.action_space), device=dev)
+        self._prev_policy_action_bnd = torch.zeros(self.num_envs, int(c.action_space), device=dev)
+
+        # ── [wrist6] 액션 레이아웃 ──────────────────────────────────────────────────────
+        # 손별 폭이 모드에 따라 다르므로 슬라이스를 상수로 뽑는다. 하드코딩하면 모드를 바꿀 때
+        # 조용히 어긋난다 (손가락 슬라이스가 27/손 전제로 a[:,9:27], a[:,36:54] 였다).
+        #   wrench: [pos3 | rot6d6 | finger18] = 27/손 → 54
+        #   joint6: [wrist6      | finger18] = 24/손 → 48
+        self._w6 = str(getattr(c, "wrist_mode", "wrench")) == "joint6"
+        self._ACT_W = 6 if self._w6 else 9          # 손목 액션 폭 / 손
+        self._ACT_PH = self._ACT_W + 18             # 손별 총 폭
+        assert int(c.action_space) == 2 * self._ACT_PH, (
+            f"action_space {c.action_space} != 2*{self._ACT_PH} (wrist_mode={c.wrist_mode})")
+        if self._w6:
+            # `_ref_wrist_dof6`(텐서)는 이 블록보다 **아래**에서 만들어지므로 여기서는
+            # 레퍼런스 로드 단계(super().__init__ 이전)에 채워지는 numpy 배열로 확인한다.
+            if getattr(self, "_np_wrist_dof6", None) is None:
+                raise RuntimeError(
+                    "wrist_mode='joint6' 인데 wrist_dof6 레퍼런스가 없습니다 — "
+                    "_load_reference_trajectories 가 로드에 실패했습니다")
+            # [wrist6] 상태 캐시는 _CACHE_LAYOUT["joint6"] (174) 를 쓴다. 외력 모드(176)와
+            # 손목 블록(pose13/손 → 관절 12/손)과 컨트롤러 상태(힘·토크 EMA → 잔차 EMA)에서만
+            # 다르다. 두 모드의 캐시는 폭이 달라 **호환되지 않는다** — 저장된 npz 를 다른 모드로
+            # 읽으면 형상 오류가 난다 (train.py 가 state_dim 을 함께 저장한다).
+            _W6N = ["tx", "ty", "tz", "rot1", "rot2", "rot3"]
+            for _sd, _hd in (("l", self.hand_l), ("r", self.hand_r)):
+                _jn = _hd.data.joint_names
+                _ids = [_jn.index(f"robot0_{_sd}_wrist_{n}") for n in _W6N]
+                setattr(self, f"_wrist6_joint_ids_{_sd}",
+                        torch.tensor(_ids, device=dev, dtype=torch.long))
+            # 잔차 스케일. DexMachina 와 같은 (0.04 m, 0.5 rad). 측정: 이 스케일에 EMA 0.2 면
+            # 손목 힘 최대 28 N / 9.1 N·m 로 포화 없음. 평활을 빼면(백색잡음) 178 N / 71.6 N·m
+            # 까지 가고 포화 11.2% 가 되지만 effort 한계가 걸려 발산은 하지 않았다.
+            self._wrist6_res_scale = torch.tensor(
+                [float(c.wrist6_res_pos)] * 3 + [float(c.wrist6_res_rot)] * 3, device=dev)
+            # [residual] EMA 를 최종 목표에 걸므로 평활 상태가 곧 목표다 — 별도 잔차 EMA 버퍼가
+            # 필요 없다. 리셋에서 레퍼런스로 씨딩해야 한다 (0 에서 시작하면 초기 몇 스텝이
+            # 원점에서 램프업한다).
+            self._wrist6_target = [torch.zeros(self.num_envs, 6, device=dev) for _ in range(2)]
+            self._wrist6_target_ema = float(c.wrist6_target_ema)
+            # [ROLLBACK MARKER: w6gain] 잔차 전용 EMA 상태 (cfg.wrist6_ema_on_residual 일 때만 사용).
+            # 목표 = ref[frame] + 이 값. 리셋에서 0, 캐시 복원에서 target − ref[frame] 으로 되살린다.
+            self._w6_ema_res = bool(getattr(c, "wrist6_ema_on_residual", False))
+            self._wrist6_res_ema = [torch.zeros(self.num_envs, 6, device=dev) for _ in range(2)]
+            # [/ROLLBACK MARKER: w6gain]
+            # 관절 한계 (에셋: 병진 ±2.0 m, 회전 ±720도). 잔차가 이 밖으로 나가지 않게 clamp.
+            self._wrist6_lo, self._wrist6_hi = [], []
+            for _h, _sd in enumerate("lr"):
+                _lim = self._hands[_h].data.soft_joint_pos_limits[
+                    0, getattr(self, f"_wrist6_joint_ids_{_sd}")]
+                self._wrist6_lo.append(_lim[:, 0].clone())
+                self._wrist6_hi.append(_lim[:, 1].clone())
+            print(f"[wrist6] 관절 구동 모드: 잔차 스케일 pos={c.wrist6_res_pos} m "
+                  f"rot={c.wrist6_res_rot} rad, EMA={c.wrist_force_ema}, "
+                  f"한계 병진 [{self._wrist6_lo[0][0]:.2f},{self._wrist6_hi[0][0]:.2f}] m "
+                  f"회전 [{self._wrist6_lo[0][3]:.2f},{self._wrist6_hi[0][3]:.2f}] rad")
 
         # ---- keypoint body ids + local offsets (56, matching the reference order) ----
-        kpt_names: list[str] = list(BODY_KPTS.values())
-        kpt_off: list[list[float]] = [BODY_KPT_OFFSETS.get(i, [0.0, 0.0, 0.0]) for i in BODY_KPTS]
+        # [hand-pretrain] 몸통 13개 제거 — 손 articulation 에 그 링크들이 없습니다. 남는 것은
+        # 손 42개(손당 21)뿐이고, 레퍼런스 쪽 _ref_kpts 도 아래에서 같은 슬라이스로 잘립니다.
+        kpt_names: list[str] = []
+        kpt_off: list[list[float]] = []
         # [ROLLBACK MARKER: hand-kpt-align] 오프셋은 링크 이름이 아니라 키포인트별 `pad` 플래그로
         # 정합니다. distal 을 두 번 쓰기 때문입니다 — 오프셋 0 이면 DIP, pad 면 TIP. 예전처럼
         # FINGERTIP_OFFSETS.get(링크이름) 으로 조회하면 두 번째(=TIP) 항목까지 pad 를 받거나
@@ -1319,8 +1169,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                     kpt_names.append(full)
                     kpt_off.append(FINGERTIP_OFFSETS.get(full, [0.0, 0.0, 0.0])
                                    if use_pad else [0.0, 0.0, 0.0])
-        self._kpt_body_ids = torch.tensor(
-            [self.robot.find_bodies(n)[0][0] for n in kpt_names], device=dev, dtype=torch.long)
+        self._kpt_sides, self._kpt_body_ids = self._find_hand_bodies(kpt_names)
         self._kpt_offsets = torch.tensor(kpt_off, device=dev, dtype=torch.float32)      # (54,3)
         # SPLIT body-keypoint reward: the 14 body kpts are partitioned into WRIST (reach/manipulation),
         # ANKLE (foot placement/balance) and CORE (everything else). Each gets its own reward weight
@@ -1329,73 +1178,27 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # ALL 13 (e["body"]). [ROLLBACK MARKER: ee-split] wrist+ankle used to share one _ee_kpt_idx.
         # [ROLLBACK MARKER: ee-torso] torso 키포인트는 [smplx-kpts] 에서 제거됐다. core 와 EE 는 서로
         # 배타적이고 wrist 는 EE 의 부분집합이다: core 9 + EE 4(손목2+발목2) = 13.
-        _body_names = kpt_names[:len(BODY_KPTS)]
-        # [ROLLBACK MARKER: wrist-into-ee] 손목이 EE 그룹으로 흡수됐다 (손목2+발목2+몸통1 = 5).
-        # [smplx-kpts] torso 키포인트 제거(사용자 결정) → EE 그룹은 손목 2 + 발목 2 = 4개.
-        _EE_NAMES = ("wrist", "ankle")            # EE 그룹에 들어가는 링크 이름 조각
-        self._body_core_idx = torch.tensor(
-            [i for i, n in enumerate(_body_names)
-             if not any(t in n for t in _EE_NAMES)],
-            device=dev, dtype=torch.long)                                              # (9,) core body
-        # [wrist-into-ee] 손목 2개는 이제 보상에서 EE 항에 흡수됐고, 이 인덱스는 오직 전용
-        # 손목-POSITION 종료 게이트(term_wrist_pos_err)와 Error / wrist_kpts 로그에만 쓰인다.
-        self._wrist_kpt_idx = torch.tensor(
-            [i for i, n in enumerate(_body_names) if "wrist" in n], device=dev, dtype=torch.long)  # (2,)
-        # [wrist-into-ee][smplx-kpts] 손목 2 + 발목 2 = 4개의 MEAN → rew_ee_kpts.
-        self._ee_kpt_idx = torch.tensor(
-            [i for i, n in enumerate(_body_names) if any(t in n for t in _EE_NAMES)],
-            device=dev, dtype=torch.long)                                    # (4,) wrist×2 + ankle×2
-        # 이름 매칭이라 조용히 잘못 묶일 수 있다 — 실제 구성을 한 번 찍어 확인 가능하게 남긴다.
-        print(f"[g1] kpt groups: core({len(self._body_core_idx)})="
-              f"{[_body_names[i] for i in self._body_core_idx.tolist()]} | "
-              f"wrist({len(self._wrist_kpt_idx)})={[_body_names[i] for i in self._wrist_kpt_idx.tolist()]} | "
-              f"ee({len(self._ee_kpt_idx)})={[_body_names[i] for i in self._ee_kpt_idx.tolist()]}")
+        # [hand-pretrain] 몸통 키포인트가 없으므로 core/wrist/ee 그룹을 손 블록의 palm
+        # 2개(각 손 블록의 첫 항목 = HAND_CHAIN 의 "wrist" → robot0_{l,r}_palm)로 다시 잡습니다.
+        # palm 은 떠 있는 손의 기부(= 손목 임피던스가 직접 구동하는 지점)라 EE 항의 원래 의미
+        # (도달/조작)를 그대로 유지합니다. 발목은 링크 자체가 없어 EE 에서 빠집니다.
+        # rew_body_kpts / rew_com_support 는 cfg 에서 0.0 이라 core 항은 비활성입니다.
+        # _palm_kpt_idx: 42열 전체에서의 위치 (dk 를 자를 때 씀).
+        self._palm_kpt_idx = torch.tensor([0, N_HAND_KPTS_PER_HAND], device=dev, dtype=torch.long)
+        # 아래 셋은 _compute_errors 의 body_per(= 위 2개를 자른 결과, 폭 2) 안에서의 위치입니다.
+        # 42열 색인을 그대로 쓰면 body_per[:, 21] 을 읽어 CUDA device-side assert 가 납니다.
+        _both = torch.tensor([0, 1], device=dev, dtype=torch.long)
+        self._body_core_idx = _both       # 가중치 0.0 — 비활성
+        self._wrist_kpt_idx = _both       # term_wrist_pos_err + Error/wrist_kpts
+        self._ee_kpt_idx = _both          # rew_ee_kpts (손목 도달)
+        print(f"[hand-pretrain] kpt {len(kpt_names)}개(손 전용), palm 인덱스 "
+              f"{self._palm_kpt_idx.tolist()} = {[kpt_names[i] for i in self._palm_kpt_idx.tolist()]}")
         # [ROLLBACK MARKER: energy] Σ|τ·q̇| 대상 = 허리 3 + 다리 12 = 15관절. 팔·손목은 제외
         # (레퍼런스 파워가 가장 크고 로봇이 이미 레퍼런스보다 느리다 — cfg 주석 참조).
         _en_pat = ("waist_", "_hip_", "_knee_", "_ankle_")
         self._energy_joint_ids = torch.tensor(
             [i for i, n in enumerate(self.robot.joint_names) if any(p in n for p in _en_pat)],
             device=dev, dtype=torch.long)
-        # ── [ROLLBACK MARKER: ankle-acc] 발목 관절 가속도 벌점 (ResMimic ankle_dof_acc) ──
-        # 가속도는 Isaac Lab 의 ArticulationData.joint_acc 를 그대로 쓴다. 직접 차분하지 않는다 —
-        # 그쪽이 (1) 물리 스텝마다 갱신되고(ArticulationData.update 가 매 서브스텝 joint_acc 를
-        # 건드린다) (2) write_joint_velocity_to_sim 이 리셋 때 _previous_joint_vel 을 새 속도로
-        # 맞추고 joint_acc 를 0 으로 만들어, 리셋 불연속이 자동으로 처리된다.
-        # 발목은 압력중심을 직접 만드는 관절이라 여기의 고주파 성분이 곧 균형 흔들림이다.
-        # 속도(anti_shake)가 아니라 가속도를 보므로 "빠르게 움직이는 것"이 아니라 "급격히 바꾸는
-        # 것"에만 대가가 붙는다.
-        self._ankle_acc_joint_ids = None
-        if float(getattr(c, "rew_ankle_acc", 0.0)) != 0.0:
-            import re as _re_aa
-            _aa_pat = list(getattr(c, "ankle_acc_joints", []))
-            _aa_ids = [i for i, n in enumerate(self.robot.joint_names)
-                       if any(_re_aa.fullmatch(p, n) for p in _aa_pat)]
-            assert _aa_ids, f"[ankle-acc] 정규식 {_aa_pat} 에 맞는 관절이 없다"
-            self._ankle_acc_joint_ids = torch.tensor(_aa_ids, device=dev, dtype=torch.long)
-            self._diag_ankle_acc = torch.zeros((), device=dev)
-            print(f"[ankle-acc] ON: {len(_aa_ids)}관절 {[self.robot.joint_names[i] for i in _aa_ids]}, "
-                  f"출처 data.joint_acc (물리 dt {float(c.sim.dt) * 1000:.1f} ms 차분), "
-                  f"가중치 {float(c.rew_ankle_acc)}")
-        # ── [/ROLLBACK MARKER: ankle-acc] ──
-        # ── [ROLLBACK MARKER: waist-acc] 허리 관절 가속도 벌점 ─────────────────────────────────
-        # ankle-acc 와 같은 형태이고 대상 관절만 다르다. 따로 둔 이유는 가중치를 독립으로 조절해야
-        # 하기 때문이다 — 허리 각가속도가 발목보다 크게 나온다 (진폭 ±6.5도, 6.5 Hz 진동 기준
-        # A·ω² = 188 rad/s², 제곱 3.5e4/관절).
-        # 목적: 허리를 천천히 굽히는 것은 공짜로 두고, 앞뒤로 급하게 바꾸는 진동에만 대가를 붙인다.
-        # 속도(anti_shake)가 아니라 가속도라 정상적인 기울임을 막지 않는다.
-        self._waist_acc_joint_ids = None
-        if float(getattr(c, "rew_waist_acc", 0.0)) != 0.0:
-            import re as _re_wa
-            _wa_pat = list(getattr(c, "waist_acc_joints", []))
-            _wa_ids = [i for i, n in enumerate(self.robot.joint_names)
-                       if any(_re_wa.fullmatch(_p, n) for _p in _wa_pat)]
-            assert _wa_ids, f"[waist-acc] 정규식 {_wa_pat} 에 맞는 관절이 없다"
-            self._waist_acc_joint_ids = torch.tensor(_wa_ids, device=dev, dtype=torch.long)
-            self._diag_waist_acc = torch.zeros((), device=dev)
-            print(f"[waist-acc] ON: {len(_wa_ids)}관절 {[self.robot.joint_names[i] for i in _wa_ids]}, "
-                  f"출처 data.joint_acc (물리 dt {float(c.sim.dt) * 1000:.1f} ms 차분), "
-                  f"가중치 {float(c.rew_waist_acc)}")
-        # ── [/ROLLBACK MARKER: waist-acc] ──
         print(f"[energy] Σ|τ·q̇| 대상 {len(self._energy_joint_ids)}관절: "
               f"{[self.robot.joint_names[i] for i in self._energy_joint_ids.tolist()]}")
 
@@ -1405,8 +1208,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         except Exception:
             self._body_masses = self.robot.root_physx_view.get_masses().to(dev)
         self._use_body_com = hasattr(self.robot.data, "body_com_pos_w")            # per-body world CoM if available
-        self._ankle_body_ids = [self.robot.find_bodies(n)[0][0]
-                                for n in ("left_ankle_roll_link", "right_ankle_roll_link")]
+        # [hand-pretrain] 발목 링크가 없습니다. rew_com_support=0.0 이라 이 인덱스를 읽는
+        # CoM-지지면 항은 계산되어도 보상에 0 으로 곱해집니다. 빈 리스트로 두면 그 항에서
+        # 인덱싱이 터지므로, 아래 _com_support_* 계산을 상수 0 으로 단락시킵니다.
+        self._ankle_body_ids = []
         self._x_axis = torch.tensor([1.0, 0.0, 0.0], device=dev).repeat(self.num_envs, 1)  # (E,3) base +X (forward)
         # foot SOLE OUTWARD normal in the ankle_roll_link LOCAL frame (points DOWN, out of the sole) — same
         # for both feet (legs are not Z-mirrored). Used to project the ground contact force to a compressive
@@ -1414,42 +1219,30 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._foot_sole_normal = torch.tensor([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]], device=dev)  # (2,3) [L,R]
 
         # ---- fingertip (10) body ids + offsets + pad normals (bimanual) ----
-        self._ft_body_ids = torch.tensor(
-            [self.robot.find_bodies(n)[0][0] for n in c.fingertip_body_names], device=dev, dtype=torch.long)
+        self._ft_sides, self._ft_body_ids = self._find_hand_bodies(list(c.fingertip_body_names))
         self._ft_offsets = torch.tensor(
             [FINGERTIP_OFFSETS[n] for n in c.fingertip_body_names], device=dev, dtype=torch.float32)   # (10,3)
         self._ft_pad_normals = torch.tensor(
             [FINGERTIP_PAD_NORMALS[n] for n in c.fingertip_body_names], device=dev, dtype=torch.float32)  # (10,3)
-        # ── [ROLLBACK MARKER: anti-shake] 각속도 데드존 벌점 대상 링크 (cfg 주석 참조; head_link 없으면 torso_link 대체) ──
-        self._diag_blowup_frac = torch.zeros((), device=dev)      # [nan-guard]
-        self._diag_obs_sanitized = torch.zeros((), device=dev)    # [nan-guard]
-        self._anti_shake_body_ids = None
-        if float(getattr(c, "rew_anti_shake", 0.0)) != 0.0:
-            _ids, _used = [], []
-            for _n in list(getattr(c, "anti_shake_bodies", [])):
-                _cand = [_n] + (["torso_link"] if _n == "head_link" else [])
-                _hit = next((x for x in _cand if x in self.robot.body_names), None)
-                if _hit is None:
-                    print(f"[anti-shake] 바디 '{_n}' 을 찾지 못해 건너뜁니다")
-                    continue
-                _ids.append(self.robot.body_names.index(_hit))
-                _used.append(_hit if _hit == _n else f"{_n}→{_hit}")
-            if _ids:
-                self._anti_shake_body_ids = torch.tensor(_ids, device=dev, dtype=torch.long)
-                print(f"[anti-shake] ON: 링크 {_used}, θ = {float(c.anti_shake_ang_vel_thresh):.2f} rad/s, 가중치 {float(c.rew_anti_shake)}")
-        # ── [/ROLLBACK MARKER: anti-shake] ──
         # ---- palm (wrist) body ids for explicit palm orientation/velocity obs (L,R to match ft order) ----
-        self._palm_body_ids = torch.tensor(
-            [self.robot.find_bodies(n)[0][0] for n in ("robot0_l_palm", "robot0_r_palm")],
-            device=dev, dtype=torch.long)
+        self._palm_sides, self._palm_body_ids = self._find_hand_bodies(
+            ["robot0_l_palm", "robot0_r_palm"])
 
         # ---- reference tensors (move numpy → device) ----
         def T(a):
             return torch.from_numpy(np.asarray(a)).to(dev)
-        self._ref_kpts = T(self._np_ref_kpts)                          # (F,55,3)
+        # [hand-pretrain] 몸통 13개를 잘라 손 42개만 남깁니다. 로봇 쪽 _kpt_body_ids 도 손
+        # 42개라 두 배열의 색인이 1:1 로 맞습니다(순서: 왼손 21 → 오른손 21).
+        self._ref_kpts = T(self._np_ref_kpts)[:, N_BODY_KPTS:].contiguous()   # (F,42,3)
+        assert self._ref_kpts.shape[1] == 2 * N_HAND_KPTS_PER_HAND, \
+            f"레퍼런스 손 키포인트 {self._ref_kpts.shape[1]} != 2x{N_HAND_KPTS_PER_HAND}"
         self._ref_root_pos = T(self._np_root_pos)                      # (F,3)
         self._ref_root_quat = _canon(T(self._np_root_quat))            # (F,4)
         self._ref_root_linvel = T(self._np_root_linvel)                # (F,3)
+        self._ref_wrist_pose = T(self._np_wrist_pose)                  # [hand-pretrain] (2,F,7) wxyz
+        # [wrist6] (2,F,6) = tx,ty,tz[m], rot1,rot2,rot3[rad] (내재 YZX, branch 연속)
+        self._ref_wrist_dof6 = (T(self._np_wrist_dof6)
+                                if getattr(self, "_np_wrist_dof6", None) is not None else None)
         self._ref_root_angvel = T(self._np_root_angvel)                # (F,3)
         self._ref_ft_pad = T(self._np_ft_pad)                          # (F,10,3)
         self._ref_foot_contact = T(self._np_ref_foot_contact)          # (F,2) [L,R] binary contact schedule
@@ -1552,31 +1345,16 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 사람 쪽 목록은 여기서 한 번만 계산합니다. 물체 기준 좌표라 물체 자세와 무관하고, 파일로
         # 빼면 리타게팅을 다시 돌렸을 때 옛 값이 남는 위험만 생깁니다.
         self._cws_sigma_h = None
-        # ── [ROLLBACK MARKER: cws-human-ref] σ_h 의 접촉 집합 출처 (2026-09-09). stage1_contact_map 이 로드되면
-        #    _ref_link_contact_* 는 1단계 맵이지만, CWS 의 비교 기준은 사람 접촉(hand_contact.npz)으로 둔다
-        #    (cfg.cws_ref_contact_source, 기본 "human"). 손끝 목표·관측·force 게이트는 1단계 맵을 그대로 쓴다.
-        #    사람 맵은 _load_stage1_hand 가 교체 직전에 보관한 N 프레임 배열이며, 없으면 로드된 맵으로 떨어진다.
-        _cws_mask_t, _cws_tgt_t, _cws_nrm_t = (self._ref_link_contact_mask, self._ref_link_contact_target_local,
-                                              self._ref_link_contact_normal_local)
-        _cws_src_used = "stage1" if getattr(self, "_stage1_contact_map_loaded", False) else "human"
-        if (getattr(self, "_stage1_contact_map_loaded", False)
-                and str(getattr(c, "cws_ref_contact_source", "human")) == "human"
-                and getattr(self, "_has_link_contact_human", False)):
-            _cws_mask_t = T(self._np_link_contact_mask_human)
-            _cws_tgt_t = T(self._np_link_contact_target_human)
-            _cws_nrm_t = T(self._np_link_contact_normal_human)
-            _cws_src_used = "human"
-        # ── [/ROLLBACK MARKER: cws-human-ref] ──
         # [ROLLBACK MARKER: cws-diag] cws_log_only 면 보상 모드와 무관하게 계산만 켭니다.
         if self._has_link_contact and (c.contact_reward_mode in ("cws", "both")
                                        or bool(getattr(c, "cws_log_only", False))):
-            _m = _cws_mask_t > 0.5                                             # (F,L)  [cws-human-ref]
+            _m = self._ref_link_contact_mask > 0.5                             # (F,L)
             if bool(_m.any()):
                 # [ROLLBACK MARKER: cws-rc-mesh] 물체 크기 = 메시 정점 중심에서 최대 거리(논문
                 # 정의). 렌치의 회전 성분을 이걸로 나눠 밀기 성분과 같은 자리수로 맞춥니다.
                 # 메시를 못 읽으면 옛 추정(접촉점 노름 0.9 분위)으로 떨어집니다 — 되돌리려면
                 # 아래 _rc_mesh 를 None 으로 두면 됩니다.
-                _rc_q90 = float(_cws_tgt_t[_m].norm(dim=-1).quantile(0.9))              # [cws-human-ref]
+                _rc_q90 = float(self._ref_link_contact_target_local[_m].norm(dim=-1).quantile(0.9))
                 _rc_mesh = self._object_mesh_radius() if self._has_object else None
                 _rc_ok = _rc_mesh is not None and _rc_mesh > 1e-4
                 self._cws_len = _rc_mesh if _rc_ok else _rc_q90
@@ -1595,8 +1373,8 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                         self._cws_com_p, self._cws_com_q = _cp, _cq
                 except Exception:
                     pass
-                _tgt = _cws_tgt_t                                                 # [cws-human-ref]
-                _nrm = -_cws_nrm_t                            # 저장 법선은 표면 바깥쪽 -> 안쪽으로
+                _tgt = self._ref_link_contact_target_local
+                _nrm = -self._ref_link_contact_normal_local   # 저장 법선은 표면 바깥쪽 -> 안쪽으로
                 if self._cws_com_p is not None:
                     _qi = math_utils.quat_conjugate(self._cws_com_q).expand(_tgt.shape[:-1] + (4,))
                     _tgt = math_utils.quat_apply(_qi, _tgt - self._cws_com_p)
@@ -1610,10 +1388,8 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                 print(f"[cws] 접촉 렌치 {_mode}  물체크기={self._cws_len * 100:.1f}cm({_src}, "
                       f"접촉점0.9분위={_rc_q90 * 100:.1f}cm)  "
                       f"모멘트팔={'COM' if self._cws_com_p is not None else 'body원점'}  "
-                      f"방향={c.cws_n_dir}  옆면={c.cws_n_edge}  여유={c.cws_beta}  mu={c.cws_mu}  "
-                      f"σ_h 접촉 출처={_cws_src_used}")   # [cws-human-ref]
-        self._link_contact_body_ids = torch.tensor(
-            [self.robot.find_bodies(n)[0][0] for n in LINK_CONTACT_NAMES], device=dev, dtype=torch.long)  # (L,)
+                      f"방향={c.cws_n_dir}  옆면={c.cws_n_edge}  여유={c.cws_beta}  mu={c.cws_mu}")
+        self._lc_sides, self._link_contact_body_ids = self._find_hand_bodies(list(LINK_CONTACT_NAMES))
         # [ROLLBACK MARKER: link-kpt] 접촉 목표 보상에 쓸 링크. 손바닥은 기본 제외입니다 —
         # 레퍼런스 자세에서조차 오른손바닥은 요구 프레임의 12.6%만 목표에 닿습니다(측정값).
         # 도달 불가능한 목표를 보상으로 강제하면 정책이 손바닥을 물체로 밀어 넣어 관통을 만듭니다.
@@ -1643,7 +1419,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         self._contact_normal_gate_cos = math.cos(self.cfg.contact_normal_gate_tol)  # gate threshold (precomputed)
 
         # ---- action / EMA / delta buffers ----
-        default_q = self.robot.data.default_joint_pos[:, self._action_joint_ids_t]      # (E,65)
+        # [hand-pretrain] 손별 기본 자세를 왼손→오른손 36열로 (한계 텐서와 같은 순서)
+        default_q = torch.cat(
+            [self._hands[i].data.default_joint_pos[:, getattr(self, f"_finger_joint_ids_{sd}")]
+             for i, sd in enumerate("lr")], dim=1)                                     # (E,36)
         self._smoothed_actions = self._unscale(default_q).clone()      # (E,65) normalized
         self._prev_action = torch.zeros(self.num_envs, self._n_act, device=dev)
         # per-group delta(residual)-action buffers + config (velocity cmd → integrated target). ANY of
@@ -1663,13 +1442,34 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # ---- per-env trajectory frame index ----
         self._frame_idx = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
 
-        # ---- state cache + RSI (train 222) ----
-        # layout: reward(1) + root[pos3+quat4+linvel3+angvel3=13] + obj[pos3+quat4+linvel3+angvel3=13]
-        #         + jpos(65) + jvel(65) + smoothed(65) = 1+13+13+195 = 222.
-        #   [0]=reward [1:4]rootpos [4:8]rootquat [8:11]rootlinvel [11:14]rootangvel
-        #   [14:17]objpos [17:21]objquat [21:24]objlinvel [24:27]objangvel
-        #   [27:92]jpos [92:157]jvel [157:222]smoothed
-        self._STATE_DIM = 222
+        # ---- state cache + RSI (hand-only 176) ----
+        # [hand-pretrain] 부모의 222 레이아웃은 "루트 하나 + 관절 65열" 전제입니다. 여기는 루트가
+        # 둘(손목 두 개)이고 구동 관절이 36열이라 레이아웃을 새로 잡습니다.
+        #   [0]        reward (순위 키)
+        #   [1:8]      왼손목 pose  (env-local pos 3 + quat wxyz 4)
+        #   [8:14]     왼손목 속도  (선 3 + 각 3)
+        #   [14:21]    오른손목 pose
+        #   [21:27]    오른손목 속도
+        #   [27:34]    물체 pose    (env-local pos 3 + quat 4)
+        #   [34:40]    물체 속도    (선 3 + 각 3)
+        #   [40:76]    구동 관절 위치 36 (왼손 18 -> 오른손 18)
+        #   [76:112]   구동 관절 속도 36
+        #   [112:120]  텐던 축 J0 위치 8 (왼 4 -> 오른 4)
+        #   [120:128]  텐던 축 J0 속도 8
+        #   [128:164]  smoothed_actions 36
+        #   [164:170]  손목 힘 EMA   (손별 3)
+        #   [170:176]  손목 토크 EMA (손별 3)
+        # J0 를 따로 담는 이유: 구동 36열에 J0 가 없어서, 캐시 히트에서도 J0 를 레퍼런스 값으로
+        # 재구성하면 캐시된 J1 과 짝이 안 맞습니다(캐시는 물리로 정착된 상태이고 레퍼런스 J0 는
+        # 다른 프레임의 해입니다). 실제로 방문한 상태를 그대로 되살리는 것이 캐시의 목적입니다.
+        # 손목 힘/토크 EMA 를 담는 이유: 이 둘은 컨트롤러의 적분 상태입니다. 0 으로 리셋하면
+        # 손을 들고 있던 힘이 사라져 복원 직후 몇 스텝 동안 손이 처집니다(무액션 침강 측정:
+        # 0.038 m/s). alpha=0.2 라 5스텝쯤이면 회복하지만, 담는 비용이 12칸이라 담습니다.
+        # [wrist6] 캐시 레이아웃은 모드에 따라 다르다 (wrench 176, joint6 174).
+        self._CL = self._CACHE_LAYOUT[str(getattr(c, "wrist_mode", "wrench"))]
+        self._CACHE_VEL_SLICES = self._CL["vel"]
+        self._STATE_DIM = int(self._CL["dim"])
+        assert self._STATE_DIM == self._CL["ctrl"][1], "레이아웃 dim 과 마지막 블록 끝이 불일치"
         # [ROLLBACK MARKER: spawn-declear] steps physics; everything it touches (reference arrays,
         # object, robot, scene) already exists by here.
         self._solve_spawn_declear()
@@ -1685,7 +1485,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 청크당 한 스텝이면 되고, 환경 수가 프레임 수 이상이면 한 번에 끝납니다.
         self._build_ref_link_kpt_local()      # [ROLLBACK MARKER: link-kpt-smpl]
         self._apply_body_kpt_fk()             # [ROLLBACK MARKER: body-kpt-fk]
-        self._setup_stage1_hand()             # [ROLLBACK MARKER: stage1-hand]
         # [/ROLLBACK MARKER: spawn-declear]
         # ── [ROLLBACK MARKER: failure-dump] 실패 에피소드 링 버퍼 ─────────────────────────────
         # 한 행 = 한 (환경, 제어 스텝):
@@ -1696,7 +1495,14 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 링 버퍼는 GPU에 두고(수 MB), 종료된 환경의 창만 CPU로 꺼내 모았다가 npz로 씁니다.
         self._fd_on = bool(getattr(c, "failure_dump", False))
         if self._fd_on:
-            self._FD_DIM = 364      # [cws-diag] 360 score 361 nhit 362 coverage 363 deficit
+            # [hand-pretrain] 부모는 222(캐시) / 100(액션) / 32(접촉) / 10(스칼라) = 364 를
+            # 하드코딩했습니다. 손 전용은 캐시 176, 액션 54 라 오프셋을 값에서 계산합니다 —
+            # 안 그러면 덤프가 조용히 엉뚱한 열을 읽습니다.
+            self._FD_A0 = self._STATE_DIM                          # 액션 블록 시작 (176)
+            self._FD_NA = int(c.action_space)                      # 54
+            self._FD_C0 = self._FD_A0 + self._FD_NA                # 접촉 블록 시작 (230)
+            self._FD_X0 = self._FD_C0 + N_LINK_CONTACT             # 스칼라 블록 시작 (262)
+            self._FD_DIM = self._FD_X0 + 10   # [cws-diag] +6 score +7 nhit +8 coverage +9 deficit
             self._fd_n = min(int(c.failure_dump_envs), self.num_envs)
             self._fd_w = int(c.failure_dump_window)
             self._fd_ring = torch.zeros(self._fd_n, self._fd_w, self._FD_DIM, device=dev)
@@ -1792,7 +1598,12 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # least cache_min_episode_length steps. Sized for a full episode because an episode that runs
         # to the end of the clip must still be committable. Allocated only when the feature is on.
         self._pend_n = 0
-        if int(getattr(c, "cache_min_episode_length", 0)) > 0:
+        # [hand-pretrain] `use_state_cache` 조건을 추가했습니다. 부모는 이 버퍼를
+        # `cache_min_episode_length > 0` (기본 10) 만으로 할당하는데, 캐시를 끄면
+        # _save_state_cache 가 즉시 반환하므로 아무것도 스테이징되지 않습니다 — 즉 4096 env 에서
+        # 1,378 MB 를 할당해 한 번도 쓰지 않습니다(실측). 캐시가 꺼져 있으면 만들지 않습니다.
+        if (int(getattr(c, "cache_min_episode_length", 0)) > 0
+                and bool(getattr(c, "use_state_cache", True))):
             self._pend_cap = int(self.max_episode_length)
             self._pend_state = torch.zeros(self.num_envs, self._pend_cap, self._STATE_DIM, device=dev)
             self._pend_frame = torch.zeros(self.num_envs, self._pend_cap, device=dev, dtype=torch.long)
@@ -1814,7 +1625,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         #   오른손 절대 35,40,36 → 손 내부 1,6,2  (검지MCP, 중지PIP, 검지PIP)
         # 좌우가 서로 다른 점을 쓰기까지 했습니다. Error/wrist_rot 이 중앙 0.87 rad 로 나오고
         # term_wrist_rot_err=0.75 를 상시 초과해 종료를 계속 발동시켰습니다(2026-09-05 run 실측).
-        _nb_k = N_BODY_KPTS                                          # 13
+        _nb_k = 0            # [hand-pretrain] 몸통 키포인트 없음 → 손 블록이 0 에서 시작
         _nh = N_HAND_KPTS_PER_HAND                                   # 21
         self._wrist_frame_idx = [(_nb_k + o, _nb_k + o + 5, _nb_k + o + 1) for o in (0, _nh)]  # L, R
         assert self._ref_kpts.shape[1] == _nb_k + 2 * _nh, (
@@ -1938,42 +1749,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             self._sonic_gather = torch.tensor([list(_GIO).index(n) for n in _ab_names],
                                               device=dev, dtype=torch.long)                    # (29,)
             self._sonic_hand_slice = self._group_slices["hands"]
-            # ── [ROLLBACK MARKER: joint-residual] 상체 잔차 색인. _upper_act_idx 는 액션-몸 순서(0..28),
-            # _upper_sonic_idx 는 같은 관절의 SONIC 순서 색인 — 잔차는 SONIC 순서 벡터 a_sonic 에 더한다.
-            if getattr(self, "_upper_on", False):
-                _up_names = list(_ab_names) if self._res_mode == "all" else list(c.sonic_upper_residual_joints)
-                _miss = [n for n in _up_names if n not in _ab_names]
-                assert not _miss, f"[joint-residual] 액션 몸 관절 29개에 없는 이름: {_miss}"
-                self._upper_act_idx = torch.tensor([_ab_names.index(n) for n in _up_names],
-                                                   device=dev, dtype=torch.long)          # (N,) 액션-몸 순서
-                self._upper_sonic_idx = self._sonic_gather[self._upper_act_idx]           # (N,) SONIC 순서
-                # 그룹별 scale. _upper_act_idx 의 각 항목이 액션-몸 순서(0..28)이므로 _group_slices
-                # 로 어느 그룹인지 정해진다. 비어 있으면 스칼라 sonic_upper_residual_scale 로 전부 채운다.
-                _grp = dict(getattr(c, "sonic_residual_scale_groups", {}) or {})
-                _sv = torch.full((self._upper_act_idx.numel(),),
-                                 float(c.sonic_upper_residual_scale), device=dev)
-                if _grp:
-                    for _gi, _ai in enumerate(self._upper_act_idx.tolist()):
-                        for _gn in ("legs", "waist", "arms"):
-                            _sl = self._group_slices[_gn]
-                            if _sl.start <= _ai < _sl.stop:
-                                assert _gn in _grp, f"[joint-residual] sonic_residual_scale_groups 에 '{_gn}' 이 없다"
-                                _sv[_gi] = float(_grp[_gn]); break
-                self._upper_res_scale = _sv                                               # (N,) SONIC 액션 단위
-                _by_g = {g: sorted({float(_sv[i]) for i, a in enumerate(self._upper_act_idx.tolist())
-                                    if self._group_slices[g].start <= a < self._group_slices[g].stop})
-                         for g in ("legs", "waist", "arms")}
-                print(f"[joint-residual] 그룹별 scale: " + "  ".join(
-                    f"{g}({self._group_slices[g].stop - self._group_slices[g].start}관절)="
-                    f"{','.join(f'{v:g}' for v in _by_g[g]) or '-'}" for g in ("legs", "waist", "arms")))
-                self._diag_upper_res_rad = torch.zeros((), device=dev)
-                self._diag_upper_clamp_frac = torch.zeros((), device=dev)
-                _rad = self._upper_res_scale * self._sonic_scale[0, self._upper_sonic_idx]
-                print(f"[joint-residual] 상체 {len(_up_names)}관절; |u|=1 일 때 관절 변위 "
-                      f"min {float(_rad.min()):.4f} / max {float(_rad.max()):.4f} rad "
-                      f"(= scale × SONIC 관절 스케일); SONIC 히스토리 되먹임 = "
-                      f"{'적용 목표' if bool(getattr(c, 'sonic_upper_hist_from_applied', False)) else 'SONIC 원출력'}")
-            # ── [/ROLLBACK MARKER: joint-residual] ──
             # 10-frame proprio history (term-major, oldest-first) = playback flat_proprio layout
             self._sonic_hist = {k: torch.zeros(self.num_envs, _SP.PROPRIO_HIST, d0, device=dev)
                                 for k, d0 in [("ang", 3), ("jpr", 29), ("jvr", 29), ("act", 29), ("grav", 3)]}
@@ -1991,9 +1766,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             # RAW 100-D policy action (z_res + a_hand) for the GRAIL-style obs prev_action term AND the
             # action_rate reward. _cur = this step's action (set in _sonic_pre_physics_step); _prev = the
             # previous step's (lag-1, updated at the end of _get_observations). Seeded 0 at reset.
-            _pa_dim = int(getattr(self, "_act_z", int(c.sonic_action_dim))) + int(c.hand_action_dim)
-            if getattr(self, "_upper_on", False):                        # [joint-residual] + 몸 잔차 N
-                _pa_dim += int(self._upper_act_idx.numel())
+            _pa_dim = int(c.sonic_action_dim) + int(c.hand_action_dim)   # 100
             self._cur_policy_action = torch.zeros(self.num_envs, _pa_dim, device=dev)
             self._prev_policy_action = torch.zeros(self.num_envs, _pa_dim, device=dev)
             # BOUNDED copy of the same action, used ONLY by rew_action_rate (see _get_rewards).
@@ -2017,51 +1790,145 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
     def _scale(self, a: torch.Tensor) -> torch.Tensor:
         return self._ctrl_lower + 0.5 * (a + 1.0) * (self._ctrl_upper - self._ctrl_lower)
 
-    # ---- action: SONIC latent-residual body + absolute-EMA hands (per-group EMA/delta = fallback) ----
+    # ---- action: TJ 손목 임피던스 + 상속받은 손가락 잔차 경로 -----------------------------
+    # 액션 54 = 손별 27 x 2 (왼손 먼저). 손별 27 = [pos_offset 3 | rot_offset 6D | finger 18].
+    # 손목은 workspaceTJ 의 gr_env 구현 그대로입니다: F = K_pos * pos_offset * action_dt,
+    # tau = K_rot * axis_angle(R_6d(rot_offset)) * action_dt, 그 뒤 이동평균, 루트 바디에만
+    # is_global=True 로 외력을 걸고 D 항은 강체 damping(100) 이 담당합니다. 리타게팅 손목에
+    # 앵커링하지 않습니다(사용자 결정) — 리셋만 리타게팅 pose 에서 출발합니다.
+    # 손가락은 학습 env 의 경로를 그대로 씁니다(레퍼런스 기준 per-step 잔차). 설계를 바꾸지
+    # 않는다는 원칙에 따라 TJ 의 절대-scale+EMA 방식으로 갈아타지 않았습니다.
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        # advance the reference frame for this step (reset overrides it at episode start)
         self._frame_idx = (self._frame_idx + 1).clamp(max=self._ref_len - 1)
         c = self.cfg
-        if self._sonic is not None:                       # SONIC latent-residual body + hand residual
-            self._sonic_pre_physics_step(actions)
-            return
         a = actions.clamp(-1.0, 1.0)
-        # per-group absolute EMA for all groups (baseline; feeds obs prev_action + action regularizers).
-        for gname, sl in self._group_slices.items():
-            al = self._group_alpha[gname]
-            self._smoothed_actions[:, sl] = al * a[:, sl] + (1.0 - al) * self._smoothed_actions[:, sl]
+        # 정책 액션 사본: 관측의 prev_action 항과 action_rate 보상이 읽습니다. 이미 [-1,1] 이라
+        # bnd 사본은 동일합니다(SONIC 경로의 z_res 정규화가 필요 없습니다).
+        self._cur_policy_action = a
+        self._cur_policy_action_bnd = a
 
+        # ── 손가락 36 = 왼손 18 ++ 오른손 18 (관절 한계 텐서와 같은 순서) ──
+        _w, _ph = self._ACT_W, self._ACT_PH
+        fing = torch.cat([a[:, _w:_ph], a[:, _ph + _w:2 * _ph]], dim=-1)       # (E,36)
+        al = self._group_alpha["hands"]
+        self._smoothed_actions[:] = al * fing + (1.0 - al) * self._smoothed_actions
         if c.residual_action and self._ref_joints is not None:
-            # PER-STEP RESIDUAL: target = clamp(ref_joints[frame] + residual_scale · a, limits). No integration
-            # (a=0 ⟺ exact reference playback); bounded to ±residual_scale about the reference by a∈[-1,1].
-            # residual_scale is PER GROUP (body 0.25 / hands 0.50) via _residual_scale_t (1,65).
-            # _delta_target mirrors the commanded target so obs prev_action / _apply_action reuse it unchanged.
-            self._residual_target = torch.clamp(
-                self._ref_joints[self._frame()] + self._residual_scale_t * a, self._ctrl_lower, self._ctrl_upper)
-            for gname, sl in self._group_slices.items():
-                self._delta_target[gname] = self._residual_target[:, sl]
+            # ── [residual] 손가락: 레퍼런스 기준 잔차 → 최종 목표 EMA ──────────────────────
+            _ref36 = self._ref_joints[self._frame()]                           # (E,36) 관절 단위
+            if self._fing_margin:
+                # DexMachina 본체 방식. a=+1 이면 그 관절 상한에 정확히 도달하므로 결과가 항상
+                # 한계 안이다 — 아래 clamp 는 수치 안전망일 뿐 동작하지 않는다.
+                _raw = _ref36 + torch.where(fing >= 0,
+                                            fing * (self._ctrl_upper - _ref36),
+                                            fing * (_ref36 - self._ctrl_lower))
+            else:
+                _raw = _ref36 + self._residual_scale_t * fing
+            # EMA 는 최종 목표에 (레퍼런스 + 잔차). 평활 상태가 곧 목표이므로 clamp 를 상태에
+            # 걸어 EMA 가 한계 밖으로 표류하지 못하게 한다.
+            _alh = self._group_alpha["hands"]
+            if self._fing_ema_res:
+                # [ROLLBACK MARKER: fres] 잔차 전용 EMA: 정규화 액션을 평활한 뒤 **현재 프레임**의
+                # 마진(또는 고정 배율)으로 매핑한다. 레퍼런스는 지연 없이 통과한다. _hand_target_ema
+                # 는 여기서 '현재 목표' 사본이 되어 캐시 저장/복원 코드가 그대로 유효하다.
+                _res = self._hand_res_ema
+                _res.mul_(1.0 - _alh).add_(_alh * fing)
+                if self._fing_margin:
+                    _tgt = _ref36 + torch.where(_res >= 0,
+                                                _res * (self._ctrl_upper - _ref36),
+                                                _res * (_ref36 - self._ctrl_lower))
+                else:
+                    _tgt = _ref36 + self._residual_scale_t * _res
+                self._hand_target_ema.copy_(_tgt).clamp_(self._ctrl_lower, self._ctrl_upper)
+                # [/ROLLBACK MARKER: fres]
+            else:
+                self._hand_target_ema.mul_(1.0 - _alh).add_(_alh * _raw).clamp_(
+                    self._ctrl_lower, self._ctrl_upper)
+            self._residual_target = self._hand_target_ema
+            self._delta_target["hands"] = self._residual_target
         else:
             self._residual_target = None
-            # rollback (residual_action off / no retarget): per-group free-running delta integrator; groups
-            # with the delta switch OFF stay on the absolute EMA baseline computed above.
-            for gname, sl in self._group_slices.items():
-                on, scale, smooth = self._delta_cfg[gname]
-                if not on:
+            on, scale, smooth = self._delta_cfg["hands"]
+            if on:
+                dcmd = fing * scale
+                self._delta_ema["hands"] = smooth * dcmd + (1.0 - smooth) * self._delta_ema["hands"]
+                self._delta_target["hands"] = torch.clamp(
+                    self._delta_target["hands"] + self._delta_ema["hands"],
+                    self._ctrl_lower, self._ctrl_upper)
+
+        _am = float(c.wrist_force_ema)
+        if self._w6:
+            # ── [wrist6] 손목 관절 잔차: q_des = ref[frame] + scale · EMA(a) ──────────────
+            # 평활이 핵심이다. 힘은 kp·잔차가 아니라 kp·추종오차이고, 잔차가 관절 응답보다
+            # 느리면(EMA 0.2 → 시간상수 0.1 s vs 관절 11 ms) 관절이 따라잡아 오차가 작게
+            # 유지된다. 평활을 빼면 오차 ≈ 잔차가 되어 힘이 6배로 뛴다 (실측).
+            _wa = torch.cat([a[:, 0:6], a[:, _ph:_ph + 6]], dim=-1)            # (E,12)
+            _fr6 = self._frame()
+            _tew = self._wrist6_target_ema
+            for _h in range(2):
+                # 잔차는 고정 상한(±wrist6_res_pos / ±wrist6_res_rot). 손목 관절 한계는 물리
+                # 범위가 아니라 안전벽이라 마진 스케일을 쓰지 않는다 (cfg 주석 참조).
+                # [ROLLBACK MARKER: w6gain] 잔차 전용 EMA: 레퍼런스는 지연 없이 통과, 잡음만 평활.
+                if self._w6_ema_res:
+                    _res = self._wrist6_res_ema[_h]
+                    _res.mul_(1.0 - _tew).add_(_tew * _wa[:, 6 * _h:6 * (_h + 1)] * self._wrist6_res_scale)
+                    self._wrist6_target[_h].copy_(self._ref_wrist_dof6[_h, _fr6] + _res).clamp_(
+                        self._wrist6_lo[_h], self._wrist6_hi[_h])
                     continue
-                dcmd = a[:, sl] * scale
-                self._delta_ema[gname] = smooth * dcmd + (1.0 - smooth) * self._delta_ema[gname]
-                self._delta_target[gname] = torch.clamp(self._delta_target[gname] + self._delta_ema[gname],
-                                                        self._ctrl_lower[sl], self._ctrl_upper[sl])
+                # [/ROLLBACK MARKER: w6gain]
+                _raw = (self._ref_wrist_dof6[_h, _fr6]
+                        + _wa[:, 6 * _h:6 * (_h + 1)] * self._wrist6_res_scale)
+                # EMA 를 최종 목표에. 평활 상태가 곧 목표다.
+                self._wrist6_target[_h].mul_(1.0 - _tew).add_(_tew * _raw).clamp_(
+                    self._wrist6_lo[_h], self._wrist6_hi[_h])
+        else:
+            # ── 손목 임피던스: 손별로 힘/토크를 만들고 이동평균 ──
+            _adt, _kp, _kr = float(c.wrist_action_dt), float(c.wrist_k_pos), float(c.wrist_k_rot)
+            for _h in range(2):
+                o = 27 * _h
+                f = a[:, o + 0:o + 3] * _adt * _kp                                 # (E,3) N
+                R = rotation_6d_to_matrix(a[:, o + 3:o + 9] + self._rot6d_bias)    # (E,3,3)
+                tq = matrix_to_axis_angle(R) * _adt * _kr                          # (E,3) N*m
+                self._wrist_force[_h] = (1.0 - _am) * self._wrist_force[_h] + _am * f
+                self._wrist_torque[_h] = (1.0 - _am) * self._wrist_torque[_h] + _am * tq
 
     def _apply_action(self) -> None:
         if self._residual_target is not None:                          # per-step residual: ref[frame] + scale·a
-            target = self._residual_target
-        else:                                                          # rollback: abs EMA + per-group delta
-            target = self._scale(self._smoothed_actions)               # (E,65) absolute EMA baseline
-            for gname, sl in self._group_slices.items():
-                if self._delta_cfg[gname][0]:                          # delta group → use integrated target
-                    target[:, sl] = self._delta_target[gname]
-        self.robot.set_joint_position_target(target, joint_ids=self._action_joint_ids)
+            target = self._residual_target                             # (E,36)
+        else:
+            target = self._scale(self._smoothed_actions)
+            if self._delta_cfg["hands"][0]:
+                target = self._delta_target["hands"]
+        for _h, _sd in enumerate("lr"):
+            _hand = self._hands[_h]
+            _sl = slice(0, 18) if _h == 0 else slice(18, 36)
+            _hand.set_joint_position_target(
+                target[:, _sl], joint_ids=getattr(self, f"_finger_joint_ids_{_sd}").tolist())
+            if self._w6:
+                # [wrist6] 손목은 관절 위치 목표로 구동한다. 속도 목표는 주지 않는다 —
+                # 넣어도 최대 오차 5.72 vs 5.91 mm 로 차이가 없고(측정), DexMachina 도 쓰지
+                # 않는다. 빼면 정책이 위치 목표 하나만 다루면 된다.
+                _hand.set_joint_position_target(
+                    self._wrist6_target[_h],
+                    joint_ids=getattr(self, f"_wrist6_joint_ids_{_sd}").tolist())
+                continue
+            # 손목: 루트 바디에만 외력. `set_external_force_and_torque` 는 폐기 예정이라
+            # `permanent_wrench_composer.set_forces_and_torques` 로 이관했습니다 (Isaac Lab 이
+            # 그 경고를 매 호출마다 냅니다). 확인한 사항:
+            #   * 커널이 대입(`=`)이지 누적(`+=`)이 아닙니다 (utils/warp/kernels.py
+            #     set_forces_and_torques_at_position). 매 제어 스텝 호출해도 값이 교체될 뿐
+            #     쌓이지 않습니다 — 문서의 "sum of all the forces" 표현 때문에 확인했습니다.
+            #   * permanent 는 "설정해두면 매 스텝 적용" 이라는 뜻이고 기존 API 와 같은 의미입니다.
+            #     실제로 구 API 자체가 내부에서 이 컴포저에 위임합니다.
+            #   * `positions` 를 주면 커널이 토크를 그 위치에서의 모멘트로 **덮어씁니다**(`=`).
+            #     우리 명시 토크가 사라지므로 절대 넘기지 않습니다.
+            # body_ids 를 주므로 (E, nB, 3) 전체 배열을 매 스텝 새로 만들 필요가 없습니다 —
+            # 4096 env 에서 스텝당 4.5 MB 할당이 사라집니다.
+            _hand.permanent_wrench_composer.set_forces_and_torques(
+                forces=self._wrist_force[_h].unsqueeze(1),        # (E,1,3)
+                torques=self._wrist_torque[_h].unsqueeze(1),      # (E,1,3)
+                body_ids=self._wrist_root_body_t[_h],
+                is_global=True,
+            )
 
     # -------------------------------------------------- frozen SONIC body prior
     def _sonic_proprio(self) -> torch.Tensor:
@@ -2105,22 +1972,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         tok = torch.zeros(E, self._sonic_tok_dim, device=dev)
         # [ROLLBACK MARKER: sonic-encoder-g1] encoder_index 열 순서 = m.encoders = ['g1','teleop','smpl'].
         if self._sonic_enc == "g1":
-            # ── [ROLLBACK MARKER: token-frame-skip] ──────────────────────────────────────
-            # 상류는 g1 경로와 SMPL 경로에 서로 다른 미래 프레임 간격을 씁니다
-            # (commands.py:360 future_time_steps_init = arange(N) * frame_skips).
-            #   g1  : dt_future_ref_frames      0.1  / (1/50) = 스킵 5  -> 1.0 초 창
-            #   smpl: smpl_dt_future_ref_frames 0.02 / (1/50) = 스킵 1  -> 0.2 초 창
-            # 그래서 joint_pos_multi_future 와 joint_pos_multi_future_for_smpl 가 따로 있습니다.
-            # 우리는 g1 인코더를 쓰면서 SMPL 쪽 간격(1)을 쓰고 있었습니다. 그러면 SONIC 은
-            # 0.2 초 구간을 1.0 초로 읽어 레퍼런스가 5배 느린 것처럼 보이고, 그만큼 뒤처집니다.
-            # 이 idx 는 command_multi_future_nonflat 과 motion_anchor_ori 두 항에 모두 쓰입니다.
-            # 되돌리기: cfg.sonic_token_frame_skip = 1.
-            _sk = max(1, int(getattr(self.cfg, "sonic_token_frame_skip", 1)))
-            if _sk != 1:
-                idx = (self._rframe().unsqueeze(1)
-                       + (_step * _sk) * torch.arange(K, device=dev).unsqueeze(0)
-                       ).clamp(0, self._ref_len - 1)
-            # ── [/ROLLBACK MARKER: token-frame-skip] ─────────────────────────────────────
             s_, e_, _ = lay["encoder_index"]; tok[:, s_:e_] = torch.tensor([1.0, 0.0, 0.0], device=dev)
             # 평탄 580 = [pos(f..f+9) 29개] ++ [vel(f..f+9) 29개]. 프레임당 [pos|vel]가 아닙니다
             # (디코더가 푸는 방식과 commands.py의 cat([joint_pos_mf, joint_vel_mf])에서 확인).
@@ -2151,8 +2002,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         (kept 65-D → pretrain→train transfer stays valid)."""
         c = self.cfg
         E, dev = self.num_envs, self.device
-        _az = int(getattr(self, "_act_z", int(c.sonic_action_dim)))      # 잠재 블록 폭 (끄면 0)
-        z_raw = actions[:, :_az]                                         # (E,64) 또는 (E,0)
+        z_raw = actions[:, :c.sonic_action_dim]                          # (E,64) raw policy latent output
         if c.sonic_latent_delta:                                        # [DELTA] integrate latent increments
             self._z_delta_ema = (c.sonic_latent_delta_smoothing * (z_raw * c.sonic_latent_delta_scale)
                                  + (1.0 - c.sonic_latent_delta_smoothing) * self._z_delta_ema)
@@ -2164,18 +2014,12 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             # =5.0) so the frozen-SONIC decoder never sees extreme latents (bounds the physical body
             # residual; NOTE this bounds the ENV action, not the PPO log-prob which is on the raw sample).
             z_res = torch.clamp(z_raw, -c.sonic_z_res_clip, c.sonic_z_res_clip)
-        if _az == 0:                                                     # [joint-residual] 잠재 잔차 OFF
-            z_res = torch.zeros(E, int(c.sonic_action_dim), device=dev)  # 디코더에는 0 → 순수 SONIC
-        # [joint-residual] 손 블록은 반드시 닫힌 슬라이스로 — 상체 블록이 뒤에 붙으므로 열린 슬라이스면
-        # a_hand 가 53 차원이 된다. _hs = [64,100), 상체 = [100, 117).
-        _hs = slice(_az, _az + int(c.hand_action_dim))
-        a_hand = actions[:, _hs].clamp(-1.0, 1.0)                        # (E,36)
+        a_hand = actions[:, c.sonic_action_dim:].clamp(-1.0, 1.0)        # (E,36)
         # saturation diagnostics: what FRACTION of each block's raw sample is being flattened by the
         # env clamp. Both blocks have a flat exterior (no restoring gradient there), so a rising
         # fraction is the early signature of a mean random-walk. Logged under "Diag /".
-        self._diag_hand_clamp_frac = (actions[:, _hs].abs() > 1.0).float().mean()
-        self._diag_zres_clip_frac = ((z_raw.abs() > c.sonic_z_res_clip).float().mean() if _az > 0
-                                     else torch.zeros((), device=dev))
+        self._diag_hand_clamp_frac = (actions[:, c.sonic_action_dim:].abs() > 1.0).float().mean()
+        self._diag_zres_clip_frac = (z_raw.abs() > c.sonic_z_res_clip).float().mean()
         # rew_action_reg operand (잠재 블록): the RAW (UNCLIPPED) latent residual — pre-2026-07-28
         # form. Penalizing the clipped value leaves the exterior of the clip perfectly flat, so nothing
         # pulls mu back inside once a dim saturates; the raw form keeps that restoring gradient (and
@@ -2184,16 +2028,13 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         #   squaring it would silently turn action_reg into a velocity penalty. Keep the integrated
         #   target in that mode (sonic_latent_delta is False by default, so absolute/raw is what runs).
         self._last_z_res = z_res if c.sonic_latent_delta else z_raw
-        self._cur_policy_action = actions                                # raw policy action (100, +17 if joint-residual)
+        self._cur_policy_action = actions                                # raw 100-D policy action (obs + action_rate)
         # ENV-EFFECTIVE (clipped z_res / clamped hand) copy, each block normalized by its own bound so
         # every entry is in [-1,1]. Fed rew_action_rate between 2026-07-28 and the same-day rollback;
         # currently UNREAD — kept (and still maintained) as the one-line A/B switch for that term, since
         # this axis is under active comparison. `_diag_*_clamp_frac` above do NOT depend on it.
         _zb = max(float(c.sonic_z_res_clip), 1e-6)
-        self._cur_policy_action_bnd = torch.cat(
-            ([z_res / _zb] if _az > 0 else []) + [a_hand]
-            + ([actions[:, _hs.stop:].clamp(-1.0, 1.0)] if getattr(self, "_upper_on", False) else []),
-            dim=-1)   # [joint-residual] 상체 블록 포함
+        self._cur_policy_action_bnd = torch.cat([z_res / _zb, a_hand], dim=-1)
         # frozen SONIC body: encode SMPL ref -> latent +λ·z_res (pre-quant) -> FSQ -> g1_dyn decode
         proprio = self._sonic_proprio()                                 # (E,930)
         tok = self._sonic_tokenizer()                                   # (E,TOK)
@@ -2201,41 +2042,14 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         a_sonic = self._SP.residual_decode(self._sonic, latent, z_res, proprio,
                                            float(c.residual_scale_latent))   # (E,29) SONIC order, raw
         self._last_a_sonic = a_sonic
-        # ── [ROLLBACK MARKER: joint-residual] 상체 관절 잔차: a_out = a_sonic; a_out[S] += scale·u.
-        # 잔차는 _sonic_scale 이 곱해지기 전, SONIC 액션 단위에서 더한다 (video_to_data 와 동일) — 실제
-        # 관절 변위는 scale × _sonic_scale[j] 가 되어 관절마다 다르다. tanh 없음, EMA 없음.
-        # S 에 없는 관절(다리 12개)은 SONIC 출력이 한 비트도 바뀌지 않는다.
-        a_out = a_sonic
-        if getattr(self, "_upper_on", False):
-            _u = actions[:, _hs.stop:]                                  # (E,N) raw, 무제한
-            _si = self._upper_sonic_idx
-            a_out = a_sonic.clone()
-            _rs = self._upper_res_scale                                  # (N,) 그룹별 scale
-            a_out[:, _si] = a_out[:, _si] + _rs * _u
-            self._diag_upper_res_rad = (_rs * _u.abs() * self._sonic_scale[:, _si]).mean()
-            if bool(getattr(c, "sonic_upper_hist_from_applied", False)):
-                self._last_a_sonic = a_out                              # 되먹임을 적용 목표로 (A/B 스위치)
-        # ── [/ROLLBACK MARKER: joint-residual] ──
-        body_sonic = self._sonic_default + self._sonic_scale * a_out    # (E,29) SONIC order absolute target
+        body_sonic = self._sonic_default + self._sonic_scale * a_sonic  # (E,29) SONIC order absolute target
         body_target = body_sonic[:, self._sonic_gather]                # (E,29) action-body order
         # hands: ABSOLUTE action (user-locked decision) — a_hand ∈ [-1,1] maps DIRECTLY to the
         # Shadow joint range (NOT residual-on-retarget, NOT delta). Per-group EMA-smoothed like the
         # grasp env's absolute finger path; the EMA prev is _smoothed_actions[hands] (seeded to the
         # reset pose in _reset_idx). residual_scale_hands is UNUSED in this mode.
         hsl = self._sonic_hand_slice
-        if getattr(c, "sonic_hand_residual", False):
-            # [ROLLBACK MARKER: stage1-hand] 잔차 손 액션 — 1단계(hand_pretrain) 와 같은 마진 매핑 + 정규화
-            # 잔차 전용 EMA. a=0 이면 기준(_hand_res_base: 1단계 롤아웃 PD 목표 또는 레퍼런스)을 지연 없이
-            # 그대로 재생하고, a=±1 은 그 관절의 상/하한에 정확히 닿습니다. cfg 주석 참조.
-            _b = self._hand_res_base[self._rframe()]                                        # (E,36) 관절 단위
-            _al = self._group_alpha["hands"]
-            self._hand_res_ema.mul_(1.0 - _al).add_(_al * a_hand)
-            _r = self._hand_res_ema
-            hand_target = torch.clamp(_b + torch.where(_r >= 0, _r * (self._ctrl_upper[hsl] - _b),
-                                                       _r * (_b - self._ctrl_lower[hsl])),
-                                      self._ctrl_lower[hsl], self._ctrl_upper[hsl])
-            # [/ROLLBACK MARKER: stage1-hand]
-        elif c.sonic_hand_delta:                                        # [DELTA] integrate hand JOINT increments
+        if c.sonic_hand_delta:                                          # [DELTA] integrate hand JOINT increments
             self._hand_delta_ema = (c.sonic_hand_delta_smoothing * (a_hand * c.sonic_hand_delta_scale)
                                     + (1.0 - c.sonic_hand_delta_smoothing) * self._hand_delta_ema)
             self._hand_delta_target = torch.clamp(self._hand_delta_target + self._hand_delta_ema,
@@ -2250,27 +2064,61 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         target[:, :hsl.start] = body_target                            # [0:29] = body (legs+waist+arms, SONIC)
         target[:, hsl] = hand_target                                   # [29:65] = bimanual hands (ABSOLUTE)
         self._residual_target = torch.clamp(target, self._ctrl_lower, self._ctrl_upper)
-        # [ROLLBACK MARKER: joint-residual] 상체 목표가 soft 관절 한계에 잘린 비율 (video_to_data 는 클램프가
-        # 없고 joint_pos_limits 보상으로만 누르지만, 이 env 는 위 한 곳에서 잘라낸다).
-        if getattr(self, "_upper_on", False):
-            _ui = self._upper_act_idx
-            self._diag_upper_clamp_frac = (target[:, _ui] != self._residual_target[:, _ui]).float().mean()
         self._smoothed_actions = self._unscale(self._residual_target)
         for gname, sl in self._group_slices.items():
             self._delta_target[gname] = self._residual_target[:, sl]
 
     # ------------------------------------------------- robot keypoint / fingertip FK
+    # ── [hand-pretrain] 손별 articulation 에서 body 를 찾고 모아 읽는 헬퍼 ────────────────────
+    # 부모는 단일 articulation 에서 body id 하나를 뽑아 `self.robot.data.body_pos_w[:, ids]` 로
+    # 한 번에 읽었습니다. 여기서는 왼손/오른손이 서로 다른 articulation 이라 (손, id) 쌍으로
+    # 저장하고 읽을 때 합칩니다. 이름 순서는 부모와 동일하게 유지되므로 하류 인덱싱은 그대로입니다.
+    def _hand_joint_cat(self, field: str) -> torch.Tensor:
+        """(E,36) 두 손의 구동 관절값을 왼손 18 → 오른손 18 순서로 이어붙입니다.
+        _ctrl_lower/_upper, 리셋의 36열 버퍼, 관측이 모두 이 순서를 전제합니다."""
+        return torch.cat(
+            [getattr(self._hands[i].data, field)[:, getattr(self, f"_finger_joint_ids_{sd}")]
+             for i, sd in enumerate("lr")], dim=1)
+
+    def _find_hand_bodies(self, names: list[str]):
+        """이름 리스트 → (side_idx (N,), body_ids (N,)). side_idx 0=왼손 1=오른손."""
+        sides, ids = [], []
+        for n in names:
+            h = 0 if "_l_" in n else 1
+            found = self._hands[h].find_bodies(n)[0]
+            if not found:
+                raise ValueError(f"[hand-pretrain] {n} 을 {'왼' if h == 0 else '오른'}손에서 찾지 못함")
+            sides.append(h)
+            ids.append(found[0])
+        return (torch.tensor(sides, device=self.device, dtype=torch.long),
+                torch.tensor(ids, device=self.device, dtype=torch.long))
+
+    def _gather_body(self, sides: torch.Tensor, ids: torch.Tensor, field: str) -> torch.Tensor:
+        """(E,N,D) 두 손의 body_* 배열에서 (side, id) 로 지정된 항목만 모읍니다."""
+        outs = []
+        for h in (0, 1):
+            m = sides == h
+            if not bool(m.any()):
+                continue
+            outs.append((m, getattr(self._hands[h].data, field)[:, ids[m]]))
+        E = self.num_envs
+        D = outs[0][1].shape[-1]
+        res = torch.zeros(E, sides.numel(), D, device=self.device, dtype=outs[0][1].dtype)
+        for m, v in outs:
+            res[:, m] = v
+        return res
+
     def _robot_kpts_w(self) -> torch.Tensor:
         """(E,56,3) world keypoint positions = body origin + rotated local offset."""
-        p = self.robot.data.body_pos_w[:, self._kpt_body_ids]          # (E,56,3)
-        q = self.robot.data.body_quat_w[:, self._kpt_body_ids]         # (E,56,4)
+        p = self._gather_body(self._kpt_sides, self._kpt_body_ids, "body_pos_w")   # (E,42,3)
+        q = self._gather_body(self._kpt_sides, self._kpt_body_ids, "body_quat_w")  # (E,42,4)
         off = self._kpt_offsets.unsqueeze(0).expand(self.num_envs, -1, -1)
         return p + math_utils.quat_apply(q, off)
 
     def _robot_ft_w(self):
         """(E,10,3) fingertip pad positions + (E,10,3) pad-inward world directions."""
-        p = self.robot.data.body_pos_w[:, self._ft_body_ids]
-        q = self.robot.data.body_quat_w[:, self._ft_body_ids]
+        p = self._gather_body(self._ft_sides, self._ft_body_ids, "body_pos_w")
+        q = self._gather_body(self._ft_sides, self._ft_body_ids, "body_quat_w")
         tip = p + math_utils.quat_apply(q, self._ft_offsets.unsqueeze(0).expand(self.num_envs, -1, -1))
         pad_inward = -math_utils.quat_apply(q, self._ft_pad_normals.unsqueeze(0).expand(self.num_envs, -1, -1))
         return tip, pad_inward
@@ -2279,7 +2127,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         """(E,L,3) each wrap link's INWARD pad/palmar unit normal in world = -R(link_quat)·pad_outward_local.
         The direction the object presses when the link touches with its correct (grasping) face — the analog
         of the fingertip `pad_inward`. Used both to project the contact force and for the orientation gate."""
-        q = self.robot.data.body_quat_w[:, self._link_contact_body_ids]              # (E,L,4)
+        q = self._gather_body(self._lc_sides, self._link_contact_body_ids, "body_quat_w")  # (E,L,4)
         return -math_utils.quat_apply(
             q, self._link_pad_normals.unsqueeze(0).expand(self.num_envs, -1, -1))    # (E,L,3) inward
 
@@ -2341,24 +2189,23 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         fr, nfr = self._rframe(), self._rnext_frame()   # [backward-dir] 원본 프레임
 
         # ---- BLOCK A: proprioception ----
-        root_pos = self.robot.data.root_pos_w
-        root_quat = _canon(self.robot.data.root_quat_w)
         # explicit palm (wrist) state + fingertip velocities (bimanual) — direct manipulation
         # signals (mirrors grasp's wrist quat/linvel/angvel + fingertip velocities; the palm
         # keypoint POSITION alone loses orientation/velocity). Real robot values in BOTH phases.
-        palm_quat = _canon(self.robot.data.body_quat_w[:, self._palm_body_ids])     # (E,2,4)
-        palm_linvel = self.robot.data.body_lin_vel_w[:, self._palm_body_ids]        # (E,2,3)
-        palm_angvel = self.robot.data.body_ang_vel_w[:, self._palm_body_ids]        # (E,2,3)
-        ft_vel = self.robot.data.body_lin_vel_w[:, self._ft_body_ids]               # (E,10,3)
+        palm_quat = _canon(self._gather_body(self._palm_sides, self._palm_body_ids, "body_quat_w"))
+        palm_linvel = self._gather_body(self._palm_sides, self._palm_body_ids, "body_lin_vel_w")
+        palm_angvel = self._gather_body(self._palm_sides, self._palm_body_ids, "body_ang_vel_w")
+        ft_vel = self._gather_body(self._ft_sides, self._ft_body_ids, "body_lin_vel_w")  # (E,10,3)
         # projected_gravity_b = gravity direction in the base frame → encodes base TILT (roll/pitch), the
         # signal the residual policy needs to perceive & correct balance / forward-fall (added 2026-07-21
         # for the CoM-over-support balance reward; root height/ori6d stay out — recoverable as ref − delta).
+        # [hand-pretrain] 몸통 항 3개(projected_gravity_b / root_lin_vel_w / root_ang_vel_w)를
+        # 뺐습니다. 떠 있는 손에는 "몸통 기울기"도 골반 속도도 없고, self.robot 은 왼손 별칭이라
+        # 그대로 두면 왼손 자세를 골반 신호로 위장해 넣게 됩니다. 손 자체의 자세·속도는 아래
+        # palm ori/linvel/angvel 블록이 양손 모두 담고 있습니다.
         A = [
-            self.robot.data.projected_gravity_b,                       # (3) base-frame gravity dir (tilt)
-            self.robot.data.root_lin_vel_w,                            # (3)
-            self.robot.data.root_ang_vel_w * vs,                       # (3)
-            self._unscale(self.robot.data.joint_pos[:, self._action_joint_ids_t]),  # (65)
-            self.robot.data.joint_vel[:, self._action_joint_ids_t] * vs,            # (65)
+            self._unscale(self._hand_joint_cat("joint_pos")),   # [hand-pretrain] (36)
+            self._hand_joint_cat("joint_vel") * vs,             # (36)
             _quat_to_6d(palm_quat).reshape(E, -1),                     # palm ori 6d ×2 (12)
             palm_linvel.reshape(E, -1),                               # palm linvel ×2 (6)
             (palm_angvel * vs).reshape(E, -1),                        # palm angvel ×2 (6)
@@ -2366,22 +2213,17 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         ]
 
         # ---- BLOCK B: reference tracking + look-ahead ----
-        kpts = self._robot_kpts_w()                                    # (E,54,3) world (14 body + 40 hand)
+        kpts = self._robot_kpts_w()                                    # (E,42,3) world (손 전용)
         kpts_local = kpts - org[:, None, :]                            # env-local
         delta_kpts = self._ref_kpts[nfr] - kpts_local                  # look-ahead delta
-        ref_root_p = self._ref_root_pos[nfr]                           # look-ahead (grasp-parity: obs deltas = next frame)
-        ref_root_q = self._ref_root_quat[nfr]
-        delta_root_pos = ref_root_p - (root_pos - org)
-        droot_q = _canon(math_utils.quat_mul(ref_root_q, math_utils.quat_conjugate(root_quat)))
         # NO phase/time signal (grasp env doesn't use one — progress is conveyed by the next-frame
         # reference deltas / look-ahead below, keeping obs consistent with the existing tasks).
+        # [hand-pretrain] 골반 레퍼런스 4개(ref_root_p / ref_root_ori6d / delta_root_pos /
+        # droot_q)를 뺐습니다 — 추종 대상이 골반이 아니라 두 손목입니다. 손목의 목표 대비 오차는
+        # delta_kpts 의 palm 두 항(인덱스 0, 21)이 담고 있습니다.
         B = [
-            kpts_local.reshape(E, -1),                                 # (54×3=162)
-            delta_kpts.reshape(E, -1),                                 # (54×3=162)
-            ref_root_p,                                                # ref root pos (3)  [was height-only]
-            _quat_to_6d(ref_root_q),                                   # ref root ori 6d (6)
-            delta_root_pos,                                            # (3)
-            _quat_to_6d(droot_q),                                      # (6)
+            kpts_local.reshape(E, -1),                                 # (42×3=126)
+            delta_kpts.reshape(E, -1),                                 # (42×3=126)
         ]
 
         # ---- BLOCK C: object + contact + history ----
@@ -2435,8 +2277,9 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             # to ~hundreds of N (var ~7e5 measured), destabilizing the obs RunningStandardScaler. Clip
             # the OBS copy only (the reward uses its own contact_force_cap). Keeps scaling stable.
             self._link_contact_forces().clamp(max=c.force_obs_clip),  # current per-link actual contact force (L=32)
-            self._ref_foot_contact[nfr],                              # FUTURE (look-ahead) reference foot contact L/R (2)
-            self._foot_force().clamp(max=c.force_obs_clip),           # current ACTUAL foot↔ground force L/R (2)
+            # [hand-pretrain] 발 접촉 스케줄(_ref_foot_contact)과 실측 발 힘(_foot_force)을
+            # 뺐습니다 — 발이 없습니다. 두 배열 자체는 계산해 두므로(rew_feet_contact_match=0.0)
+            # 되살릴 때는 이 두 줄만 복원하면 됩니다.
             # PREV policy action (z_res 64 + a_hand 36 = 100), GRAIL-style — the RAW action.
             #   The ENV-EFFECTIVE (clipped, per-block normalized to [-1,1]) copy `_prev_policy_action_bnd`
             #   was tried here on 2026-07-28 on the hypothesis that the unbounded raw action was driving
@@ -2457,24 +2300,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 두 행동을 평균내게 되고, repho 쪽 실험에서 최고 성능이 51.80 -> 21.69로 반토막 났습니다.
         C = C + [(~self._dir_fwd).float().unsqueeze(-1)]
         obs = torch.cat(A + B + C, dim=-1)
-        # ── [ROLLBACK MARKER: nan-guard] (L3) 관측 위생 처리 ──────────────────────────────────
-        # 스케일러(RunningStandardScaler)는 한 번 오염되면 복구되지 않는다. running_mean 은
-        #   running_mean += (input_mean − running_mean) · n/N
-        # 이라 입력에 inf 가 하나만 섞여도 input_mean 이 inf → running_mean 이 inf 가 되고, 이후
-        # 모든 관측이 (유한 − inf)/… = NaN 으로 나온다. 버퍼가 영구적이라 되돌릴 방법이 없다.
-        # 리셋 순서(_get_dones → _get_rewards → _reset_idx → _get_observations)가 로봇 상태
-        # 기원의 NaN 은 씻어 주지만, 접촉력·물체·정책 원액션 등 게이트가 보지 않는 경로가 남는다.
-        # 여기서 비유한 값을 0 으로 치환하고 크기를 제한해 그 마지막 구멍을 막는다.
-        # 숨기는 게 아니라 세어서 드러낸다 — Diag / obs_sanitized 가 0 이 아니면 위 게이트가
-        # 놓친 경로가 있다는 뜻이다.
-        _oc = float(getattr(c, "nan_guard_obs_clip", 0.0))
-        if _oc > 0.0:
-            _bad = ~torch.isfinite(obs)
-            self._diag_obs_sanitized = _bad.float().mean()
-            if _bad.any():
-                obs = torch.nan_to_num(obs, nan=0.0, posinf=_oc, neginf=-_oc)
-            obs = obs.clamp(-_oc, _oc)
-        # ── [/ROLLBACK MARKER: nan-guard] ──
         assert obs.shape[-1] == c.observation_space, (
             f"obs dim {obs.shape[-1]} != cfg.observation_space {c.observation_space} "
             "(block-C dims must be invariant across the has_object flip)")
@@ -2590,7 +2415,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         """(E,) out-of-support excess (m) of the mass-weighted CoM horizontal projection, in the foot frame:
         relu(e_fwd - L_front) + relu(-e_fwd - L_back) + relu(|e_lat| - L_side),  L_side = ½‖aL-aR‖ + halfw.
         0 when the CoM is inside the support box (feasibility → no penalty on the balanced reference)."""
-        c = self.cfg
+        # [hand-pretrain] 발/지지다각형이 없습니다. rew_com_support 는 cfg 에서 0.0 이므로
+        # 상수 0 을 돌려주는 것이 이 항을 제거한 것과 정확히 같습니다.
+        return torch.zeros(self.num_envs, device=self.device)
+        c = self.cfg                                                              # noqa: 이하 미사용
         rd = self.robot.data
         pos = rd.body_com_pos_w if self._use_body_com else rd.body_pos_w          # (E,nB,3) world
         m = self._body_masses                                                    # (E,nB)
@@ -2612,6 +2440,9 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         """(E,2)=[left,right] COMPRESSIVE foot↔ground force (N). = the ground-filtered contact force
         (force_matrix_w) projected on the foot SOLE-INWARD normal (= -sole normal, ≈ up when flat),
         clamped ≥0 — mirrors the fingertip force computation. Used by the obs + (thresholded) the reward."""
+        # [hand-pretrain] 발 센서와 발목 링크가 없습니다 (_foot_sensors = []). 관측에서도 이 항을
+        # 뺐지만, _foot_contact_actual() 이 여전히 부르므로 상수 0 을 돌려줍니다.
+        return torch.zeros(self.num_envs, 2, device=self.device)
         q = self.robot.data.body_quat_w[:, self._ankle_body_ids]                    # (E,2,4)
         sole_inward = -math_utils.quat_apply(                                        # (E,2,3) into the foot (≈up)
             q, self._foot_sole_normal.unsqueeze(0).expand(self.num_envs, -1, -1))
@@ -2665,13 +2496,15 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         kpts = self._robot_kpts_w() - org[:, None, :]
         ref = self._ref_kpts[fr]
         dk = ref - kpts
-        _nb = len(BODY_KPTS)                                          # 14 body kpts (GRAIL-aligned)
-        body_per = dk[:, :_nb].norm(dim=-1)                          # (E,14) per-body-kpt distance
+        # [hand-pretrain] 몸통 블록 없음. "body" 계열 오차는 palm 2개(떠 있는 손목)로 정의합니다
+        # — 이름을 쓰는 하위 호출부(종료 게이트, 로그)가 모두 의미 있는 값을 계속 받습니다.
+        _nb = 0
+        body_per = dk[:, self._palm_kpt_idx].norm(dim=-1)            # (E,2) palm 거리
         body_err = body_per.mean(dim=-1)                            # (E,) UNIFORM mean → termination gate
-        body_core_err = body_per[:, self._body_core_idx].mean(dim=-1)  # (E,) 9 CORE body kpts (REWARD)
+        body_core_err = body_per[:, self._body_core_idx].mean(dim=-1)  # (E,) palm 2개 (가중치 0.0)
         # [ee-split] wrist and ankle are now separate REWARD groups (they were one 4-kpt "ee" mean).
         wrist_pos_err = body_per[:, self._wrist_kpt_idx].mean(dim=-1)  # (E,) MEAN over both wrists (termination + 로그)
-        ee_err = body_per[:, self._ee_kpt_idx].mean(dim=-1)            # (E,) MEAN over ankle×2 + torso (REWARD) [ee-torso]
+        ee_err = body_per[:, self._ee_kpt_idx].mean(dim=-1)            # (E,) palm 2개 평균 (rew_ee_kpts)
         hand_err = dk[:, _nb:].norm(dim=-1).mean(dim=-1)            # (E,) 40 hand kpts — 무가중 (로그)
         # [ROLLBACK MARKER: z-weight] 보상용 z 가중 사본. 무가중은 로그/게이트에 그대로 남깁니다.
         _zw = float(self.cfg.z_weight_reward)
@@ -2685,11 +2518,11 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # all of which use a plain mean for the termination gate (no per-hand worst-of-two-hands max).
         ft_err = ft_per.mean(dim=-1)                                            # (E,)
         # root
-        root_pos = self.robot.data.root_pos_w - org
-        root_quat = _canon(self.robot.data.root_quat_w)
-        root_pos_err = (self._ref_root_pos[fr] - root_pos).norm(dim=-1)
-        qerr = _canon(math_utils.quat_mul(self._ref_root_quat[fr], math_utils.quat_conjugate(root_quat)))
-        root_rot_err = 2.0 * torch.arcsin(qerr[:, 1:].norm(dim=-1).clamp(max=1.0))
+        # [hand-pretrain] 골반이 없으므로 root 오차는 정의되지 않습니다. self.robot 은 왼손
+        # 별칭이라 그대로 계산하면 "왼손목 대 사람 골반" 거리가 Error/root_pos 로 찍힙니다.
+        # 보상 가중치 0.0 / 종료 임계 1e9 로 이미 무효인 항이므로 상수 0 을 둡니다.
+        root_pos_err = torch.zeros(self.num_envs, device=self.device)
+        root_rot_err = torch.zeros(self.num_envs, device=self.device)
         # object
         if self._has_object:
             obj_pos = self._object.data.root_pos_w - org
@@ -2728,7 +2561,9 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             # [ROLLBACK MARKER: link-kpt-objframe] 목표 = 물체 기준으로 표현한 레퍼런스 링크 위치를
             # 살아있는 물체 자세로 되돌린 것. 물체가 돌면 손이 따라가야 할 자세도 함께 돕니다.
             # 접촉 요구와 무관하게 매 프레임 정의되므로 접촉 마스크로 걸지 않습니다(손바닥만 제외).
-            _lp = self.robot.data.body_pos_w[:, self._link_contact_body_ids] - org[:, None, :]  # (E,L,3)
+            # [hand-pretrain] 32열은 양손에 걸쳐 있어 한 손 articulation 에 그대로 색인하면 안 됩니다.
+            _lp = self._gather_body(self._lc_sides, self._link_contact_body_ids,
+                                    "body_pos_w") - org[:, None, :]                 # (E,L,3)
             _oqL = obj_quat.unsqueeze(1).expand(-1, _lp.shape[1], -1)
             _ltgt = math_utils.quat_apply(_oqL, self._ref_link_kpt_local[fr]) + obj_pos.unsqueeze(1)
             _act = (self._link_kpt_use & self._link_kpt_has_ref.unsqueeze(0)
@@ -2752,7 +2587,8 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                     ee=ee_err, hand_w=hand_err_w, obj_pos_w=obj_pos_err_w,   # [z-weight]
                     com_support=self._com_support_err(), wrist_pos=wrist_pos_err, hand=hand_err, ft=ft_err, ft_reward=ft_reward, ft_per=ft_per, tip=tip,
                     pad_inward=pad_inward, root_pos=root_pos_err, root_rot=root_rot_err,
-                    obj_pos=obj_pos_err, obj_rot=obj_rot_err, root_quat=root_quat,
+                    # [hand-pretrain] root_quat 항목 제거 — 골반이 없고 읽는 곳도 없습니다.
+                    obj_pos=obj_pos_err, obj_rot=obj_rot_err,
                     wrist_rot=wrist_rot_err)
 
     def _get_rewards(self) -> torch.Tensor:
@@ -2779,7 +2615,8 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             oqL = self._object.data.root_quat_w[:, None, :].expand(-1, N_LINK_CONTACT, -1)   # (E,L,4) live
             tgt_w = (math_utils.quat_apply(oqL, self._ref_link_contact_target_local[fr])
                      + self._object.data.root_pos_w[:, None, :])                              # (E,L,3) world target
-            lp = self.robot.data.body_pos_w[:, self._link_contact_body_ids]                   # (E,L,3) world link pos
+            lp = self._gather_body(self._lc_sides, self._link_contact_body_ids,
+                                    "body_pos_w")                                     # [hand-pretrain] (E,L,3)
             near = ((lp - tgt_w).norm(dim=-1) < c.contact_match_dist).float()                 # (E,L) spatial gate
             if c.use_contact_normal_gate:
                 inward_w = self._link_pad_inward_w()                                          # (E,L,3) link face
@@ -2858,10 +2695,10 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 적분된 잠재 — raw 증분을 제곱하면 속도 페널티가 되므로 그쪽을 써야 한다). 손은 raw 정책
         # 액션의 손 블록(클램프 이전)이라 클립 밖에서도 복원 기울기가 남는다.
         hsl = self._group_slices["hands"]
-        _nz_reg = int(getattr(self, "_act_z", int(self.cfg.sonic_action_dim)))
+        _nz_reg = int(self.cfg.sonic_action_dim)
         if self._sonic is not None:
             _areg_src = torch.cat([self._last_z_res,
-                                   self._cur_policy_action[:, _nz_reg:]], dim=-1)      # (E,100 | 117)
+                                   self._cur_policy_action[:, _nz_reg:]], dim=-1)      # (E,100)
         else:
             _areg_src = self._cur_policy_action
         action_reg = (_areg_src ** 2).sum(-1)                                           # (E,) SUM
@@ -2872,9 +2709,9 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # tracking in joint space with zero neutral-pose safety. Body is SONIC-driven so it is NOT regularized
         # here. Matches the grasp ancestor (jp - default_joint_pos) and TJ (dof_pos² toward the rest pose);
         # GRAIL/SONIC carry no pose regularizer at all (tracking owns the reference; only limit/rate/contact).
-        _hand_ids = self._action_joint_ids_t[hsl]
-        hand_ref = self.robot.data.default_joint_pos[:, _hand_ids]
-        pose_reg_hands = ((self.robot.data.joint_pos[:, _hand_ids] - hand_ref) ** 2).sum(-1)
+        # [hand-pretrain] 손 36개 전체가 대상입니다 (hsl 슬라이스가 곧 0:36).
+        hand_ref = self._hand_joint_cat("default_joint_pos")
+        pose_reg_hands = ((self._hand_joint_cat("joint_pos") - hand_ref) ** 2).sum(-1)
         # action_rate on the RAW 100-D policy action (z_res + a_hand). It is NOT the realized joint
         # target: penalizing that would penalize SONIC's OWN body tracking (the base's job); this
         # penalizes only the policy's residual+hand smoothness (GRAIL meta_action_rate_l2).
@@ -2895,32 +2732,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         _eqd = self.robot.data.joint_vel[:, self._energy_joint_ids]                 # (E,15) rad/s
         energy = (_etau * _eqd).abs().sum(-1)                                       # (E,) W
         self._diag_energy = energy.mean()          # 가중 이전 원값(W) — _log_reward_terms 가 읽는다
-        # ── [ROLLBACK MARKER: ankle-acc] Σ_j ((q̇_prev,j − q̇_j)/dt)²  (ResMimic ankle_dof_acc) ──
-        if getattr(self, "_ankle_acc_joint_ids", None) is not None:
-            _aa = self.robot.data.joint_acc[:, self._ankle_acc_joint_ids]                  # (E,J) rad/s²
-            ankle_acc = (_aa * _aa).sum(-1)                                                # (E,) (rad/s²)²
-            self._diag_ankle_acc = ankle_acc.mean()    # 가중 이전 원값
-        else:
-            ankle_acc = torch.zeros(self.num_envs, device=self.device)
-        # ── [/ROLLBACK MARKER: ankle-acc] ──
-        # ── [ROLLBACK MARKER: waist-acc] Σ_j (data.joint_acc[j])² — 허리 관절 ──
-        if getattr(self, "_waist_acc_joint_ids", None) is not None:
-            _wa = self.robot.data.joint_acc[:, self._waist_acc_joint_ids]                  # (E,J) rad/s²
-            waist_acc = (_wa * _wa).sum(-1)                                                # (E,) (rad/s²)²
-            self._diag_waist_acc = waist_acc.mean()    # 가중 이전 원값
-        else:
-            waist_acc = torch.zeros(self.num_envs, device=self.device)
-        # ── [/ROLLBACK MARKER: waist-acc] ──
-        # ── [ROLLBACK MARKER: anti-shake] mean_i relu(‖ω_i‖ − θ)² over the configured links (SONIC anti_shake_ang_vel_l2) ──
-        if getattr(self, "_anti_shake_body_ids", None) is not None:
-            _wb = self.robot.data.body_ang_vel_w[:, self._anti_shake_body_ids]                 # (E,B,3) 월드 각속도
-            _ex = (_wb.norm(dim=-1) - float(c.anti_shake_ang_vel_thresh)).clamp(min=0.0)     # (E,B) 데드존 초과분
-            anti_shake = (_ex * _ex).mean(dim=-1)                                              # (E,)
-        else:
-            anti_shake = torch.zeros(self.num_envs, device=self.device)
-        self._last_anti_shake = anti_shake
-        self._diag_anti_shake_frac = (anti_shake > 0.0).float().mean()
-        # ── [/ROLLBACK MARKER: anti-shake] ──
         # CoM-over-support balance penalty (anti-fall): out-of-support excess (m), 0 when the CoM stays
         # over the feet (so it never penalizes the balanced reference) — grows only when the robot tips.
         com_support = e["com_support"]                    # (E,) ≥ 0
@@ -2968,9 +2779,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             + c.rew_action_reg * action_reg + c.rew_pose_reg_hands * pose_reg_hands
             + c.rew_action_rate * action_rate
             + c.rew_energy * energy                       # [energy] 허리+다리 Σ|τ·q̇|
-            + c.rew_anti_shake * anti_shake               # [anti-shake] 손목·머리 각속도 데드존 벌점 (SONIC)
-            + c.rew_ankle_acc * ankle_acc                 # [ankle-acc] 발목 관절 가속도 벌점 (ResMimic)
-            + c.rew_waist_acc * waist_acc                 # [waist-acc] 허리 관절 가속도 벌점
             + c.rew_com_support * com_support             # anti-fall (outside the tracking clamp)
             + c.rew_feet_contact_match * feet_match       # feet-contact-match bonus (positive)
         ).clamp(min=0.0)
@@ -3016,9 +2824,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             "pose_reg_hands": c.rew_pose_reg_hands * pose_reg_hands,
             "action_rate": c.rew_action_rate * action_rate,
             "energy": c.rew_energy * energy,                   # [energy]
-            "anti_shake": c.rew_anti_shake * anti_shake,     # [anti-shake]
-            "ankle_acc": c.rew_ankle_acc * ankle_acc,        # [ankle-acc]
-            "waist_acc": c.rew_waist_acc * waist_acc,        # [waist-acc]
             "com_support": c.rew_com_support * com_support,
             "feet_contact_match": c.rew_feet_contact_match * feet_match,
         }
@@ -3048,6 +2853,9 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             "Curriculum / rsi_start_ceiling": float(getattr(self, "_rsi_ceil_f", self._ref_len - 1)),
             "Curriculum / pretrain_fallback": self._last_pretrain_fallback_ratio,
             "Curriculum / cache_coverage": float((~self._init_flg).sum().item()) / self._ref_len,
+            # [hand-pretrain] 유한성/크기 검사로 캐시 쓰기가 거부된 env 비율. 0 이 정상이고,
+            # 0 이 아니면 떠 있는 손이 수치적으로 발산하고 있다는 뜻입니다.
+            "Diag / cache_reject_frac": float(getattr(self, "_diag_cache_reject", 0.0)),
         })
         # per-term reward contributions → Episode_Reward group. ONE graph per reward TERM and nothing
         # else: no group aggregate, no total ("Reward / Instantaneous reward (mean)" from skrl is the
@@ -3086,16 +2894,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # episode_len = steps elapsed in the CURRENT episode; rsi_start = frame the episode began at.
         if hasattr(self, "_diag_energy"):                # [energy] 가중 이전 원값 (W)
             log["Diag / energy"] = self._diag_energy
-            log["Diag / anti_shake_frac"] = self._diag_anti_shake_frac     # [anti-shake] 데드존 초과 env 비율
-            if getattr(self, "_ankle_acc_joint_ids", None) is not None:
-                log["Diag / ankle_acc"] = self._diag_ankle_acc             # [ankle-acc] 가중 이전 Σ(rad/s²)²
-            if getattr(self, "_waist_acc_joint_ids", None) is not None:
-                log["Diag / waist_acc"] = self._diag_waist_acc             # [waist-acc] 가중 이전 Σ(rad/s²)²
-        if getattr(self, "_upper_on", False):                     # [joint-residual]
-            log["Diag / upper_res_rad"] = self._diag_upper_res_rad          # |상체 잔차| 평균, rad
-            log["Diag / upper_clamp_frac"] = self._diag_upper_clamp_frac    # 관절 한계에 잘린 비율
-        log["Diag / blowup_frac"] = self._diag_blowup_frac        # [nan-guard] 관절 속도 폭주로 리셋된 env 비율
-        log["Diag / obs_sanitized"] = self._diag_obs_sanitized    # [nan-guard] 위생 처리된 관측 원소 비율 (0 이어야 정상)
         log["Diag / episode_len_mean"] = self.episode_length_buf.float().mean()
         log["Diag / rsi_start_mean"] = self._episode_start_frame.float().mean()
         if self.cfg.contact_vel_gate:                                  # [contact-vel-gate]
@@ -3108,8 +2906,19 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # RAW action magnitude — action_rate no longer sees it, so this is now the ONLY window on a
         # mean random-walk (the failure mode that killed the 2026-07-28 09:32 run: |z_res| reached the
         # ±20 clip on 25% of samples while the bounded terms stayed flat).
-        log["Diag / zres_absmax"] = self._cur_policy_action[:, :self.cfg.sonic_action_dim].abs().max()
-        log["Diag / hand_absmax"] = self._cur_policy_action[:, self.cfg.sonic_action_dim:].abs().max()
+        # [hand-pretrain] 액션 블록이 z_res+손 이 아니라 손별 27(손목 9 + 손가락 18)입니다.
+        # 손목 오프셋과 손가락 액션의 포화, 그리고 실제로 걸리는 손목 힘/토크를 봅니다.
+        _a = self._cur_policy_action
+        # [wrist6] 손별 폭이 모드에 따라 다르다 (wrench 27, joint6 24).
+        _w, _ph = self._ACT_W, self._ACT_PH
+        _wr = torch.cat([_a[:, 0:_w], _a[:, _ph:_ph + _w]], dim=-1)            # 손목 (18 or 12)
+        _fg = torch.cat([_a[:, _w:_ph], _a[:, _ph + _w:2 * _ph]], dim=-1)      # 손가락 36
+        log["Diag / wrist_absmax"] = _wr.abs().max()
+        log["Diag / hand_absmax"] = _fg.abs().max()
+        log["Diag / wrist_force_N"] = torch.stack(
+            [f.norm(dim=-1).mean() for f in self._wrist_force]).mean()
+        log["Diag / wrist_torque_Nm"] = torch.stack(
+            [t.norm(dim=-1).mean() for t in self._wrist_torque]).mean()
         # per-frame-bucketed tracking error — disambiguates reward-balance from curriculum-mix:
         # if per-bucket error stays flat/falls while the GLOBAL mean rises, the rise is a
         # frame-distribution shift (harder later frames entered the mix), not per-frame regression.
@@ -3195,36 +3004,16 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # Force-reset any env whose root/joint state is non-finite so the poison cannot spread. (`inf`
         # states are already caught by the `>` gates; this specifically closes the NaN leak.) This runs
         # AFTER the termination toggle so a NaN env is reset even during no-termination rollouts.
-        rd = self.robot.data
-        nonfinite = (
-            ~torch.isfinite(rd.root_pos_w).all(-1)
-            | ~torch.isfinite(rd.root_quat_w).all(-1)
-            | ~torch.isfinite(rd.joint_pos).all(-1)
-            | ~torch.isfinite(rd.joint_vel).all(-1)
-        )
-        # ── [ROLLBACK MARKER: nan-guard] ─────────────────────────────────────────────────────
-        # (L2) 물체 상태 유한성. 관측 블록 C 가 물체 pose/속도를 그대로 싣는데(_get_observations),
-        # 위 게이트는 로봇만 본다. 물체가 NaN 이 되면 term_obj_pos_err 같은 `>` 비교는 NaN 에 대해
-        # 전부 False 라 어떤 종료 조건에도 안 걸리고, 그대로 관측으로 흘러 스케일러를 영구히 죽인다.
-        if self._has_object and bool(getattr(c, "nan_guard_object", True)):
-            _od = self._object.data
+        # [hand-pretrain] 두 손 모두 검사합니다 — 오른손이 NaN 이 되어도 리셋되도록.
+        nonfinite = torch.zeros_like(d)
+        for _hh in self._hands:
+            rd = _hh.data
             nonfinite = nonfinite | (
-                ~torch.isfinite(_od.root_pos_w).all(-1)
-                | ~torch.isfinite(_od.root_quat_w).all(-1)
-                | ~torch.isfinite(_od.root_lin_vel_w).all(-1)
-                | ~torch.isfinite(_od.root_ang_vel_w).all(-1)
+                ~torch.isfinite(rd.root_pos_w).all(-1)
+                | ~torch.isfinite(rd.root_quat_w).all(-1)
+                | ~torch.isfinite(rd.joint_pos).all(-1)
+                | ~torch.isfinite(rd.joint_vel).all(-1)
             )
-        # (L1) 관절 속도 폭주 게이트. 근원은 손가락 J0 다 — 액추에이터가 없고 고정 텐던
-        # (limit_stiffness 30, damping 0.2)만 걸려 있어 파지 임펄스를 흡수하지 못한다. 실측:
-        # 512env × 240스텝 무작위 액션에서 |q̇| 최대 7335 rad/s, 100 rad/s 초과가 103 env-스텝.
-        # 드라이브 속도 한계는 몸 20~37, 손가락 15 rad/s 라 100 이상은 정상 범위가 아니다.
-        # 이 값이 vel_obs_scale(0.2) 배로 관측에 실려 스케일러 분산을 부풀리는 것이 오염의 출발점이다.
-        _vth = float(getattr(c, "nan_guard_joint_vel", 0.0))
-        if _vth > 0.0:
-            _blow = rd.joint_vel.abs().max(-1).values > _vth
-            self._diag_blowup_frac = _blow.float().mean()
-            nonfinite = nonfinite | _blow
-        # ── [/ROLLBACK MARKER: nan-guard] ──
         return d | nonfinite
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3380,7 +3169,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             return
         # 손 블록(한 손 20개)의 Shadow 바디 이름 = _ref_kpts 손 블록 순서
         _hb = [b for spec in HAND_CHAIN.values() for b in spec["shadow"]]          # 20
-        _nb = len(BODY_KPTS)                                                      # 14
+        _nb = 0          # [hand-pretrain] _ref_kpts 에 몸통 블록이 없습니다
         idx: list[int] = []
         for i, full in enumerate(LINK_CONTACT_NAMES):
             side, body = full.split("_")[1], full.split("_", 2)[2]
@@ -3399,151 +3188,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         print(f"[link-kpt-smpl] SMPL 대응 {_n}/{L} 링크 "
               f"(제외: {[n.split('_',2)[2] for i, n in enumerate(LINK_CONTACT_NAMES) if not self._link_kpt_has_ref[i]]})")
         print(f"[link-kpt-objframe] 레퍼런스 링크 위치를 물체 기준으로 계산: {F} 프레임 x {L} 링크")
-
-    # ── [ROLLBACK MARKER: stage1-hand] 1단계 롤아웃 → 손 보상 목표 교체 + 잔차 손 액션 기준 (2026-09-09) ──
-    def _setup_stage1_hand(self) -> None:
-        """_load_stage1_hand 의 numpy 를 써서 (1) hand_kpt_from_stage1 이면 손·손목 보상 목표를 롤아웃 FK 로
-        교체하고 (2) sonic_hand_residual 이면 잔차 기준 _hand_res_base (F,36) 와 EMA 상태를 만듭니다."""
-        c, dev = self.cfg, self.device
-        S = getattr(self, "_np_s1", None)
-        hsl = self._group_slices["hands"]
-        if S is not None and bool(getattr(c, "hand_kpt_from_stage1", False)):
-            self._apply_stage1_hand_kpts(S)
-        if not bool(getattr(c, "sonic_hand_residual", False)):
-            return
-        assert not bool(getattr(c, "sonic_hand_delta", False)), \
-            "[stage1-hand] sonic_hand_residual 과 sonic_hand_delta 는 동시에 켤 수 없습니다"
-        src = str(getattr(c, "sonic_hand_residual_base", "reference"))
-        if src.startswith("stage1") and S is not None:
-            key = "finger_qpos" if src == "stage1_qpos" else "finger_target"
-            act_hand_names = [self.robot.joint_names[i] for i in self._action_joint_ids_t[hsl].tolist()]
-            perm = [S["base_names"].index(n) for n in act_hand_names]     # 이름으로 재배열 (없으면 ValueError)
-            base = torch.from_numpy(np.ascontiguousarray(S[key][:, perm])).to(dev)          # (F,36)
-            what = f"1단계 롤아웃 {key}"
-        else:
-            if src != "reference":
-                print(f"[stage1-hand] 잔차 기준 '{src}' 을 쓸 1단계 파일이 없어 레퍼런스(_ref_joints)로 대체합니다.")
-            if self._ref_joints is None:
-                raise RuntimeError("[stage1-hand] sonic_hand_residual 에는 기준이 필요합니다 — 리타게팅(_ref_joints)도 없습니다.")
-            base = self._ref_joints[:, hsl].clone()
-            what = "리타게팅 레퍼런스 _ref_joints"
-        # 기준을 한계 안으로 — 마진(상한-기준, 기준-하한)이 음수가 되지 않게
-        self._hand_res_base = torch.clamp(base, self._ctrl_lower[hsl], self._ctrl_upper[hsl])
-        self._hand_res_ema = torch.zeros(self.num_envs, int(hsl.stop - hsl.start), device=dev)
-        print(f"[stage1-hand] 잔차 손 액션 ON: 기준 = {what} (F={base.shape[0]}, 한계 클램프 최대 "
-              f"{(base - self._hand_res_base).abs().max().item():.3f} rad), EMA α = {self._group_alpha['hands']:.2f} "
-              f"(정규화 잔차 전용), 마진 매핑")
-
-    def _apply_stage1_hand_kpts(self, S: dict) -> None:
-        """_ref_kpts 손 블록 42 + 손목 2, _ref_ft_pad 10, _ref_palm_quat 을 1단계 롤아웃 FK 로 교체합니다.
-        로봇을 프레임마다 리타게팅 자세로 세우되 손 관절만 롤아웃 값으로 바꾸고(_apply_body_kpt_fk 와 같은
-        방식, 물리 진행 없음), 각 링크를 손바닥(robot0_{l,r}_palm) 기준으로 읽어 롤아웃 손바닥 자세에 다시
-        붙입니다 — 팔 자세가 무엇이든 결과는 같습니다."""
-        F, E, dev, c = self._ref_len, self.num_envs, self.device, self.cfg
-        nb, nh = N_BODY_KPTS, N_HAND_KPTS_PER_HAND
-        org = self.scene.env_origins
-        aid = self._action_joint_ids_t
-        jn = self.robot.joint_names
-        # 롤아웃 손 관절 → 이 로봇 관절 인덱스 (이름). 롤아웃 값이 한계를 살짝 넘는 경우가 있어 클램프.
-        s1_jid = torch.tensor([jn.index(n) for n in S["hand_q_names"]], device=dev, dtype=torch.long)
-        lim = self.robot.data.soft_joint_pos_limits[0, s1_jid]                                # (44,2)
-        s1_q = torch.clamp(torch.from_numpy(S["hand_q"]).to(dev), lim[:, 0], lim[:, 1])        # (F,44)
-        pp_s1 = torch.from_numpy(S["palm_pos"]).to(dev)                                       # (F,2,3) 보정 후
-        pq_s1 = _canon(torch.from_numpy(S["palm_quat"]).to(dev))                              # (F,2,4)
-        pp_raw = torch.from_numpy(S["palm_pos_raw"]).to(dev)                                  # 보정 전 (정합 검사)
-        pq_raw = _canon(torch.from_numpy(S["palm_quat_raw"]).to(dev))
-        hand_ids, hand_off = self._kpt_body_ids[nb:], self._kpt_offsets[nb:]                  # (42,), (42,3)
-        side_h = torch.tensor([0] * nh + [1] * nh, device=dev, dtype=torch.long)              # 손 블록 = 왼손 21, 오른손 21
-        side_ft = torch.tensor([0 if "_l_" in n else 1 for n in c.fingertip_body_names], device=dev, dtype=torch.long)
-        wr_names = [list(BODY_KPTS.values())[i] for i in self._wrist_kpt_idx.tolist()]
-        wrist_ids = self._kpt_body_ids[self._wrist_kpt_idx]
-        side_w = torch.tensor([0 if "left" in n else 1 for n in wr_names], device=dev, dtype=torch.long)
-        zero_off = torch.zeros(len(wr_names), 3, device=dev)
-        keep_q = self.robot.data.joint_pos.clone()
-        keep_r = self.robot.data.root_state_w[:, :7].clone()
-        out_h = torch.zeros(F, hand_ids.numel(), 3, device=dev)
-        out_ft = torch.zeros(F, self._ft_body_ids.numel(), 3, device=dev)
-        out_w = torch.zeros(F, wrist_ids.numel(), 3, device=dev)
-        chk_ft = torch.zeros_like(out_ft)
-        for base in range(0, F, E):
-            fr = (base + torch.arange(E, device=dev)).clamp(max=F - 1)
-            rp = torch.zeros(E, 7, device=dev)
-            rp[:, :3] = self._ref_root_pos[fr] + org
-            rp[:, 3:7] = self._ref_root_quat[fr]
-            jp = self.robot.data.default_joint_pos.clone()
-            if self._ref_joints is not None:
-                jp[:, aid] = self._ref_joints[fr]
-            jp[:, s1_jid] = s1_q[fr]
-            self.robot.write_root_pose_to_sim(rp)
-            self.robot.write_root_velocity_to_sim(torch.zeros(E, 6, device=dev))   # 속도 0 — _apply_body_kpt_fk 주석
-            self.robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
-            self.scene.write_data_to_sim()
-            self.sim.step(render=False)
-            self.scene.update(dt=self.physics_dt)
-            bp, bq = self.robot.data.body_pos_w, self.robot.data.body_quat_w
-            pp, pq = bp[:, self._palm_body_ids], bq[:, self._palm_body_ids]                  # (E,2,3/4) 이 FK 의 손바닥
-
-            def _anchor(ids, off, side, a_p, a_q):
-                # 링크 → 손바닥 기준 상대 자세 → 롤아웃 손바닥 (a_p, a_q) 에 다시 붙임 → 키포인트 오프셋
-                p, q = bp[:, ids], bq[:, ids]                                                 # (E,K,3/4) world
-                pp_k, pq_k = pp[:, side], pq[:, side]
-                rel_p = math_utils.quat_apply(math_utils.quat_conjugate(pq_k), p - pp_k)
-                rel_q = math_utils.quat_mul(math_utils.quat_conjugate(pq_k), q)
-                ap, aq = a_p[fr][:, side], a_q[fr][:, side]                                   # (E,K,3/4) env-local
-                pw = ap + math_utils.quat_apply(aq, rel_p)
-                return pw + math_utils.quat_apply(math_utils.quat_mul(aq, rel_q),
-                                                  off.unsqueeze(0).expand(E, -1, -1))
-
-            n = min(E, F - base)
-            out_h[base:base + n] = _anchor(hand_ids, hand_off, side_h, pp_s1, pq_s1)[:n]
-            out_ft[base:base + n] = _anchor(self._ft_body_ids, self._ft_offsets, side_ft, pp_s1, pq_s1)[:n]
-            out_w[base:base + n] = _anchor(wrist_ids, zero_off, side_w, pp_s1, pq_s1)[:n]
-            chk_ft[base:base + n] = _anchor(self._ft_body_ids, self._ft_offsets, side_ft, pp_raw, pq_raw)[:n]
-        # 로봇을 원래대로
-        self.robot.write_root_pose_to_sim(keep_r)
-        self.robot.write_root_velocity_to_sim(torch.zeros(E, 6, device=dev))
-        self.robot.write_joint_state_to_sim(keep_q, torch.zeros_like(keep_q))
-        self.scene.write_data_to_sim()
-        # 정합 검사: 보정 전 손바닥에 붙인 FK 손끝 vs 롤아웃이 기록한 손끝 (같은 USD 손이면 ~0 mm)
-        valid = torch.from_numpy(S["valid"]).to(dev) > 0.5
-        perm_ft = [S["ft_names"].index(n) for n in c.fingertip_body_names]
-        rec_ft = torch.from_numpy(np.ascontiguousarray(S["ft_pos"][:, perm_ft])).to(dev)
-        d_chk = ((chk_ft - rec_ft).norm(dim=-1)[valid] * 1000.0).flatten()
-        d_h = (out_h - self._ref_kpts[:, nb:]).norm(dim=-1)[valid] * 100.0
-        d_w = (out_w - self._ref_kpts[:, self._wrist_kpt_idx]).norm(dim=-1)[valid] * 100.0
-        d_ft = (out_ft - self._ref_ft_pad).norm(dim=-1)[valid] * 100.0
-        d_corr = (pp_s1 - pp_raw).norm(dim=-1)[valid] * 100.0
-        print(f"[stage1-hand] 손 보상 목표 교체: 손 키포인트 {hand_ids.numel()} + 손목 {wrist_ids.numel()} + 손끝 "
-              f"{out_ft.shape[1]} ({F} 프레임, 유효 {int(valid.sum())})\n"
-              f"    SMPL-X 대비 이동: 손 kpt 중앙 L {d_h[:, :nh].median().item():.1f} / R {d_h[:, nh:].median().item():.1f} cm "
-              f"(최대 {d_h.max().item():.1f}), 손목 중앙 {d_w.median().item():.1f} cm (최대 {d_w.max().item():.1f}), "
-              f"손끝 중앙 {d_ft.median().item():.1f} cm (최대 {d_ft.max().item():.1f})\n"
-              f"    물체 보정으로 옮긴 손바닥: 중앙 {d_corr.median().item():.2f} / 최대 {d_corr.max().item():.2f} cm\n"
-              f"    USD 정합 (FK 손끝 vs 롤아웃 기록 손끝): 중앙 {d_chk.median().item():.2f} / p95 "
-              f"{d_chk.kthvalue(max(1, int(0.95 * d_chk.numel()))).values.item():.2f} / 최대 {d_chk.max().item():.2f} mm")
-        self._ref_kpts[:, nb:] = out_h
-        self._ref_kpts[:, self._wrist_kpt_idx] = out_w
-        self._ref_ft_pad = out_ft
-        # ── [ROLLBACK MARKER: stage1-vertex] 접촉 프레임 손끝 목표(사람 접촉점, 물체 좌표) → 1단계 pad (1단계 물체 좌표).
-        #    rew_fingertip 과 손끝 관측이 접촉/비접촉 모두 "1단계 손 대비 물체" 하나를 보게 된다 — rew_hand_kpts 와
-        #    같은 손을 가리킨다. 물체 레퍼런스(_ref_obj_pos/quat)는 그대로. 손끝 외 링크 행은 건드리지 않는다.
-        if S.get("ft_obj_local") is not None and self._has_link_contact:
-            new_loc = torch.from_numpy(np.ascontiguousarray(S["ft_obj_local"][:, perm_ft])).to(dev)   # (F,10,3)
-            old_loc = self._ref_link_contact_target_local[:, self._ft_distal_idx]
-            m_c = (self._ref_link_contact_mask[:, self._ft_distal_idx] > 0.5) & valid.unsqueeze(1)    # (F,10) 사람 접촉 프레임
-            d_v = (new_loc - old_loc).norm(dim=-1)[m_c] * 100.0
-            self._ref_link_contact_target_local[:, self._ft_distal_idx] = new_loc
-            if d_v.numel() > 0:
-                print(f"[stage1-hand] 접촉 손끝 목표 교체: 사람 접촉점 → 1단계 pad (물체 좌표). 사람 접촉 프레임 {int(m_c.sum())}개에서 "
-                      f"중앙 {d_v.median().item():.1f} / p90 "
-                      f"{d_v.kthvalue(max(1, int(0.9 * d_v.numel()))).values.item():.1f} / 최대 {d_v.max().item():.1f} cm 이동")
-            else:
-                print("[stage1-hand] 접촉 손끝 목표 교체: 사람 접촉점 → 1단계 pad (물체 좌표). (사람 접촉 프레임 없음)")
-        # ── [/ROLLBACK MARKER: stage1-vertex] ──
-        self._ref_palm_quat = pq_s1.clone()
-        self._has_palm_ref = True
-        self._build_ref_link_kpt_local()      # 손 블록이 바뀌었으니 물체 기준 링크 목표도 다시 만듭니다
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
 
     # ------------------------------------------------------------------ reset
     def _reset_idx(self, env_ids) -> None:
@@ -3724,21 +3368,50 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             self._sonic_hist_init[env_ids] = True
             self._last_a_sonic[env_ids] = 0.0
             self._last_z_res[env_ids] = 0.0
-            self._cur_policy_action[env_ids] = 0.0        # prev-action obs AND action_rate = 0 at episode start
-            self._prev_policy_action[env_ids] = 0.0
-            self._cur_policy_action_bnd[env_ids] = 0.0    # (currently-unread A/B copy — kept in sync)
-            self._prev_policy_action_bnd[env_ids] = 0.0
+        # [hand-pretrain] 정책 액션 버퍼 초기화를 SONIC 가드 밖으로 꺼냈습니다.
+        # 이 네 버퍼는 손 env 에서도 (가드 밖에서) 할당되고 _prev_policy_action 은 관측 559차원
+        # 중 54차원을 차지하는데, 초기화가 가드 안에 있어 use_sonic=False 인 손 env 에서는
+        # 한 번도 실행되지 않았습니다 — 에피소드 첫 관측이 **이전 에피소드의 액션**을 들고
+        # 시작합니다. action_rate 보상도 그 값으로 계산됩니다.
+        # (IsaacLab discussions#2219 가 보고한 "학습은 되는데 play 에서 실패" 의 원인 유형과
+        #  같은 계열입니다 — 리셋 경로의 버퍼 갱신 누락이 리셋 빈도에 따라 다르게 드러남.)
+        self._cur_policy_action[env_ids] = 0.0        # prev-action obs AND action_rate = 0 at episode start
+        self._prev_policy_action[env_ids] = 0.0
+        self._cur_policy_action_bnd[env_ids] = 0.0    # (currently-unread A/B copy — kept in sync)
+        self._prev_policy_action_bnd[env_ids] = 0.0
 
         # ---- restore state (train cache hit → pretrain hit → reference+default) ----
         root_pose = torch.zeros(n, 7, device=dev); root_pose[:, 3] = 1.0
         root_vel = torch.zeros(n, 6, device=dev)
-        jpos = self.robot.data.default_joint_pos[env_ids].clone()
+        # ── [hand-pretrain] 리셋 버퍼를 36열(손당 18, 왼손→오른손)로 ─────────────────────────
+        # 부모는 단일 로봇의 전체 DOF 벡터를 만들어 한 번에 썼습니다. 여기서는 articulation 이
+        # 둘이라 '액션 관절 36개'만 담는 중립 버퍼를 만들고, 실제 쓰기 직전에 손별 DOF 벡터
+        # (22 = 구동 18 + 텐던 J0 4)로 흩뿌립니다. aid 는 이 36열 안의 위치가 됩니다.
+        _nA = 36
+        jpos = torch.zeros(len(env_ids), _nA, device=self.device)
         jvel = torch.zeros_like(jpos)
         org = self.scene.env_origins[env_ids]
+        aid = torch.arange(_nA, device=self.device)      # [hand-pretrain] 36열 내 위치
+        # 손목 루트는 articulation 이 둘이라 부모의 단일 root_pose/root_vel 로 표현할 수 없습니다.
+        # 손별 버퍼를 따로 두고, 세 리셋 경로가 각자 채운 뒤 맨 아래 쓰기 블록이 한 번에 씁니다.
+        # 기본값 = 리타게팅 손목 pose, 속도 0 (레퍼런스 경로의 동작 — 검증된 0.00 mm 일치).
+        wr_pose = torch.zeros(2, len(env_ids), 7, device=dev)
+        wr_vel = torch.zeros(2, len(env_ids), 6, device=dev)
+        # [wrist6] 관절 모드의 손목 상태. 위 두 버퍼는 외력 모드용(루트 pose/vel)이고 이건
+        # 관절값이다. 두 모드가 같은 리셋 경로를 공유하도록 버퍼만 하나 더 둔다.
+        wr_dof6 = (torch.zeros(2, len(env_ids), 6, device=dev) if self._w6 else None)
+        wr_dof6_vel = (torch.zeros(2, len(env_ids), 6, device=dev) if self._w6 else None)
+        # 텐던 축 J0 8열 (왼 4 -> 오른 4). 레퍼런스 경로는 _ref_j0 를, 캐시 경로는 캐시 값을
+        # 씁니다. _use_ref_j0 가 True 인 env 만 아래에서 레퍼런스 J0 로 덮습니다.
+        j0pos = torch.zeros(len(env_ids), 8, device=dev)
+        j0vel = torch.zeros(len(env_ids), 8, device=dev)
+        _use_ref_j0 = torch.ones(len(env_ids), dtype=torch.bool, device=dev)
 
         # 3-way source selection per env (train cache > pretrain cache > reference+default),
         # vectorized via boolean masks + 2D advanced-index gathers (no per-env python loop).
-        aid = self._action_joint_ids_t                               # (65,) action-joint columns
+        # [hand-pretrain] aid 는 위에서 36열 버퍼 내 위치로 정의했습니다. 부모의 재정의
+        # (self._action_joint_ids_t = 왼손 18개) 를 제거합니다 — 그대로 두면 36열 대입이
+        # 18열 인덱스에 브로드캐스트되며 터집니다.
         train_hit = ~self._init_flg[rstart]                          # (n,) [backward-dir]
         if self._pretrain_cache is not None:
             pretrain_hit = ~self._pretrain_init_flg[rstart]          # [backward-dir]
@@ -3767,7 +3440,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         where_pre = (~train_hit) & pretrain_hit
         where_ref = (~train_hit) & (~pretrain_hit)
 
-        if where_train.any():                                        # train cache: 222-D layout
+        if where_train.any():                                        # [hand-pretrain] 176 레이아웃
             idx = where_train.nonzero(as_tuple=True)[0]
             # [backward-dir] 캐시는 원본 프레임으로 색인되고 정방향 규약(속도 부호)으로 저장돼
             # 있습니다. train_hit도 rstart로 판정하므로 여기서도 rstart를 써야 합니다 — start를
@@ -3776,19 +3449,45 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             s = self._state_cache[rstart[idx]]
             if self._any_backward:
                 s = self._flip_cache_vel(s, dir_sign_n[idx])
-            root_pose[idx, :3] = s[:, 1:4] + org[idx]; root_pose[idx, 3:7] = s[:, 4:8]
-            root_vel[idx, :3] = s[:, 8:11]; root_vel[idx, 3:6] = s[:, 11:14]
-            jpos[idx.unsqueeze(1), aid.unsqueeze(0)] = s[:, 27:92]
-            jvel[idx.unsqueeze(1), aid.unsqueeze(0)] = s[:, 92:157]
-            self._smoothed_actions[env_ids[idx]] = s[:, 157:222]
-        if where_pre.any():                                          # pretrain cache: 209-D layout
-            idx = where_pre.nonzero(as_tuple=True)[0]
-            s = self._pretrain_cache[rstart[idx]]                    # [backward-dir]
-            root_pose[idx, :3] = s[:, 1:4] + org[idx]; root_pose[idx, 3:7] = s[:, 4:8]
-            root_vel[idx, :3] = s[:, 8:11]; root_vel[idx, 3:6] = s[:, 11:14]
-            jpos[idx.unsqueeze(1), aid.unsqueeze(0)] = s[:, 14:79]
-            jvel[idx.unsqueeze(1), aid.unsqueeze(0)] = s[:, 79:144]
-            self._smoothed_actions[env_ids[idx]] = s[:, 144:209]
+            L = self._CL
+            for _h in range(2):
+                _a, _b = L["wristL"] if _h == 0 else L["wristR"]
+                if self._w6:
+                    # [wrist6] 관절값을 그대로. env-local 오프셋을 더하지 않는다 — anchor 가
+                    # env 원점에 있고 관절값은 그 기준이다. 속도도 캐시에서 복원한다.
+                    wr_dof6[_h, idx] = s[:, _a:_a + 6]
+                    wr_dof6_vel[_h, idx] = s[:, _a + 6:_b]
+                else:
+                    wr_pose[_h, idx, :3] = s[:, _a:_a + 3] + org[idx]
+                    wr_pose[_h, idx, 3:7] = s[:, _a + 3:_a + 7]
+                    wr_vel[_h, idx, :3] = s[:, _a + 7:_a + 10]
+                    wr_vel[_h, idx, 3:6] = s[:, _a + 10:_b]
+            jpos[idx.unsqueeze(1), aid.unsqueeze(0)] = s[:, L["jpos"][0]:L["jpos"][1]]
+            jvel[idx.unsqueeze(1), aid.unsqueeze(0)] = s[:, L["jvel"][0]:L["jvel"][1]]
+            j0pos[idx] = s[:, L["j0pos"][0]:L["j0pos"][1]]
+            j0vel[idx] = s[:, L["j0vel"][0]:L["j0vel"][1]]
+            _use_ref_j0[idx] = False              # 캐시된 J1 과 짝이 맞는 J0 를 그대로 씁니다
+            _sm = s[:, L["smoothed"][0]:L["smoothed"][1]]
+            if self.cfg.residual_action:
+                self._hand_target_ema[env_ids[idx]] = _sm                  # 관절 단위
+                self._smoothed_actions[env_ids[idx]] = self._unscale(_sm)  # 정규화 사본도 맞춘다
+            else:
+                self._smoothed_actions[env_ids[idx]] = _sm
+            _ca, _cb = L["ctrl"]
+            if self._w6:
+                self._wrist6_target[0][env_ids[idx]] = s[:, _ca:_ca + 6]
+                self._wrist6_target[1][env_ids[idx]] = s[:, _ca + 6:_cb]
+            else:
+                for _h in range(2):               # 손목 임피던스 이동평균 상태도 복원
+                    self._wrist_force[_h][env_ids[idx]] = s[:, _ca + 3 * _h:_ca + 3 + 3 * _h]
+                    self._wrist_torque[_h][env_ids[idx]] = s[:, _ca + 6 + 3 * _h:_ca + 9 + 3 * _h]
+        # [hand-pretrain] pretrain 캐시(209 전신 레이아웃)는 이 env 에서 지원하지 않습니다.
+        # set_pretrain_cache() 가 거부하므로 _pretrain_init_flg 는 항상 None 이고 where_pre 는
+        # 전부 False 입니다. 조용히 틀린 값을 읽는 대신 즉시 터지게 둡니다.
+        assert not bool(where_pre.any()), \
+            "손 전용 env 는 pretrain 캐시(209 전신 레이아웃)를 복원할 수 없습니다"
+        if False:                                                    # 도달 불가 (위 assert)
+            pass
         if where_ref.any():                                          # reference root + default/retargeted joints
             idx = where_ref.nonzero(as_tuple=True)[0]
             # [backward-dir] start는 에피소드 프레임. 레퍼런스는 원본 프레임으로 읽고, 속도는
@@ -3810,6 +3509,24 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
                     self._ref_joint_vel[fr] * _sg * self._ref_jvel_scale,
                     -self._ref_jvel_clip, self._ref_jvel_clip)          # (1,65) 성분별 상한, 브로드캐스트
             self._smoothed_actions[env_ids[idx]] = self._unscale(jpos[idx][:, aid])
+            # [residual] 손가락 목표 EMA 를 리셋 자세로 씨딩한다. 0 에서 시작하면 초기 몇 스텝이
+            # 관절 원점에서 램프업하며 레퍼런스와 크게 벌어진다 (EMA 시간상수 = 1/alpha 스텝).
+            self._hand_target_ema[env_ids[idx]] = jpos[idx][:, aid]
+            # [hand-pretrain] 손목은 리타게팅 pose, 속도 0. 손목 임피던스 이동평균도 0 으로
+            # (에피소드 시작이므로 컨트롤러 상태가 없습니다).
+            for _h in range(2):
+                wr_pose[_h, idx, :3] = self._ref_wrist_pose[_h, fr, :3] + org[idx]
+                wr_pose[_h, idx, 3:7] = self._ref_wrist_pose[_h, fr, 3:7]
+                wr_vel[_h, idx] = 0.0
+                if self._w6:
+                    # [wrist6] 루트가 용접돼 있으므로 손목 상태는 **관절값**으로 복원한다.
+                    # env-local 오프셋(org)을 더하지 않는다 — anchor 가 env 원점에 박히고
+                    # (tx,ty,tz) 는 그 anchor 기준이므로 레퍼런스 값이 그대로 관절값이다.
+                    wr_dof6[_h, idx] = self._ref_wrist_dof6[_h, fr]
+                    # 목표 EMA 도 레퍼런스로 씨딩 (아래 손별 쓰기에서 _wrist6_target 에 대입)
+                else:
+                    self._wrist_force[_h][env_ids[idx]] = 0.0
+                    self._wrist_torque[_h][env_ids[idx]] = 0.0
 
         self._last_pretrain_fallback_ratio = float(where_pre.sum().item()) / max(1, n)
 
@@ -3818,34 +3535,96 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 요구하므로 그대로 두면 리셋마다 최대 1.14 rad 위반으로 시작해 말단이 1.7 m/s 로 튑니다.
         # 속도도 같은 비율로 맞춥니다 — 위치만 맞추고 속도를 0 으로 두면 텐던이 다시 속도를 만듭니다.
         # 캐시 경로도 포함해야 합니다: 캐시는 65열만 저장하므로 J0 는 어느 경로에서도 복원되지 않습니다.
-        if c.tendon_reset_couple and self._tendon_j0_ids.numel() > 0:
-            # [ROLLBACK MARKER: ref-j0] 리타게팅이 J0 를 풀었으면 그 값을 씁니다. 다만 캐시 경로의
-            # J1 은 레퍼런스와 다르므로 (레퍼런스 J0 > 실제 J1) 이 되어 제약을 깰 수 있습니다 —
-            # min() 으로 잘라 q_J0 <= q_J1 을 항상 만족시킵니다. 65열 npz 면 _ref_j0 가 None 이라
-            # 기존 J1 x gear 경로가 그대로 돕니다.
-            if getattr(self, "_ref_j0", None) is not None:
-                # rstart = 전체 리셋 env 의 원본 프레임 (n,). fr 은 레퍼런스 경로 env 부분집합만
-                # 담는 조건부 변수라 여기서 쓰면 모양이 안 맞습니다.
-                jpos[:, self._ref_j0_ids] = torch.minimum(
-                    self._ref_j0[rstart], jpos[:, self._tendon_j1_ids])
-            else:
-                jpos[:, self._tendon_j0_ids] = jpos[:, self._tendon_j1_ids] * self._tendon_gear
-            if getattr(self, "_ref_j0_vel", None) is not None:
-                # 손 클립을 그대로 씁니다 (J0 는 손가락 관절). 부호는 역방향 에피소드 규약(_sg).
-                jvel[:, self._ref_j0_ids] = torch.clamp(
-                    self._ref_j0_vel[rstart] * dir_sign_n * self._ref_jvel_scale,   # dir_sign_n 은 (n,1)
-                    -float(c.ref_reset_joint_vel_clip_hands), float(c.ref_reset_joint_vel_clip_hands))
-            else:
-                jvel[:, self._tendon_j0_ids] = jvel[:, self._tendon_j1_ids] * self._tendon_gear
+        # [hand-pretrain] 일반 텐던-리셋 블록은 제거했습니다. _tendon_j{0,1}_ids 는 한 손
+        # articulation(22 DOF) 기준 인덱스라 36열 버퍼에 쓸 수 없고, J0 는 바로 아래 손별
+        # 쓰기 블록이 _ref_j0 / _ref_j0_vel 에서 직접 채웁니다(동일한 목적, 올바른 폭).
 
-        self.robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
-        self.robot.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
-        self.robot.write_joint_state_to_sim(jpos, jvel, env_ids=env_ids)
-        # [ankle-acc] 리셋 불연속은 Isaac Lab 이 처리한다 — write_joint_velocity_to_sim 이
-        # _previous_joint_vel 을 새 속도로 맞추고 joint_acc 를 0 으로 만든다. 별도 씨딩 불필요.
+        # ── [hand-pretrain] 손별 쓰기 ──────────────────────────────────────────────────────
+        # 루트: 골반이 아니라 손목입니다. 값은 위에서 경로별로 채워둔 wr_pose / wr_vel 에서
+        # 옵니다 — 캐시 히트면 실제로 방문했던 손목 상태, 레퍼런스 경로면 리타게팅 손목 pose
+        # (속도 0). RSI 는 출발점만 제공하고 이후에는 앵커가 없습니다.
+        # 관절: 36열 버퍼를 손별 18개로 흩뿌리고, 텐던 축 J0 4개는 경로에 따라 다릅니다 —
+        # 레퍼런스면 _ref_j0(리타게팅 부등식 해), 캐시면 캐시에 담긴 J0. 캐시 히트에서 레퍼런스
+        # J0 를 쓰면 캐시된 J1 과 다른 프레임의 J0 가 섞여 텐던 제약이 깨집니다.
+        _fr_reset = rstart                                     # (n,) 각 env 의 시작 프레임
+        for _h, _sd in enumerate("lr"):
+            _hand = self._hands[_h]
+            if self._w6:
+                # [wrist6] anchor 를 env 원점에 **명시적으로** 쓴다. 두 가지 이유:
+                #   (1) 정합성. 관절 6개는 anchor 기준 상대 자세이므로, (tx,ty,tz) 가 env-local
+                #       좌표를 뜻하려면 anchor 가 env 원점에 있어야 한다.
+                #   (2) _spawn_declear 가 물체 스폰 높이를 푸는 동안 로봇을 +5 m 로 park 하는데
+                #       (park[:, :3] = org + [0,0,5]), 외력 모드는 리셋이 루트 pose 를 다시 써서
+                #       돌아온다. 관절 모드가 루트 쓰기를 건너뛰면 영구히 5 m 위에 남는다 —
+                #       실측: 20스텝 후 palm 오차가 정확히 5000.00 mm 였고 매 스텝 종료됐다.
+                _anchor = torch.zeros(len(env_ids), 7, device=dev)
+                _anchor[:, :3] = self.scene.env_origins[env_ids]
+                _anchor[:, 3] = 1.0
+                _hand.write_root_pose_to_sim(_anchor, env_ids=env_ids)
+                _hand.write_root_velocity_to_sim(
+                    torch.zeros(len(env_ids), 6, device=dev), env_ids=env_ids)
+            else:
+                _hand.write_root_pose_to_sim(wr_pose[_h], env_ids=env_ids)
+                _hand.write_root_velocity_to_sim(wr_vel[_h], env_ids=env_ids)
+            _jp = _hand.data.default_joint_pos[env_ids].clone()          # (n,22) / joint6: (n,28)
+            _jv = torch.zeros_like(_jp)
+            if self._w6:
+                _w6id = getattr(self, f"_wrist6_joint_ids_{_sd}")
+                _jp[:, _w6id] = wr_dof6[_h]
+                # 속도: 레퍼런스 경로는 0(에피소드 시작), 캐시 경로는 담아둔 값. 아래 _jv 에
+                # 실어 write_joint_state_to_sim 이 한 번에 쓰게 한다 — 위치만 맞추고 속도를
+                # 0 으로 두면 캐시 복원이 실제로 방문했던 상태와 달라진다.
+                _jv[:, _w6id] = wr_dof6_vel[_h]
+                self._wrist6_target[_h][env_ids] = wr_dof6[_h]
+                # [ROLLBACK MARKER: w6gain] 잔차 EMA 상태. 레퍼런스 리셋은 0, 캐시 히트는 (복원된
+                # 관절값 − 그 프레임의 레퍼런스) — 위 줄이 목표를 관절값으로 두는 것과 같은 뜻이다.
+                self._wrist6_res_ema[_h][env_ids] = wr_dof6[_h] - self._ref_wrist_dof6[_h, _fr_reset]
+                # [/ROLLBACK MARKER: w6gain]
+            _sl = slice(0, 18) if _h == 0 else slice(18, 36)
+            _fid = getattr(self, f"_finger_joint_ids_{_sd}")
+            _jp[:, _fid] = jpos[:, _sl]
+            _jv[:, _fid] = jvel[:, _sl]
+            if isinstance(getattr(self, "_ref_j0_ids", None), dict):
+                _j0sl = slice(0, 4) if _h == 0 else slice(4, 8)
+                _j0id = self._ref_j0_ids[_sd]
+                _j1id = self._tendon_j1_ids[_sd]
+                # 캐시 경로: 담아둔 J0 그대로. 이미 물리로 정착된 상태라 제약을 만족합니다.
+                _q0 = j0pos[:, _j0sl].clone()
+                _v0 = j0vel[:, _j0sl].clone()
+                # 레퍼런스 경로: 리타게팅이 푼 J0. Shadow 문서의 q_J0 <= q_J1 을 min() 으로
+                # 보장합니다 (제약 위반 상태로 리셋하면 말단이 1.7 m/s 로 튑니다 — 실측).
+                if getattr(self, "_ref_j0", None) is not None:
+                    _r0 = torch.minimum(self._ref_j0[_fr_reset][:, _j0sl], _jp[:, _j1id])
+                    _rv = torch.zeros_like(_v0)
+                    if getattr(self, "_ref_j0_vel", None) is not None:
+                        _rv = torch.clamp(
+                            self._ref_j0_vel[_fr_reset][:, _j0sl] * dir_sign_n * self._ref_jvel_scale,
+                            -float(c.ref_reset_joint_vel_clip_hands),
+                            float(c.ref_reset_joint_vel_clip_hands))
+                    _m = _use_ref_j0.unsqueeze(-1)                       # (n,1)
+                    _q0 = torch.where(_m, _r0, _q0)
+                    _v0 = torch.where(_m, _rv, _v0)
+                _jp[:, _j0id] = _q0
+                _jv[:, _j0id] = _v0
+            _hand.write_joint_state_to_sim(_jp, _jv, env_ids=env_ids)
+
+        # [ROLLBACK MARKER: fres] 손가락 잔차 EMA 상태를 (복원된 목표 − 그 프레임의 레퍼런스) 의
+        # 역매핑으로 씨딩한다. 레퍼런스 리셋은 목표 = 리셋 자세 = 레퍼런스라 0, 캐시 히트는 담아둔
+        # 목표(_hand_target_ema, 관절 단위)를 정규화 잔차로 되돌린다 — 손목 _wrist6_res_ema 와 같은 뜻.
+        if self._fing_ema_res and self._ref_joints is not None:
+            _r36 = self._ref_joints[_fr_reset]                                  # (n,36)
+            _d36 = self._hand_target_ema[env_ids] - _r36
+            if self._fing_margin:
+                _res0 = torch.where(_d36 >= 0,
+                                    _d36 / (self._ctrl_upper - _r36).clamp_min(1e-6),
+                                    _d36 / (_r36 - self._ctrl_lower).clamp_min(1e-6))
+            else:
+                _res0 = _d36 / self._residual_scale_t
+            self._hand_res_ema[env_ids] = _res0.clamp_(-1.0, 1.0)
+        # [/ROLLBACK MARKER: fres]
 
         # object restore if present: reference pose on pretrain/reference resets; on an RSI
-        # TRAIN-cache hit restore the object FROM the cache too (blocks [14:27]) so the drifted
+        # TRAIN-cache hit restore the object FROM the cache too (_CL["obj"] block) so the drifted
         # cached robot and the object stay a physically-consistent pair (a reference object paired
         # with a mid-manip cached robot could trip term_obj_pos_err/term_ft_err at start+1).
         if self._has_object:
@@ -3872,18 +3651,26 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             ovel[:, 3:6] = self._ref_obj_angvel[rf0] * dir_sign_n
             if where_train.any():
                 # [backward-dir] 캐시는 원본 프레임 색인이고 정방향 규약으로 저장돼 있습니다.
-                sc = self._state_cache[rstart]                       # (n,222)
+                sc = self._state_cache[rstart]                       # [hand-pretrain] (n,176)
                 if self._any_backward:
                     sc = self._flip_cache_vel(sc, dir_sign_n)
                 tw = where_train.unsqueeze(-1)
-                op[:, :3] = torch.where(tw, sc[:, 14:17] + org, ref_op)
-                op[:, 3:7] = torch.where(tw, sc[:, 17:21], ref_oq)
-                ovel = torch.where(tw, sc[:, 21:27], ovel)
+                # [ROLLBACK MARKER: cache-obj-layout] 물체 블록의 열 위치를 레이아웃(_CL["obj"])에서
+                # 읽는다. 외력 모드는 27:40 이지만 관절 모드(joint6)는 손목 블록이 13→12/손으로 줄어
+                # 25:38 이다. 27:40 을 그대로 쓰면 joint6 캐시 히트마다 물체가 캐시 행의
+                # (pos_z, q_w, q_x) 를 위치로, (q_y, q_z, v_x, v_y) 를 사원수로, 손가락 관절값을
+                # 각속도로 받아 원래 자리에서 1 m 이상 떨어진 곳에 뒤틀린 채 놓였다 — 관절 모드
+                # 학습에서 물체가 날아가고 시작 직후 종료되던 증상의 원인. 외력 모드 값은 그대로다.
+                _oa, _ob = self._CL["obj"]
+                op[:, :3] = torch.where(tw, sc[:, _oa:_oa + 3] + org, ref_op)
+                op[:, 3:7] = torch.where(tw, sc[:, _oa + 3:_oa + 7], ref_oq)
+                ovel = torch.where(tw, sc[:, _oa + 7:_ob], ovel)
+                # [/ROLLBACK MARKER: cache-obj-layout]
             self._object.write_root_pose_to_sim(op, env_ids=env_ids)
             self._object.write_root_velocity_to_sim(ovel, env_ids=env_ids)
 
         # seed delta integrators (all groups) to the actual reset pose; ema → 0
-        rj = jpos[:, self._action_joint_ids_t]
+        rj = jpos                                    # [hand-pretrain] jpos 가 이미 36열입니다
         for gname, sl in self._group_slices.items():
             self._delta_target[gname][env_ids] = rj[:, sl]
             self._delta_ema[gname][env_ids] = 0.0
@@ -3894,46 +3681,37 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             self._z_delta_ema[env_ids] = 0.0
             self._hand_delta_target[env_ids] = rj[:, self._sonic_hand_slice]
             self._hand_delta_ema[env_ids] = 0.0
-            if getattr(self.cfg, "sonic_hand_residual", False) and getattr(self, "_hand_res_base", None) is not None:
-                # [ROLLBACK MARKER: stage1-hand] 잔차 EMA 씨딩 = (복원된 손 PD 목표 − 그 프레임의 기준) 의 역매핑.
-                # 캐시 히트는 담아둔 목표(_smoothed_actions 손 블록 → 관절 단위)를 되살리고, 레퍼런스 리셋은
-                # 리셋 자세(리타게팅)에서 기준으로 EMA 가 몇 스텝에 걸쳐 이어집니다 — 1단계 env 의 fres 씨딩.
-                _hsl = self._sonic_hand_slice
-                _b = self._hand_res_base[rstart]                                                   # (n,36)
-                _d = self._scale(self._smoothed_actions[env_ids])[:, _hsl] - _b
-                _r0 = torch.where(_d >= 0, _d / (self._ctrl_upper[_hsl] - _b).clamp_min(1e-6),
-                                  _d / (_b - self._ctrl_lower[_hsl]).clamp_min(1e-6))
-                self._hand_res_ema[env_ids] = _r0.clamp(-1.0, 1.0)
-                # [/ROLLBACK MARKER: stage1-hand]
         self._prev_action[env_ids] = self._smoothed_actions[env_ids]
 
     # ── [ROLLBACK MARKER: failure-dump] ───────────────────────────────────────────────────────
     def _fd_record(self, state: torch.Tensor, reward: torch.Tensor) -> None:
         """제어 스텝마다 앞쪽 N개 환경의 한 행을 링 버퍼에 씁니다. `state`는 _save_state_cache 가
-        이미 만들어 둔 (E,222) 복원 상태라 다시 계산하지 않습니다."""
+        이미 만들어 둔 (E,_STATE_DIM) 복원 상태라 다시 계산하지 않습니다."""
         n, dev = self._fd_n, self.device
         row = torch.zeros(n, self._FD_DIM, device=dev)
-        row[:, 0:222] = state[:n]
+        _a0, _c0, _x0 = self._FD_A0, self._FD_C0, self._FD_X0
+        row[:, 0:_a0] = state[:n]
         _pa = getattr(self, "_cur_policy_action", None)
         if _pa is not None:
-            row[:, 222:222 + min(100, _pa.shape[1])] = _pa[:n, :100]
+            _w = min(self._FD_NA, _pa.shape[1])
+            row[:, _a0:_a0 + _w] = _pa[:n, :_w]
         try:
-            row[:, 322:322 + N_LINK_CONTACT] = self._link_contact_forces()[:n]
+            row[:, _c0:_c0 + N_LINK_CONTACT] = self._link_contact_forces()[:n]
         except Exception:
             pass
-        row[:, 354] = self._frame_idx[:n].float()                      # 레퍼런스 프레임
-        row[:, 355] = float(self._sampling_step_count)                 # 학습 스텝
-        row[:, 356] = self.episode_length_buf[:n].float()
-        row[:, 357] = self._episode_start_frame[:n].float()
-        row[:, 358] = 0.0                                              # 종료 원인 — 수확 때 채웁니다
-        row[:, 359] = torch.arange(n, device=dev, dtype=torch.float32)
+        row[:, _x0 + 0] = self._frame_idx[:n].float()                  # 레퍼런스 프레임
+        row[:, _x0 + 1] = float(self._sampling_step_count)             # 학습 스텝
+        row[:, _x0 + 2] = self.episode_length_buf[:n].float()
+        row[:, _x0 + 3] = self._episode_start_frame[:n].float()
+        row[:, _x0 + 4] = 0.0                                          # 종료 원인 — 수확 때 채웁니다
+        row[:, _x0 + 5] = torch.arange(n, device=dev, dtype=torch.float32)
         # [ROLLBACK MARKER: cws-diag] 실패 창 안에서 접촉 렌치가 어떻게 변하는지 보려면 프레임별로
         # 남겨야 합니다 (텐서보드 평균만으로는 사망 직전 궤적을 못 봅니다).
         if getattr(self, "_cws_per_env", None) is not None:
-            row[:, 360] = self._cws_per_env[:n]
-            row[:, 361] = self._cws_nhit[:n]
-            row[:, 362] = self._cws_cov[:n]
-            row[:, 363] = self._cws_def[:n]
+            row[:, _x0 + 6] = self._cws_per_env[:n]
+            row[:, _x0 + 7] = self._cws_nhit[:n]
+            row[:, _x0 + 8] = self._cws_cov[:n]
+            row[:, _x0 + 9] = self._cws_def[:n]
         self._fd_ring[:, self._fd_ptr % self._fd_w] = row
         self._fd_ptr += 1
         self._fd_filled = min(self._fd_filled + 1, self._fd_w)
@@ -3980,7 +3758,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # 링을 시간순으로 정렬해 꺼냅니다 (_fd_ptr 이 다음에 덮어쓸 자리 = 가장 오래된 칸)
         order = (torch.arange(self._fd_w, device=self.device) + self._fd_ptr) % self._fd_w
         win = self._fd_ring[ids][:, order].clone()                   # (m,W,360)
-        win[:, :, 358] = self._fd_cause_code()[ids].unsqueeze(1)     # 종료 원인
+        win[:, :, self._FD_X0 + 4] = self._fd_cause_code()[ids].unsqueeze(1)   # 종료 원인
         self._fd_buf.append(win.cpu().numpy())
         self._fd_saved += int(ids.numel())
         self._fd_bucket_taken += int(ids.numel())
@@ -4001,20 +3779,23 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         _np.savez_compressed(
             p, windows=arr,
             failure_count=self._failure_count.detach().cpu().numpy().astype(_np.float32),
-            joint_names=_np.array(self._action_joint_names),      # 27:92 / 92:157 열의 이름 순서
+            joint_names=_np.array(self._action_joint_names),      # 40:76 / 76:112 열의 이름 순서
             link_contact_names=_np.array(LINK_CONTACT_NAMES),     # 322:354 열의 이름 순서
             step=_np.int64(self._sampling_step_count), ref_len=_np.int64(self._ref_len),
             layout=_np.array([
-                "행 = (에피소드, 창스텝, 360). 창은 시간순(마지막 행 = 종료 직전 스텝).",
-                "0:222 cache_state ([0]=reward, [1:4]root_pos, [4:8]root_quat, [8:11]root_linvel,",
-                "      [11:14]root_angvel, [14:17]obj_pos, [17:21]obj_quat, [21:24]obj_linvel,",
-                "      [24:27]obj_angvel, [27:92]jpos(65), [92:157]jvel(65), [157:222]smoothed(65))",
-                "222:322 raw_action(100) | 322:354 link_contact_force(32, LINK_CONTACT_NAMES 순서)",
-                "354 ref_frame | 355 train_step | 356 ep_len | 357 start_frame | 358 term_bits | 359 env_id",
-                "360 cws_score(원점수, v보정 민감) | 361 cws_nhit | 362 cws_coverage(요구방향 충족비율) | 363 cws_deficit",
+                f"행 = (에피소드, 창스텝, {self._FD_DIM}). 창은 시간순(마지막 행 = 종료 직전 스텝).",
+                f"0:{self._FD_A0} cache_state — [0]reward [1:8]손목L_pose [8:14]손목L_vel",
+                "      [14:21]손목R_pose [21:27]손목R_vel [27:34]obj_pose [34:40]obj_vel",
+                "      [40:76]jpos(36) [76:112]jvel(36) [112:120]J0pos(8) [120:128]J0vel(8)",
+                "      [128:164]smoothed(36) [164:170]손목힘EMA [170:176]손목토크EMA",
+                f"{self._FD_A0}:{self._FD_C0} raw_action({self._FD_NA}, 손별 {self._ACT_PH})",
+                f"{self._FD_C0}:{self._FD_X0} link_contact_force(32, LINK_CONTACT_NAMES 순서)",
+                f"{self._FD_X0}+0 ref_frame +1 train_step +2 ep_len +3 start_frame "
+                "+4 term_bits +5 env_id",
+                "+6 cws_score(원점수, v보정 민감) +7 cws_nhit +8 cws_coverage +9 cws_deficit",
                 "term_bits: 1=obj_pos 2=obj_rot 4=wrist_pos 8=ft 16=root_pos 32=root_rot 64=body",
                 "주의: 링 버퍼라 에피소드가 창보다 짧으면 앞쪽 행은 이전 에피소드입니다.",
-                "      유효 행 = 마지막 min(ep_len, W) 개. ep_len = windows[i,-1,356].",
+                f"      유효 행 = 마지막 min(ep_len, W) 개. ep_len = windows[i,-1,{self._FD_X0 + 2}].",
             ]))
         print(f"[failure-dump] {p}  {arr.shape[0]} 에피소드  "
               f"{os.path.getsize(p)/1024**2:.1f} MB  (누적 {self._fd_saved})")
@@ -4032,7 +3813,11 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
 
     # -------------------------------------------------------- state cache write
     def _save_state_cache(self, reward: torch.Tensor) -> None:
-        """Store per-frame best (highest-reward) full-body state into the 222-D train cache.
+        # [hand-pretrain] use_state_cache=False 면 쓰지 않고, 리셋은 항상 레퍼런스 경로를 탑니다
+        # (모든 프레임이 리타게팅 손목 pose 에서 복원 가능하므로 캐시 없이도 RSI 는 돕니다).
+        if not getattr(self.cfg, "use_state_cache", True):
+            return
+        """Store per-frame best (highest-reward) hand state into the 176-D train cache.
 
         `reward` is the ACTUAL step reward, exactly as grasp (robotis_sh5_grasp_env.py:1666 passes
         its own `reward.clamp(min=0.0)`) and as TJ's original (gr_env.py:608 compares
@@ -4046,7 +3831,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         object-acceptable — but `enough_obj_threshold` is loose, so within that band it could not
         prefer the state whose object placement was actually better.
 
-        Vectorized: build the full (E,222) state once, then scatter the highest-reward env
+        Vectorized: build the full (E,176) state once, then scatter the highest-reward env
         into each UNIQUE frame it covers (loop is O(unique frames) << O(num_envs))."""
         if not hasattr(self, "_errs"):
             return
@@ -4062,6 +3847,36 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         gate = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         if self._pretrain_cache is not None:
             gate = self.episode_length_buf >= 3
+        # ── [hand-pretrain] 발산 상태 차단 ────────────────────────────────────────────────
+        # 떠 있는 손은 수치적으로 터질 수 있습니다 (실측: 캐시를 끈 순수 물리에서 무작위 액션
+        # 0.5 배율 + 종료 비활성으로 400스텝 굴렸을 때 200스텝에서 관절값이 2.03e16 에 도달).
+        # 종료 게이트가 켜져 있으면 그 전에 리셋되지만, 캐시는 스텝마다 쓰므로 발산한 행이 한 번
+        # 들어가면 그 프레임에서 리셋하는 모든 이후 에피소드가 쓰레기 상태에서 출발합니다.
+        # 캐시는 프레임당 "최고 보상 1행" 만 남기므로 한 번의 오염이 영구적입니다 — 그래서
+        # 품질 게이트(손끝/물체)와 별도로 유한성과 크기를 직접 검사합니다.
+        _fin = torch.ones_like(gate)
+        for _hh in self._hands:
+            _hd = _hh.data
+            _fin = _fin & (
+                torch.isfinite(_hd.root_pos_w).all(-1)
+                & torch.isfinite(_hd.root_quat_w).all(-1)
+                & torch.isfinite(_hd.root_lin_vel_w).all(-1)
+                & torch.isfinite(_hd.joint_pos).all(-1)
+                & torch.isfinite(_hd.joint_vel).all(-1)
+                # 손 관절은 |q| <= ~1.6 rad, 속도 한계 15 rad/s. 넉넉히 3배로 잡습니다 —
+                # 정상 상태는 절대 넘지 않고 발산은 항상 넘습니다.
+                & (_hd.joint_pos.abs().amax(-1) < 3.0 * math.pi)
+                & (_hd.joint_vel.abs().amax(-1) < 1.0e3)
+                & (_hd.root_lin_vel_w.norm(dim=-1) < 1.0e2)
+            )
+        if self._has_object:
+            _od = self._object.data
+            _fin = _fin & torch.isfinite(_od.root_pos_w).all(-1) \
+                & torch.isfinite(_od.root_quat_w).all(-1) \
+                & torch.isfinite(_od.root_lin_vel_w).all(-1)
+        self._diag_cache_reject = float((~_fin).float().mean())
+        gate = gate & _fin
+        # ── [/hand-pretrain] ─────────────────────────────────────────────────────────────
 
         # ---- tracking-quality gate (grasp mechanism) ----
         # A frame is cache-eligible only while tracking has been CONTINUOUSLY "good enough" since
@@ -4123,7 +3938,30 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             self._reached_frame = max(self._reached_frame, int(uf.item()))
 
     # ── 역방향 롤아웃 [ROLLBACK MARKER: backward-dir] ──────────────────────────────────
-    _CACHE_VEL_SLICES = ((8, 14), (21, 27), (92, 157))   # 루트 6, 물체 6, 관절 65
+    # [hand-pretrain] 손목 속도 6x2, 물체 속도 6, 구동 관절 속도 36, J0 속도 8.
+    # 손목 힘/토크 EMA 는 속도가 아니라 컨트롤러 상태이므로 뒤집지 않습니다 — 시간을 거꾸로
+    # 돌려도 중력은 그대로여서, 손을 들고 있던 힘은 계속 들고 있어야 합니다.
+    # ── [wrist6] 상태 캐시 레이아웃 ────────────────────────────────────────────────────────
+    # 흩어진 매직 넘버 대신 이름으로 참조한다. 두 모드가 손목 블록과 컨트롤러 상태에서만
+    # 다르고 나머지는 폭이 같다. `ctrl` 은 리셋 시 복원해야 하는 컨트롤러 내부 상태 —
+    # 외력 모드는 힘·토크 이동평균(6+6), 관절 모드는 잔차 이동평균(손별 6)이다. 둘 다
+    # 에피소드 중간 상태이므로 캐시 복원 시 함께 되살려야 한다.
+    _CACHE_LAYOUT = {
+        "wrench": dict(                       # 176
+            wristL=(1, 14), wristR=(14, 27),  # pos3 + quat4 + linvel3 + angvel3 = 13/손
+            obj=(27, 40), jpos=(40, 76), jvel=(76, 112),
+            j0pos=(112, 120), j0vel=(120, 128), smoothed=(128, 164), ctrl=(164, 176),
+            dim=176,
+            vel=((8, 14), (21, 27), (34, 40), (76, 112), (120, 128)),
+        ),
+        "joint6": dict(                       # 174
+            wristL=(1, 13), wristR=(13, 25),  # 관절 pos6 + vel6 = 12/손
+            obj=(25, 38), jpos=(38, 74), jvel=(74, 110),
+            j0pos=(110, 118), j0vel=(118, 126), smoothed=(126, 162), ctrl=(162, 174),
+            dim=174,
+            vel=((7, 13), (19, 25), (32, 38), (74, 110), (118, 126)),
+        ),
+    }
 
     def _flip_cache_vel(self, state: torch.Tensor, sign: torch.Tensor) -> torch.Tensor:
         """캐시 행의 속도 채널에만 부호를 곱합니다. sign (n,1): 정방향 +1 / 역방향 -1.
@@ -4137,24 +3975,58 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         return out
 
     def _build_cache_state(self, r: torch.Tensor, org: torch.Tensor) -> torch.Tensor:
-        """(E,222) cache row for every env: [0] = the step reward (ranking key), rest = the full
-        restorable sim state. Column 0 must be the SAME quantity the `better` comparison uses."""
-        state = torch.empty(self.num_envs, self._STATE_DIM, device=self.device)
+        """(E,176) cache row for every env: [0] = the step reward (ranking key), rest = the full
+        restorable sim state. Column 0 must be the SAME quantity the `better` comparison uses.
+        레이아웃은 __init__ 의 _STATE_DIM 주석 참조."""
+        L = self._CL
+        state = torch.zeros(self.num_envs, self._STATE_DIM, device=self.device)
         state[:, 0] = r
-        state[:, 1:4] = self.robot.data.root_pos_w - org
-        state[:, 4:8] = self.robot.data.root_quat_w
-        state[:, 8:11] = self.robot.data.root_lin_vel_w
-        state[:, 11:14] = self.robot.data.root_ang_vel_w
+        for _h, _sd in enumerate("lr"):
+            _a, _b = L["wristL"] if _h == 0 else L["wristR"]
+            _d = self._hands[_h].data
+            if self._w6:
+                # [wrist6] 손목 상태 = 관절값. 루트(anchor)는 env 원점에 용접돼 있어 담을 게 없다.
+                _w6id = getattr(self, f"_wrist6_joint_ids_{_sd}")
+                state[:, _a:_a + 6] = _d.joint_pos[:, _w6id]
+                state[:, _a + 6:_b] = _d.joint_vel[:, _w6id]
+            else:
+                state[:, _a:_a + 3] = _d.root_pos_w - org
+                state[:, _a + 3:_a + 7] = _d.root_quat_w
+                state[:, _a + 7:_a + 10] = _d.root_lin_vel_w
+                state[:, _a + 10:_b] = _d.root_ang_vel_w
+        _oa, _ob = L["obj"]
         if self._has_object:
-            state[:, 14:17] = self._object.data.root_pos_w - org
-            state[:, 17:21] = self._object.data.root_quat_w
-            state[:, 21:24] = self._object.data.root_lin_vel_w
-            state[:, 24:27] = self._object.data.root_ang_vel_w
+            state[:, _oa:_oa + 3] = self._object.data.root_pos_w - org
+            state[:, _oa + 3:_oa + 7] = self._object.data.root_quat_w
+            state[:, _oa + 7:_oa + 10] = self._object.data.root_lin_vel_w
+            state[:, _oa + 10:_ob] = self._object.data.root_ang_vel_w
         else:
-            state[:, 14:27] = 0.0
-        state[:, 27:92] = self.robot.data.joint_pos[:, self._action_joint_ids_t]
-        state[:, 92:157] = self.robot.data.joint_vel[:, self._action_joint_ids_t]
-        state[:, 157:222] = self._smoothed_actions
+            state[:, _oa + 3] = 1.0                           # 사원수 항등 (미기록 행의 NaN 방지)
+        state[:, L["jpos"][0]:L["jpos"][1]] = self._hand_joint_cat("joint_pos")
+        state[:, L["jvel"][0]:L["jvel"][1]] = self._hand_joint_cat("joint_vel")
+        # 텐던 축 J0 8개. _ref_j0_ids 는 손별 dict (손 articulation 내 DOF 인덱스).
+        if isinstance(getattr(self, "_ref_j0_ids", None), dict):
+            for _h, _sd in enumerate("lr"):
+                _j = self._ref_j0_ids[_sd]
+                _o = 4 * _h
+                state[:, L["j0pos"][0] + _o:L["j0pos"][0] + 4 + _o] = \
+                    self._hands[_h].data.joint_pos[:, _j]
+                state[:, L["j0vel"][0] + _o:L["j0vel"][0] + 4 + _o] = \
+                    self._hands[_h].data.joint_vel[:, _j]
+        # [residual] 잔차 모드에서는 손가락 목표 EMA(관절 단위)가 복원해야 하는 상태다.
+        # 폭은 36 으로 같아 레이아웃이 바뀌지 않지만 **단위가 다르다** (관절 rad vs 정규화 액션).
+        # 두 모드의 캐시는 어차피 폭이 달라(174/176) 섞일 수 없고, 모드 전환 시 재생성이 필요하다.
+        state[:, L["smoothed"][0]:L["smoothed"][1]] = (
+            self._hand_target_ema if self.cfg.residual_action else self._smoothed_actions)
+        _ca, _cb = L["ctrl"]
+        if self._w6:
+            # 손목 목표 EMA (평활 상태가 곧 목표). 왼6 ++ 오른6.
+            state[:, _ca:_ca + 6] = self._wrist6_target[0]
+            state[:, _ca + 6:_cb] = self._wrist6_target[1]
+        else:
+            for _h in range(2):                                 # 손목 임피던스 이동평균 상태
+                state[:, _ca + 3 * _h:_ca + 3 + 3 * _h] = self._wrist_force[_h]
+                state[:, _ca + 6 + 3 * _h:_ca + 9 + 3 * _h] = self._wrist_torque[_h]
         return state
 
     # [ROLLBACK MARKER: deferred-cache] -----------------------------------------------------------
@@ -4175,7 +4047,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
             valid = self._pend_valid[rows]                                   # (R, cap)
             if valid.any():
                 sel = torch.nonzero(valid, as_tuple=False)                   # (K,2) [row, slot]
-                cand_state = self._pend_state[rows[sel[:, 0]], sel[:, 1]]    # (K,222)
+                cand_state = self._pend_state[rows[sel[:, 0]], sel[:, 1]]    # (K,_STATE_DIM)
                 cand_frame = self._pend_frame[rows[sel[:, 0]], sel[:, 1]]    # (K,)
                 cand_r = cand_state[:, 0]
                 # per frame: best candidate in this flush, then the usual "only if better" vs cache
@@ -4208,6 +4080,12 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         [0]reward [1:14]root [14:79]jpos [79:144]jvel [144:209]smoothed; read by _reset_idx's
         pretrain branch). Gated by cfg.pretrain_cache_warmstart (False → vanilla RSI: empty train
         cache, _reached_frame gate, fixed-home + frame-0-IK fallback). [ROLLBACK MARKER: pretrain-cache-warmstart]"""
+        # [hand-pretrain] 209 전신 레이아웃(루트 하나 + 관절 65열) 전제라 손 전용 캐시
+        # (176, 손목 둘 + 관절 36열) 와 호환되지 않습니다. 조용히 잘못된 열을 읽는 대신
+        # 거부합니다 — _reset_idx 의 where_pre 경로도 같은 이유로 assert 로 막혀 있습니다.
+        print(f"[pretrain-cache] 손 전용 env 는 전신 pretrain 캐시를 지원하지 않습니다 — 무시: "
+              f"{npz_path}")
+        return False
         if not self.cfg.pretrain_cache_warmstart:
             print("[pretrain-cache] warm-start DISABLED by cfg (pretrain_cache_warmstart=False); vanilla RSI start.")
             return False

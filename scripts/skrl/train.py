@@ -47,6 +47,10 @@ parser.add_argument("--trajectory_task", type=str, default=None, help="Trajector
 parser.add_argument("--trajectory_data_id", type=int, default=None, help="Trajectory data sub-index; overrides env_cfg.trajectory_data_id.")
 parser.add_argument("--clip_class", type=str, default=None, help="ParaHome clip class (g1 loco-manip); overrides env_cfg.clip_class.")
 parser.add_argument("--clip_name", type=str, default=None, help="ParaHome clip name (g1 loco-manip); overrides env_cfg.clip_name.")
+parser.add_argument("--wrist_mode", type=str, default=None, choices=("wrench", "joint6"),
+                    help="[wrist6] hand-pretrain 손목 구동 방식. 'wrench'=자유 베이스 외력(기존), "
+                         "'joint6'=palm 앞 6-DoF 관절 PD. 차원이 바뀌므로(action 54/48, obs 559/553) "
+                         "적용 후 env_cfg.__post_init__() 를 다시 호출한다.")
 parser.add_argument(
     "--ml_framework",
     type=str,
@@ -395,7 +399,8 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
         a.memory.set_tensor_by_name("advantages", advantages)
 
         cumulative_policy_loss = 0
-        _rm = []          # [failure-sigma] V1: 첫 에포크의 PPO 비율 중앙값
+        _rm = []          # 첫 에포크의 PPO 비율 중앙값 (Diag / ppo_ratio_med)
+        _nf_skipped = 0   # [nan-guard] 비유한이라 건너뛴 옵티마이저 스텝 수
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         # [DUAL-CLIP] diagnostics, accumulated over every mini-batch of the update. Kept as DEVICE
@@ -452,9 +457,8 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
                     # compute policy loss
                     ratio = torch.exp(next_log_prob - sampled_log_prob)
-                    # [ROLLBACK MARKER: failure-sigma] V1 검증. 롤아웃과 업데이트에 같은 beta 가
-                    # 적용되면 첫 에포크의 비율은 1 에서 시작합니다. 어긋나면 여기가 즉시 드러납니다
-                    # (beta=1.5, 36차원이면 3.7e-4 까지 떨어져 전부 클립됩니다).
+                    # 롤아웃과 업데이트가 같은 분포를 쓰면 첫 에포크의 비율은 1 에서
+                    # 시작합니다. 어긋나면 이 중앙값이 즉시 드러냅니다.
                     if epoch == 0:
                         with torch.no_grad():
                             _rm.append(float(ratio.median()))
@@ -489,14 +493,36 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
                     acc_lr_min = torch.minimum(acc_lr_min, _lr.min())
 
                 # optimization step
+                # ── [ROLLBACK MARKER: nan-guard] (L4) 비유한 업데이트 건너뛰기 ──────────────
+                # skrl 의 GradScaler 는 mixed_precision=False 에서 비활성이라 scaler.step() 이
+                # 비유한 그래디언트를 걸러내지 않고 그대로 optimizer.step() 을 부른다. 그리고
+                # clip_grad_norm_ 은 NaN 을 지우지 못한다 — 전체 노름이 NaN 이면 클리핑 계수도
+                # NaN 이라 정상이던 파라미터의 그래디언트까지 전부 NaN 이 된다. 그 다음 Adam 이
+                # 모든 가중치에 NaN 을 쓰면 정책은 영구히 NaN 을 출력한다. 한 번의 나쁜 미니배치가
+                # 학습 전체를 죽이는 유일한 경로라 여기서 끊는다.
+                _tot_loss = policy_loss + entropy_loss + value_loss
+                if not torch.isfinite(_tot_loss):
+                    a.optimizer.zero_grad(set_to_none=True)
+                    _nf_skipped += 1
+                    continue
+                # ── [/ROLLBACK MARKER: nan-guard] ──
                 a.optimizer.zero_grad()
-                a.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+                a.scaler.scale(_tot_loss).backward()
 
                 if _sk_config.torch.is_distributed:
                     a.policy.reduce_parameters()
                     if a.policy is not a.value:
                         a.value.reduce_parameters()
 
+                # [ROLLBACK MARKER: nan-guard] 그래디언트 유한성 — 클리핑 이전에 본다. 하나라도
+                # 비유한이면 스텝 전체를 버린다 (클리핑은 NaN 을 퍼뜨릴 뿐 지우지 못한다).
+                _gp = [q for q in itertools.chain(a.policy.parameters(), a.value.parameters())
+                       if q.grad is not None] if a.policy is not a.value else \
+                      [q for q in a.policy.parameters() if q.grad is not None]
+                if _gp and not all(torch.isfinite(q.grad).all() for q in _gp):
+                    a.optimizer.zero_grad(set_to_none=True)
+                    _nf_skipped += 1
+                    continue
                 if a.cfg.grad_norm_clip > 0:
                     a.scaler.unscale_(a.optimizer)
                     if a.policy is a.value:
@@ -528,6 +554,9 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
         # record data
         _n = a.cfg.learning_epochs * a.cfg.mini_batches
+        a.track_data("Diag / nonfinite_updates_skipped", float(_nf_skipped))   # [nan-guard]
+        if _nf_skipped:
+            print(f"[nan-guard] 비유한 업데이트 {_nf_skipped}개 건너뜀 (가중치 보호)")
         if _rm:
             a.track_data("Diag / ppo_ratio_med", sum(_rm) / len(_rm))
         a.track_data("Loss / Policy loss", cumulative_policy_loss / _n)
@@ -793,73 +822,6 @@ def _patch_analytic_kl(agent) -> None:
           "(rl_games convention); skrl's k3 value is logged as 'Diag / kl_k3'.")
 
 
-def _patch_failure_sigma(agent, n_action: int, dims: str) -> None:
-    """[ROLLBACK MARKER: failure-sigma] 실패 구간에서 sampling sigma 를 beta 배로 키웁니다.
-
-    env 가 관측 마지막 열에 beta 를 실어 보냅니다. 여기서 두 가지를 합니다.
-
-      1. 관측 전처리기를 감싸 beta 열은 정규화하지 않고 통과시킵니다.
-         RunningStandardScaler 에 넣으면 학습 초기 beta 가 상수 1.0 이라 분산이 0 으로 수렴하고,
-         정규화/역정규화가 0 으로 나누는 꼴이 되어 터집니다.
-
-      2. 정책의 compute 를 감싸 beta 를 log_std 에 더합니다 (log_std += log beta).
-         신경망에는 beta 를 뺀 앞부분만 넣으므로 mu 는 beta 를 보지 않습니다 — 탐색 폭만 바뀌고
-         행동 자체는 안 바뀝니다.
-
-    PPO 는 건드리지 않습니다. GaussianMixin.act 가 이 log_std 로 분포를 만들고 같은 분포로
-    log_prob / 엔트로피를 계산하며, 업데이트 때도 저장된 관측에서 같은 beta 가 나오므로 비율이
-    1 에서 시작합니다. (검증: Diag / ppo_ratio_med 가 첫 업데이트에서 1.00 ± 0.01)
-    """
-    import torch as _t
-
-    policy = agent.models["policy"]
-
-    # ── 1. 전처리기: 마지막 열(beta)은 통과 ────────────────────────────────────
-    _pre = agent._observation_preprocessor
-
-    def _pre_keep_last(x, train=False, **kw):
-        # 스케일러는 관측 전체 폭(767)으로 만들어져 있으므로 통째로 통과시킨 뒤 beta 열만 원본으로
-        # 되돌립니다. 열을 잘라 넣으면 폭이 안 맞아 터집니다. beta 쪽 running stat 은 갱신되지만
-        # 그 정규화 값을 쓰지 않으므로 무해합니다.
-        out = _pre(x, train=train, **kw)
-        return _t.cat([out[..., :-1], x[..., -1:]], dim=-1)
-
-    agent._observation_preprocessor = _pre_keep_last
-
-    # ── 2. 정책: log_std 에 log(beta) ─────────────────────────────────────────
-    # 인스턴스가 아니라 CLASS 에 붙입니다. 인스턴스에 붙이면 _patch_analytic_kl 의
-    # copy.deepcopy(agent.policy) 스냅샷이 그 클로저를 그대로 복사하는데, 클로저가 원본 정책의
-    # 바운드 메서드를 잡고 있어서 스냅샷이 원본 가중치로 계산합니다. 그러면 mu_old == mu_new 가 되어
-    # KL 이 항상 정확히 0 → KL 적응형 학습률이 무한정 올라가 정책이 발산합니다
-    # (실측: 보상 0.000, logratio_max -7588). 클래스에 붙이면 self 가 호출 시점에 풀리므로
-    # 스냅샷은 스냅샷의 가중치로 계산합니다.
-    # "hand" 면 뒤쪽 36차원(양손)만, "all" 이면 100차원 전체
-    _lo = 0 if dims == "all" else n_action - 36
-    _cls = type(policy)
-    _orig = _cls.compute
-
-    def _compute_beta(self, inputs, role=""):
-        obs = inputs.get("observations", None)
-        if obs is None or obs.shape[-1] < 2:
-            return _orig(self, inputs, role)
-        beta = obs[..., -1:].clamp(min=1e-6)
-        # 열을 잘라내면 안 됩니다 — 자동 생성된 compute 가 관측을 원래 폭으로 unflatten 하므로
-        # 폭이 바뀌면 터집니다. 상수 0 으로 덮어써서 mu 쪽 신경망이 beta 를 못 보게 합니다.
-        obs_masked = obs.clone()
-        obs_masked[..., -1] = 0.0
-        mean_actions, outputs = _orig(self, {**inputs, "observations": obs_masked}, role)
-        ls = outputs["log_std"]
-        if ls.dim() == 1:                       # 상태 비의존 파라미터 → 배치로 확장
-            ls = ls.unsqueeze(0).expand(beta.shape[0], -1).clone()
-        else:
-            ls = ls.clone()
-        ls[..., _lo:] = ls[..., _lo:] + beta.log()
-        outputs["log_std"] = ls
-        return mean_actions, outputs
-
-    _cls.compute = _compute_beta
-    print(f"[failure-sigma] 정책 패치 완료 — log_std[{_lo}:{n_action}] += log(beta), "
-          f"전처리기는 beta 열을 통과시킵니다.")
 
 
 def _patch_entropy_flip(agent, env_wrapper, base_entropy_scale: float) -> None:
@@ -1173,6 +1135,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.clip_class = args_cli.clip_class
     if args_cli.clip_name is not None and hasattr(env_cfg, "clip_name"):
         env_cfg.clip_name = args_cli.clip_name
+    # [wrist6] 손목 구동 방식. action/obs 차원과 에셋이 __post_init__ 에서 유도되므로 적용 후
+    # 다시 호출한다 (그 함수는 멱등하게 작성돼 있다).
+    if args_cli.wrist_mode is not None and hasattr(env_cfg, "wrist_mode"):
+        env_cfg.wrist_mode = args_cli.wrist_mode
+        env_cfg.__post_init__()
+        print(f"[train] wrist_mode={env_cfg.wrist_mode} → action={env_cfg.action_space} "
+              f"obs={env_cfg.observation_space}")
 
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
@@ -1275,19 +1244,58 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # the same pretrain-cache mechanism as the grasp RSI variant.
     _is_g1_train = "Locomanip" in (args_cli.task or "") and "Pretrain" not in (args_cli.task or "")
     _is_g1_pretrain = "Locomanip" in (args_cli.task or "") and "Pretrain" in (args_cli.task or "")
+    # 떠 있는 손 dexterous 사전학습 (2단계 계획의 1단계). 태스크 id 가 "HandPretrain" 을 담고
+    # 있고 grasp/locomanip 어느 쪽에도 걸리지 않으므로, 위 네 플래그가 모두 False 입니다.
+    # main() 이 trainer 의 environment_info 를 전역으로 끄기 때문에, 이 플래그 없이는 env 가
+    # 내보내는 "Error /", "Episode_Reward /", "Diag /" 지표가 전부 조용히 버려집니다
+    # (실측: 400 timestep 학습에서 스칼라 17개 = skrl 내장 항목만 남았습니다).
+    # 정책 패치(mass-as-action / entropy-flip / dual-clip / analytic-KL)는 적용하지 않습니다 —
+    # 이 태스크는 skrl 기본 PPO 를 그대로 씁니다.
+    _is_hand_pretrain = "HandPretrain" in (args_cli.task or "")
     if _is_grasp_train:
         _patch_mass_policy(runner.agent, agent_cfg["models"]["policy"], agent_cfg["agent"]["learning_rate"])
         _patch_entropy_flip(runner.agent, env, agent_cfg["agent"]["entropy_loss_scale"])
 
-    # [ROLLBACK MARKER: failure-sigma] env 가 켰을 때만. 관측 마지막 열(beta)로 sampling sigma 조절.
-    if _is_g1_train and bool(getattr(env_cfg, "failure_sigma", False)):
-        _patch_failure_sigma(runner.agent, int(env_cfg.action_space),
-                             str(getattr(env_cfg, "failure_sigma_dims", "all")))
+    # ── [ROLLBACK MARKER: joint-residual] zero-actor ──────────────────────────────────────────
+    # 정책 마지막 층의 출력 행을 0 으로 만든다. video_to_data 의 scripts/rsl_rl/train.py
+    # --zero-actor 와 같은 목적: 잔차 평균이 정확히 0 에서 출발해 SONIC 사전값에서 깨끗하게
+    # 갈라져 나간다. skrl 기본 초기화는 마지막 층 출력이 차원당 표준편차 0.3~0.6 이라, 그냥
+    # 두면 학습 첫 스텝부터 잔차에 큰 고정 오프셋이 실린다.
+    #
+    # 어디까지 0 으로 할지는 두 플래그가 정한다.
+    #   zero_actor_residual  손(36) + 몸 관절 잔차(N) 행
+    #   zero_actor_latent    잠재 잔차 z_res(64) 행까지 포함 → 마지막 층 전체가 0
+    # 둘 다 켜면 첫 스텝의 정책 평균이 117 차원 전부 0 이다. z_res=0 이면 잠재 섭동이 없어
+    # SONIC 은 순수 디코드를 하고, 손은 1단계 목표를 그대로 재생한다. 즉 학습이 "얼어 있는
+    # SONIC + 1단계 손 재생" 이라는 정확히 알려진 지점에서 시작한다 (video_to_data 와 동일).
+    # 체크포인트 로드보다 먼저 실행하므로 resume 이면 로드된 가중치가 이 0 을 덮어쓴다.
+    if _is_g1_train and bool(getattr(env_cfg, "zero_actor_residual", False)):
+        _zpol = runner.agent.models["policy"]
+        _zlin = [m for m in _zpol.modules() if isinstance(m, torch.nn.Linear)]
+        # 잠재 잔차 행을 포함하지 않으면 z 블록 뒤부터 0 으로 만든다. 잠재 잔차가 꺼져 있으면
+        # 애초에 액션에 z 블록이 없으므로 어느 쪽이든 0 행부터다.
+        _z_on = bool(getattr(env_cfg, "sonic_latent_residual", True))
+        _z_zero = bool(getattr(env_cfg, "zero_actor_latent", False))
+        _zfrom = 0 if (_z_zero or not _z_on) else int(getattr(env_cfg, "sonic_action_dim", 0))
+        if _zlin and 0 <= _zfrom < _zlin[-1].weight.shape[0]:
+            _zlast, _znout = _zlin[-1], _zlin[-1].weight.shape[0]
+            with torch.no_grad():
+                _zlast.weight[_zfrom:].zero_()
+                _zlast.bias[_zfrom:].zero_()
+            _what = ("z_res + 손 + 상체 잔차 (마지막 층 전체)" if _zfrom == 0 and _z_on
+                     else "손 + 상체 잔차" if _zfrom > 0 else "손 + 상체 잔차 (z_res 블록 없음)")
+            print(f"[zero-actor] 정책 마지막 층 출력 {_zfrom}:{_znout} 행 ({_znout - _zfrom}차원) "
+                  f"가중치·바이어스 0 초기화 — {_what}"
+                  + (f"; z_res 0:{_zfrom} 행은 유지" if _zfrom > 0 else ""))
+        else:
+            print(f"[zero-actor] 건너뜀 (from={_zfrom}, linear={'있음' if _zlin else '없음'})")
+    # ── [/ROLLBACK MARKER: joint-residual] ──
 
     # Manual env-info → Tensorboard (applies to BOTH train and pretrain — trainer's
     # auto-prefix "Info / " is disabled in main(), so this is the sole logging path
     # for env extras['log'] keys like "Error /", "Episode_Reward /", "Curriculum /").
-    if _is_grasp_train or _is_grasp_pretrain or _is_g1_train or _is_g1_pretrain:
+    if (_is_grasp_train or _is_grasp_pretrain or _is_g1_train or _is_g1_pretrain
+            or _is_hand_pretrain):
         _patch_env_info_log(runner.agent)
 
     # g1 uses skrl's native PPO update, which computes the mean approx-KL for the KLAdaptiveLR
@@ -1307,6 +1315,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _patch_analytic_kl(runner.agent)
         else:
             _patch_kl_logging(runner.agent)
+    elif _is_hand_pretrain:
+        # skrl 기본 PPO 는 KLAdaptiveLR 용 근사 KL 을 계산하지만 기록하지 않습니다.
+        # 'Policy / KL' 로 남깁니다 (dual-clip / analytic-KL 은 적용하지 않습니다).
+        _patch_kl_logging(runner.agent)
 
     # For the grasp pretrain task: freeze log_std_parameter at YAML initial value (σ=0.22)
     # to mirror TJ's `frozen_sigma: True` in rl_games_ppo_cfg_pretrain.yaml. The policy
@@ -1454,6 +1466,69 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _np.savez(_log_cache_path, **_pretrain_cache_payload)
             print(f"[pretrain-cache-warmstart] saved pretrain state cache → {_log_cache_path}")
     # ── END PRETRAIN-CACHE WARM-START ─────────────────────────────────────────
+
+    # ── [hand-state-cache] 떠 있는 손 사전학습의 상태 캐시 저장 ──────────────────────────────
+    # 위 블록과 목적이 다릅니다. 저건 "다음 env 의 RSI 워밍업" 용이고, 이건 **stage 2 의 추종
+    # 레퍼런스 후보** 입니다. _state_cache 는 프레임별로 보상이 가장 높았던 물리적 방문 상태를
+    # 품질 스트릭 + 최소 에피소드 길이로 걸러 수천 에피소드에 걸쳐 갱신한 것이라, 롤아웃 N개의
+    # best 를 고르는 것보다 표본이 압도적으로 많습니다 (커버리지 83% 실측).
+    #
+    # 저장하지 않으면 학습 종료와 함께 GPU 메모리에서 사라집니다 — 지금까지의 학습에서 전부
+    # 유실됐습니다. 위 블록의 조건(_is_grasp_pretrain and "Rsi") / _is_g1_pretrain 중 어느
+    # 쪽에도 HandPretrain 이 걸리지 않기 때문입니다.
+    #
+    # 176 레이아웃을 그대로 씁니다(리맵 없음). 소비자가 다른 env 의 RSI 가 아니라 레퍼런스
+    # 생성이므로 손목 pose/속도·손가락·J0·물체·손목 힘EMA 를 전부 보존하는 것이 목적입니다.
+    if _is_hand_pretrain and hasattr(env.unwrapped, "_state_cache"):
+        import numpy as _np
+
+        _ue = env.unwrapped
+        _sc = _ue._state_cache.detach().cpu().numpy()
+        _iflg = _ue._init_flg.detach().cpu().numpy()
+        _payload = dict(
+            state_cache=_sc,                     # (F,176)
+            # 주의: init_flg 는 True = "캐시 없음(레퍼런스)" 입니다. 기존 규약과 맞추려 그대로
+            # 두고, 반전 실수를 막기 위해 valid 를 함께 저장합니다.
+            init_flg=_iflg,
+            valid=~_iflg,                        # True = 이 프레임에 캐시 항목이 있음
+            reached_frame=int(_ue._reached_frame),
+            ref_len=int(_ue._ref_len),
+            state_dim=int(_ue._STATE_DIM),
+            control_fps=float(getattr(env_cfg, "control_fps", 0.0)),
+            clip_class=str(getattr(env_cfg, "clip_class", "")),
+            clip_name=str(getattr(env_cfg, "clip_name", "")),
+            coverage=float((~_iflg).mean()),
+            layout=_np.array([
+                "state_cache[f] = 프레임 f 에서 보상이 가장 높았던 물리적 방문 상태.",
+                "위치는 env-LOCAL (scene.env_origins 를 뺀 값). 쿼터니언은 wxyz.",
+                "속도는 항상 정방향 규약으로 저장 (역방향 에피소드는 쓰기 시 부호 반전).",
+                "[0]reward(순위키) [1:8]손목L_pose [8:14]손목L_vel [14:21]손목R_pose",
+                "[21:27]손목R_vel [27:34]obj_pose [34:40]obj_vel [40:76]jpos(36)",
+                "[76:112]jvel(36) [112:120]J0pos(8) [120:128]J0vel(8) [128:164]smoothed(36)",
+                "[164:170]손목힘EMA(2x3) [170:176]손목토크EMA(2x3)",
+                "관절 36열 순서 = 왼손 18 -> 오른손 18.",
+                "valid=False 프레임의 행은 미기록이며 reward 열이 -inf 입니다 — 읽지 마세요.",
+                "연속성 주의: 프레임 f 와 f+1 은 서로 다른 에피소드에서 왔을 수 있습니다.",
+                "  RSI 출발점으로는 문제 없지만, 추종 레퍼런스로 쓰려면 프레임 간 점프를 먼저 재야 합니다.",
+            ]),
+        )
+        _dsts = []
+        # (1) 리타게팅 사이드카 옆 — stage 2 소비자가 wrist_ref.npz / hand_rl.npz 를 찾는 곳.
+        #     env 가 보관한 실제 경로를 씁니다 (cfg 로 재구성하면 clip_name="" 일 때 어긋납니다).
+        _rd = getattr(_ue, "_retarget_dir", None)
+        if _rd and os.path.isdir(_rd):
+            _dsts.append(_rd)
+        else:
+            print(f"[hand-state-cache] WARN: _retarget_dir 없음/부재 ({_rd}) — 로그 디렉터리에만 저장합니다.")
+        _dsts.append(log_dir)                    # (2) 출처 추적용
+        for _dst in _dsts:
+            os.makedirs(_dst, exist_ok=True)
+            _p = os.path.join(_dst, "hand_state_cache.npz")
+            _np.savez_compressed(_p, **_payload)
+            print(f"[hand-state-cache] saved → {_p}  "
+                  f"({_sc.shape[0]}x{_sc.shape[1]}, 커버리지 {(~_iflg).mean() * 100:.1f}%, "
+                  f"reached_frame {int(_ue._reached_frame)})")
+    # ── [/hand-state-cache] ────────────────────────────────────────────────────────────────
 
     # Save task_info.json to the processed output directory (only for grasp tasks with sequence info).
     _has_seq = (

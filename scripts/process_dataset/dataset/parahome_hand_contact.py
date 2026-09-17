@@ -79,6 +79,47 @@ def _quat2R(wxyz):
                      [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]], np.float64)
 
 
+# ── [ROLLBACK MARKER: stage1-contact-map] 프레임 단위 접촉 코어 (2026-09-09). main() 의 루프 본문을 그대로 옮긴 것으로
+#    동작은 같다. 사람(SMPL-X 정점) 맵과 1단계(Shadow 링크 메시 정점, stage1_hand_contact.py) 맵이 같은 함수를
+#    통과하도록 하기 위한 분리다. 손 표면 점의 출처만 다르고 gamma·FPS·링크 집계·법선 정의는 여기서 한 번만 정해진다.
+def frame_contacts(hand_w, hand_link, V, VN, R, op, L, gamma, num_contacts, normal_source):
+    """한 프레임의 링크별 접촉. 반환 (mask (L,), target (L,3) 월드, normal (L,3) 물체 로컬 바깥, n_kept) 또는 접촉이 없으면 None.
+    hand_w (H,3) 손 표면 점(월드), hand_link (H,) 점→링크 색인, V/VN (n_objv,3) 물체 정점·바깥 법선(물체 로컬),
+    R (3,3) 물체 로컬→월드 회전, op (3,) 물체 위치(월드)."""
+    from scipy.spatial import cKDTree
+    Vw = V @ R.T + op                                              # (n_objv,3) OBJECT verts in WORLD
+    # DexMachina step 1 (cKDTree-accelerated): for each OBJECT vertex, nearest HAND vertex + distance.
+    d_obj, paired = cKDTree(hand_w).query(Vw, k=1)                 # (n_objv,) dist + nearest hand-vert idx
+    keep = np.where(d_obj < gamma)[0]                              # object vertices in contact
+    if keep.size == 0:
+        return None
+    cw = Vw[keep]                                                  # (M,3) world contact points (object surface)
+    clink = hand_link[paired[keep]]                                # (M,) link via the paired HAND vertex
+    # per-contact direction, object-LOCAL (pose-invariant), pointing OUT of the object surface.
+    # "surface": the mesh's own outward normal at the contact vertex (friction-cone axis, already object-local).
+    # "to-hand": direction from the object surface point to the paired HAND vertex (legacy).
+    if normal_source == "surface":
+        nrm_l = VN[keep]
+    else:
+        nrm_w = hand_w[paired[keep]] - cw                          # (M,3) world, surface→hand
+        nrm_w /= np.clip(np.linalg.norm(nrm_w, axis=1, keepdims=True), 1e-9, None)
+        nrm_l = nrm_w @ R                                          # (M,3) object-local (world→local dir)
+    # DexMachina step 2 (FPS): spatially subsample to <= num_contacts (keep link/normal aligned).
+    fps = _farthest_point_sample(cw, num_contacts)
+    cw = cw[fps]; clink = clink[fps]; nrm_l = nrm_l[fps]
+    # aggregate per link: target = mean OBJECT contact pos (world); normal = mean reaction dir (local, renorm).
+    mask = np.zeros(L, np.float32); target = np.zeros((L, 3), np.float32); normal = np.zeros((L, 3), np.float32)
+    for li in range(L):
+        sel = clink == li
+        if sel.any():
+            mask[li] = 1.0
+            target[li] = cw[sel].mean(0)
+            nl = nrm_l[sel].mean(0)
+            normal[li] = nl / max(float(np.linalg.norm(nl)), 1e-9)
+    return mask, target, normal, len(cw)
+# ── [/ROLLBACK MARKER: stage1-contact-map] ──
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", default="s100_seg00_pan")
@@ -151,40 +192,12 @@ def main():
         if args.use_velocity_gate and not vel[t]:
             continue
         R = _quat2R(oq[t])                                         # object local→world rotation
-        Vw = V @ R.T + op[t]                                       # (n_objv,3) OBJECT verts in WORLD
-        # DexMachina step 1 (cKDTree-accelerated): for each OBJECT vertex, nearest HAND vertex + distance.
-        d_obj, paired = cKDTree(verts[t]).query(Vw, k=1)           # (n_objv,) dist + nearest hand-vert idx
-        keep = np.where(d_obj < args.gamma)[0]                     # object vertices in contact
-        if keep.size == 0:
+        # [stage1-contact-map] 프레임 코어는 frame_contacts() (아래) — 1단계 맵 스크립트와 공유
+        fc = frame_contacts(verts[t], hand_v_link, V, VN, R, op[t], L,
+                            args.gamma, args.num_contacts, args.normal_source)
+        if fc is None:
             continue
-        cw = Vw[keep]                                              # (M,3) world contact points (object surface)
-        clink = hand_v_link[paired[keep]]                          # (M,) link via the paired HAND vertex
-        # per-contact direction, object-LOCAL (pose-invariant), pointing OUT of the object surface.
-        # "surface": the mesh's own outward normal at the contact vertex. This is the axis of the
-        #   friction cone, which is what the contact-wrench reward needs, and it is already in object
-        #   coordinates so no rotation is involved.
-        # "to-hand": the previous behaviour — direction from the object surface point to the paired
-        #   HAND vertex. It approximates the surface normal only while the hand sits directly above
-        #   the surface; where the nearest hand vertex is off to the side it tilts away from it.
-        # Both point outward, so downstream consumers see the same sign convention either way.
-        if args.normal_source == "surface":
-            nrm_l = VN[keep]
-        else:
-            nrm_w = verts[t][paired[keep]] - cw                    # (M,3) world, surface→hand
-            nrm_w /= np.clip(np.linalg.norm(nrm_w, axis=1, keepdims=True), 1e-9, None)
-            nrm_l = nrm_w @ R                                      # (M,3) object-local (world→local dir)
-        # DexMachina step 2 (FPS): spatially subsample to <= num_contacts (keep link/normal aligned).
-        fps = _farthest_point_sample(cw, args.num_contacts)
-        cw = cw[fps]; clink = clink[fps]; nrm_l = nrm_l[fps]
-        n_contacts_log[t] = len(cw)
-        # aggregate per link: target = mean OBJECT contact pos (world); normal = mean reaction dir (local, renorm).
-        for li in range(L):
-            sel = clink == li
-            if sel.any():
-                mask[t, li] = 1.0
-                target[t, li] = cw[sel].mean(0)
-                nl = nrm_l[sel].mean(0)
-                normal[t, li] = nl / max(float(np.linalg.norm(nl)), 1e-9)
+        mask[t], target[t], normal[t], n_contacts_log[t] = fc
 
     out = clip_dir / "0" / "hand_contact.npz"
     # normal_source is recorded so a consumer can tell which convention a file was written with.

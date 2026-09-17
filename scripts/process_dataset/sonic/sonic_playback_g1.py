@@ -157,20 +157,37 @@ def _lerp_np(x, t_src, t_tgt):
     return np.stack([np.interp(t_tgt, t_src, x[:, d]) for d in range(x.shape[1])], axis=1).astype(np.float32)
 
 
+def _AJN_REF():
+    """[njoint-65] 액션 관절 수 (65). 저장된 순서 파일에서 읽어 하드코딩을 피한다."""
+    import json as _json
+    global _AJN_CACHE
+    try:
+        return _AJN_CACHE
+    except NameError:
+        pass
+    _p = os.path.join(_PROC, "..", "..", "robots", "G1", "g1_shadow_joint_order.json")
+    _AJN_CACHE = _json.load(open(_p))["action_joint_names"]
+    return _AJN_CACHE
+
+
 def load_clip(clip, cls):
     sm = np.load(os.path.join(_PROC, "g1_shadow", cls, clip, "0", "sonic_smpl_50fps.npz"))
     d = {k: torch.tensor(sm[k], device=device) for k in ("smpl_joints_local", "root_q_zb", "wrist_ref")}
     d["g1_root_quat0"] = tuple(float(x) for x in sm["g1_root_quat0"])
-    # retarget reference frame-0 (for --ref_reset RSI): g1_joint_pos (65, action order) + root z
+    # retarget reference frame-0 (for --ref_reset RSI): g1_joint_pos + root z.
+    # [ROLLBACK MARKER: njoint-65] npz 가 65 → 73 열로 늘어났다 (뒤 8개 = 텐던 종속 J0,
+    # robot0_{l,r}_{FF,MF,RF,LF}J0). 액션 순서는 앞 65 열이 그대로라 거기까지만 쓴다.
+    # 확인: npz["joint_names"][:65] == g1_shadow_joint_order.json["action_joint_names"] (불일치 0/65).
+    _NA = len(_AJN_REF())
     rt = np.load(os.path.join(_PROC, "g1_shadow", cls, clip, "0", "trajectory_pyroki.npz"))
-    d["ref_q"] = torch.tensor(rt["g1_joint_pos"][0], device=device)                 # (65,) action order
+    d["ref_q"] = torch.tensor(rt["g1_joint_pos"][0, :_NA], device=device)           # (65,) action order
     d["ref_root_z"] = float(rt["g1_root_pose"][0, 2]) if "g1_root_pose" in rt.files else 0.80
     N = d["smpl_joints_local"].shape[0]
     # ---- g1-encoder reference: the retargeted joint trajectory itself ----
     # Stored at the ParaHome rate; resample to the 50 Hz playback rate the same way the env does
     # (linear on joints, and velocity as a finite difference of the RESAMPLED positions so the two
     # channels agree — a velocity carried over from 30 Hz would contradict the positions).
-    gq = rt["g1_joint_pos"].astype(np.float32)                                      # (F,65) action order
+    gq = rt["g1_joint_pos"][:, :_NA].astype(np.float32)                             # (F,65) action order
     F0 = gq.shape[0]
     t_s, t_t = np.arange(F0) / SRC_FPS, np.linspace(0.0, (F0 - 1) / SRC_FPS, N)
     gq5 = _lerp_np(gq, t_s, t_t)                                                    # (N,65)
@@ -222,7 +239,7 @@ def load_clip(clip, cls):
             if k in d and torch.is_tensor(d[k]):
                 d[k] = torch.flip(d[k], dims=[0]).contiguous()
         d["g1_v_act"] = -d["g1_v_act"]              # reversing time negates the velocity channel
-        d["ref_q"] = torch.tensor(rt["g1_joint_pos"][-1], device=device)
+        d["ref_q"] = torch.tensor(rt["g1_joint_pos"][-1, :_NA], device=device)      # [njoint-65]
         if "g1_root_pose" in rt.files:
             d["ref_root_z"] = float(rt["g1_root_pose"][-1, 2])
             d["g1_root_quat0"] = tuple(float(x) for x in rt["g1_root_pose"][-1, 3:7])
