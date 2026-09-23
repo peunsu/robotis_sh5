@@ -470,8 +470,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # 그 타겟의 시간축 거동이 bang-bang 판정의 대상입니다. 첫 에피소드 동안만 기록합니다.
     _jrec = None
     if args_cli.dump_joints:
+        # [joint-dump] obj_pos/obj_quat: 물리로 잡힌 물체의 실제 자세. figure 렌더가 롤아웃을
+        # 그대로 재생할 때 레퍼런스 물체 자세를 쓰면 손과 물체가 어긋나므로 같이 기록합니다.
+        # [joint-dump] *_all: 모든 env 의 FULL 관절 벡터(73 = 구동 65 + 텐던 J0 8)와 루트·물체 자세.
+        # 구동 65 만 저장하면 재생 시 J0 8개가 articulation 기본값(0 = 손끝 펴짐)으로 남아
+        # 손가락이 펴진 그림이 나온다. figure 재생은 *_all 을 써야 한다.
         _jrec = {k: [] for k in ("target", "qpos", "qvel", "tau", "action", "a_sonic",
-                                 "root_pos", "root_quat", "ref_root_pos", "frame")}
+                                 "root_pos", "root_quat", "ref_root_pos", "frame",
+                                 "obj_pos", "obj_quat", "qpos_all", "root_all", "obj_all")}
         print(f"[joint-dump] env 0 기록 시작: {len(actual_env._action_joint_names)}관절")
 
     # ── [ROLLBACK MARKER: hand-traj] 모든 env 의 손 궤적 기록 ────────────────────────────
@@ -624,6 +630,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # 자세 정상을 뜻하지 않습니다 — 골반 높이와 기울기로 직접 봐야 합니다.
             _jrec["root_pos"].append(actual_env.robot.data.root_pos_w[0].clone().cpu())
             _jrec["root_quat"].append(actual_env.robot.data.root_quat_w[0].clone().cpu())
+            _ob = getattr(actual_env, "_object", None)
+            if _ob is not None:
+                _jrec["obj_pos"].append(_ob.data.root_pos_w[0].clone().cpu())
+                _jrec["obj_quat"].append(_ob.data.root_quat_w[0].clone().cpu())
+            _jrec["qpos_all"].append(actual_env.robot.data.joint_pos.clone().cpu())
+            _jrec["root_all"].append(torch.cat([actual_env.robot.data.root_pos_w,
+                                                actual_env.robot.data.root_quat_w], -1).clone().cpu())
+            if _ob is not None:
+                _jrec["obj_all"].append(torch.cat([_ob.data.root_pos_w,
+                                                   _ob.data.root_quat_w], -1).clone().cpu())
             _rr = getattr(actual_env, "_ref_root_pos", None)
             if _rr is not None:
                 _fi = int(actual_env._frame_idx[0].clamp(max=_rr.shape[0] - 1))
@@ -727,6 +743,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _sv[_k] = torch.stack(_jrec[_k]).numpy()
         if _jrec["ref_root_pos"]:
             _sv["ref_root_pos"] = torch.stack(_jrec["ref_root_pos"]).numpy()
+        if _jrec["obj_pos"]:
+            _sv["obj_pos"] = torch.stack(_jrec["obj_pos"]).numpy()
+            _sv["obj_quat"] = torch.stack(_jrec["obj_quat"]).numpy()
+        _sv["joint_names_all"] = _np.array(list(actual_env.robot.joint_names))
+        for _k in ("qpos_all", "root_all", "obj_all"):
+            if _jrec[_k]:
+                _sv[_k] = torch.stack(_jrec[_k]).numpy()          # (T, E, ...)
+        _sv["env_origin"] = actual_env.scene.env_origins[0].cpu().numpy()
         # [joint-dump] SONIC 액션 + 그 액션을 관절 타겟으로 바꾸는 아핀 계수(같은 순서로 gather).
         # 분석 쪽에서 (한계 - default)/scale 로 "관절 한계가 함의하는 액션 범위"를 계산합니다.
         if _jrec["a_sonic"]:

@@ -84,18 +84,19 @@ CLIPS=(
     # "s101_seg12_knife"
     # "s101_seg29_pot"
     # "s101_seg30_bowl"
-    "s207_seg06_kettle"
     "s66_seg26_pan"
-    "s55_seg31_knife"
-    "s73_seg31_pot"
-    "s33_seg18_bowl"
-    "s127_seg29_pan"
     "s53_seg19_knife"
     "s152_seg21_pot"
     "s71_seg27_bowl"
-    # "s10_seg03_book"     # ← hand_contact.npz 없음: 접촉/CWS 보상이 무력해집니다
+    # "s207_seg06_kettle"
+    # "s55_seg31_knife"
+    # "s73_seg31_pot"
+    # "s33_seg18_bowl"
+    # "s127_seg29_pan"
     # "s100_seg02_kettle"
     # "s100_seg03_cup"
+    # "s101_seg18_potlid"
+    # "s101_seg23_salt"      # ← uncomment / add more clips here
 )
 [[ -n "${CLIPS_OVERRIDE:-}" ]] && read -ra CLIPS <<< "${CLIPS_OVERRIDE}"
 

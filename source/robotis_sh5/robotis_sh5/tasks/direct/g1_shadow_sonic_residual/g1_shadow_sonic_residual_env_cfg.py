@@ -510,7 +510,11 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #    손목 pitch/yaw 가 작은 것은 그 관절 모터가 약하기 때문이다(effort 5 Nm).
     #    tanh 도 EMA 도 없다 (video_to_data 의 use_tanh=False, 평활화 없음). u 는 무제한이고 위 클램프로만 잘린다.
     #    S 에 없는 관절은 SONIC 출력이 그대로 나간다 (mode="upper" 면 다리 12관절).
-    sonic_upper_residual: bool = True
+    # Ablation 스위치. False 로 두면 상체 관절 잔차가 완전히 빠지고 차원도 줄어듭니다
+    # (action 117->100, obs 789->772) — 켜진 체크포인트와 호환되지 않으니 새로 학습해야 합니다.
+    # env 의 모든 참조가 _upper_on 으로 가드되어 있고 버퍼 생성도 그 블록 안에 있습니다.
+    # [ROLLBACK MARKER: ablation-upper-off] 되돌리기: True.
+    sonic_upper_residual: bool = False
     # 잔차를 받는 관절 집합.
     #   현재 조합 (2026-09-15): 하체 = 잠재 잔차(z_res)만, 상체 = 잠재 잔차 + 관절 잔차.
     #   mode="upper" 라 다리 12관절에는 관절 잔차가 붙지 않고, SONIC 디코더 출력이 그대로 나간다.
@@ -602,7 +606,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #   "reference"    : 리타게팅 레퍼런스(_ref_joints) — 1단계 파일이 없을 때의 대체값이기도 합니다.
     # sonic_hand_delta 와 동시에 켤 수 없습니다. 되돌리기: False.
     sonic_hand_residual: bool = True
-    sonic_hand_residual_base: str = "stage1_target" # "stage1_target"
+    sonic_hand_residual_base: str = "reference"  # [ablation-stage1-off] 원래 "stage1_target"
     # ── [/ROLLBACK MARKER: stage1-hand] ──
     sonic_latent_delta: bool = False
     sonic_latent_delta_scale: float = 0.5      # latent-units/step at raw=1
@@ -762,7 +766,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # 파일 위치: <dataset_root>/<stage1_subdir>/<clip_class>/<clip>/0/<stage1_hand_file>, 없으면 같은
     #   폴더의 evaluation_*/<stage1_hand_file> 중 가장 최근 것. 둘 다 없으면 SMPL-X 목표를 유지합니다.
     # 시간축: 롤아웃 control_fps(50) → 레퍼런스 control_fps 로 선형 보간, 끝은 마지막 값 유지.
-    hand_kpt_from_stage1: bool = True   # [ROLLBACK MARKER: ref-track] True→False (2026-09-10): 손·손목·pad 목표를 1단계 롤아웃이 아니라 레퍼런스로
+    hand_kpt_from_stage1: bool = False  # [ablation-stage1-off] 원래 True
     stage1_subdir: str = "g1_shadow_hand_pretrain"
     stage1_hand_file: str = "hand_traj_best.npz"
     # 접촉 중 물체 기준 보정: 롤아웃의 물체가 ParaHome 물체와 어긋난 만큼(측정 p50 0.5 cm / 3°) 손바닥
@@ -775,7 +779,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #    hand_kpt_from_stage1 이 켜져 있고 1단계 파일에 obj_pos 가 있을 때만 작동. 측정: 사람 접촉점과 1단계가 실제로
     #    잡은 위치는 물체 좌표에서 1~4 cm (knife 검지 4.3 cm) 떨어져 있어 rew_hand_kpts 와 rew_fingertip 이 서로
     #    다른 곳을 가리켰다. 물체 레퍼런스는 건드리지 않는다.
-    stage1_contact_vertex: bool = True
+    stage1_contact_vertex: bool = False  # [ablation-stage1-off] 원래 True
     # ── [/ROLLBACK MARKER: stage1-vertex] ──
     # ── [ROLLBACK MARKER: stage1-contact-map] 32링크 접촉 맵(mask/normal/target)을 사람(SMPL-X) 대신 1단계 롤아웃에서
     #    같은 방식(물체 정점 → gamma 안 최근접 손 정점 → FPS → 링크별 평균)으로 만든 파일로 교체 (2026-09-09).
@@ -788,7 +792,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     #    (맵이 손끝 행을 포함). 파일이 없으면 경고를 찍고 사람 맵 + stage1_contact_vertex 로 동작한다.
     #    측정 근거: 사람 마스크와 1단계 실접촉(>1 N)의 링크별 IoU 가 knife 중지 distal 0.22 / middle 0.07,
     #    pan 소지 distal 0.12 등 — Shadow 손은 얇은 손잡이를 손끝이 아니라 중간 마디로 감싼다.
-    stage1_contact_map: bool = True   # [ROLLBACK MARKER: ref-track] True→False (2026-09-10): 접촉 맵도 사람 맵(hand_contact.npz) 사용
+    stage1_contact_map: bool = False  # [ablation-stage1-off] 원래 True
     stage1_contact_map_file: str = "hand_contact_stage1.npz"
     # ── [ROLLBACK MARKER: cws-human-ref] CWS 보상의 레퍼런스 지지함수 σ_h 에 쓰는 접촉 집합 (2026-09-09).
     #    "human" = 사람 접촉 맵(hand_contact.npz, 이전과 동일). stage1_contact_map 이 로드돼도 σ_h 만은 사람 접촉으로
