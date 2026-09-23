@@ -1,25 +1,7 @@
-"""Configuration for the G1 + Shadow-hand full-body loco-manipulation task.
+"""G1 + 양손 Shadow 전신 loco-manipulation (SONIC 잔차) 환경 설정.
 
-Unitree G1 (29-DOF body: 12 legs + 3 waist + 14 arms) with its Dex3 3-finger hands
-REPLACED by two Shadow Dexterous Hands (18 actuated DOF each) → 65 actuated DOF total,
-FLOATING base. The policy imitates retargeted ParaHome SMPL-X whole-body motion
-(walking + bimanual object manipulation).
-
-This EXTENDS the fixed-base single-hand grasp task (robotis_shadow_grasp_rsi) to full
-body + bimanual + locomotion. Reused mechanisms: adaptive frame-sampling curriculum,
-pretrain→train + pretrain-cache RSI warm-start, contact-conditioned fingertip force,
-per-group action EMA smoothing. New: root/locomotion tracking, balance + foot contact,
-fall (reference-deviation) termination, full-body proprioception.
-
-ASSET STATUS — the composite G1+Shadow USD is BUILT and validated:
-  * data/robots/G1/G1_shadow.usd — G1_29DOF flattened, Dex3 stripped, bimanual Shadow
-    grafted (right reused + left geometric-mirror), mounted at the wrists. Spawn-tested:
-    78 bodies / 73 DOF, actuators cover 65 (8 J0 coupling joints uncoupled by design),
-    assembled + bounded under gravity (scripts/process_dataset/diagnostics/spawn_test_g1_shadow.py).
-  * G1_SHADOW_CFG below is the validated ArticulationCfg (G1_29DOF body actuators +
-    Shadow finger gains). Instancing was assessed and found unnecessary (G1 geometry is
-    flatten-instanced; Shadow collision is primitive Cubes → no per-env cook cost).
-  * body-link / fingertip-body names are CONFIRMED against the composite USD.
+로봇은 Unitree G1 몸 29 DOF 에 Shadow 손 2개(각 18 구동)를 붙인 65 구동 DOF, floating base 다.
+정책은 리타게팅된 ParaHome SMPL-X 전신 동작과 물체 궤적을 추종한다.
 """
 
 from __future__ import annotations
@@ -37,116 +19,27 @@ from isaaclab.utils import configclass
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
 _ROBOT_USD = str(_DATA_DIR / "robots" / "G1" / "G1_shadow.usd")
 
-# =============================================================================== #
-# Keypoint-tracking skeleton (design spec → constants)
-# =============================================================================== #
-# ParaHome joint_positions layout: [0:23]=body, [23:48]=left hand(25), [48:73]=right hand(25).
-# (parahome.py stores the raw (F,73,3) array; blocks split by this layout.)
-# Hand-25 order (per hand), VERIFIED against ParaHome visualize/utils.py hand-order dicts:
-#   0=Wrist, 1-5=CMC/palm-knuckle row (thumb..pinky — proximal to the finger MCPs, distinct
-#   joints), then a 4-point chain per finger MCP/PIP/DIP/Tip in REVERSE finger order:
-#   pinky:6-9, ring:10-13, middle:14-17, index:18-21, thumb:22=MCP,23=IP,24=Tip (thumb has 3).
 
-# --- Body: 16 of the 23 ParaHome body joints → G1 body links ------------------------
-# The 23-joint ParaHome body skeleton (Xsens-MVN-style rig; VERIFIED against ParaHome
-# visualize/utils.py `body_order`, bone_vectors.pkl hierarchy, and frame-0 geometry):
-#   0 pHipOrigin* 1 jL5S1  2 jL4L3  3 jL1T12  4 jT9T8*  5 jT1C7  6 jC1Head
-#   7 jRightT4Shoulder  8 jRightShoulder* 9 jRightElbow* 10 jRightWrist*
-#   11 jLeftT4Shoulder  12 jLeftShoulder* 13 jLeftElbow* 14 jLeftWrist*
-#   15 jRightHip* 16 jRightKnee* 17 jRightAnkle* 18 jRightBallFoot*
-#   19 jLeftHip*  20 jLeftKnee*  21 jLeftAnkle*  22 jLeftBallFoot*     (* = tracked below)
-# UNUSED (7): {1,2,3}=lumbar/thoracic spine segments, 5=jT1C7 (base of neck), 6=jC1Head,
-#   {7,11}=T4-anchored clavicle/scapula. None is an INDEPENDENTLY-ARTICULATED G1 body:
-#   G1_29DOF's trunk is only the 3 waist joints → torso_link (arms mount at torso_link), and
-#   the HEAD DOES EXIST but is RIGIDLY FUSED into torso_link (head_link + d435/mid360 geometry
-#   at torso-frame z≈+0.38 m; NO neck joint) — so tracking jC1Head would only re-track the torso
-#   AND would wrongly force the torso to chase the human's independent (neck) head motion (common
-#   head-down gaze during manipulation). Spine/clavicle likewise have no independent body. Dropped
-#   — NOT forced (user-confirmed). pelvis(0)+torso_link(4)+shoulders(8,12)+hips(15,19) already
-#   bound trunk pose/orientation. All 16 targets below exist in G1_shadow.usd (CONFIRMED).
-# ── [ROLLBACK MARKER: smplx-kpts] ParaHome 스트림 -> SMPL-X 관절 (2026-09-04) ──────────────
-# 키가 SMPL-X 관절 인덱스입니다(옛 ParaHome/Xsens 인덱스가 아님). 구성은 PyRoki 원본
-# (examples/retarget_helpers/_utils.py get_humanoid_retarget_indices) 의 13쌍과 동일하며,
-# retarget_g1_pyroki.py 의 _BODY 와도 같아야 합니다 — 두 곳이 어긋나면 리타게팅이 맞춘 것과
-# 보상이 재는 것이 달라집니다.
-#   torso 는 제거했습니다(사용자 결정). 사람 상흉부(spine3, 골반 기준 25.1 cm)를 torso_link
-#   (골반 기준 4.4 cm)에 맞추는 대응은 오프셋 없이는 성립하지 않고, PyRoki 도 척추를 쓰지 않습니다.
-#   상체 방향은 local_alignment(어깨-골반 상대 기하)가 잡습니다.
-# SMPL-X 순서: 0 pelvis, 1/2 hip, 3 spine1, 4/5 knee, 6 spine2, 7/8 ankle, 9 spine3,
-#             10/11 foot, 12 neck, 13/14 collar, 15 head, 16/17 shoulder, 18/19 elbow, 20/21 wrist
+# 추적 몸 키포인트: ParaHome 관절 인덱스 → G1 링크
 BODY_KPTS: dict[int, str] = {
-    0:  "pelvis",                     # pelvis (root)
-    17: "right_shoulder_pitch_link",  # right_shoulder
-    19: "right_elbow_link",           # right_elbow
-    21: "right_wrist_yaw_link",       # right_wrist (distal forearm; arm mount)
-    16: "left_shoulder_pitch_link",   # left_shoulder
-    18: "left_elbow_link",            # left_elbow
-    20: "left_wrist_yaw_link",        # left_wrist
-    2:  "right_hip_pitch_link",       # right_hip (leg-root body)
-    5:  "right_knee_link",            # right_knee
-    8:  "right_ankle_roll_link",      # right_ankle (foot; 1 pt/foot, GRAIL-style)
-    1:  "left_hip_pitch_link",        # left_hip
-    4:  "left_knee_link",             # left_knee
-    7:  "left_ankle_roll_link",       # left_ankle
+    0:  "pelvis",  # 루트
+    17: "right_shoulder_pitch_link",
+    19: "right_elbow_link",
+    21: "right_wrist_yaw_link",
+    16: "left_shoulder_pitch_link",
+    18: "left_elbow_link",
+    20: "left_wrist_yaw_link",
+    2:  "right_hip_pitch_link",
+    5:  "right_knee_link",
+    8:  "right_ankle_roll_link",
+    1:  "left_hip_pitch_link",
+    4:  "left_knee_link",
+    7:  "left_ankle_roll_link",
 }
-# BODY = 14 links (pelvis, torso, shoulders/elbows/wrists ×2, hips/knees/ankles ×2) — matches GRAIL's
-# 14 tracked bodies. The ballfoot toe points (jRightBallFoot 18 / jLeftBallFoot 22) were DROPPED
-# (user 2026-07-20, GRAIL-aligned) — feet are now 1 pt/foot (ankle_roll), same as GRAIL; the foot pitch
-# they used to add is left to the frozen SONIC base (which owns feet/balance).
 
-# Per-body-keypoint LOCAL offset (in the target G1 link frame), added (rotated) to the body origin
-# before tracking. (The FOOT_TOE_OFFSET for the ballfoot keypoints was removed with those keypoints
-# 2026-07-20.) jT9T8 (upper spine, idx 4) ≠ torso_link ORIGIN (at the waist, ~0.27 m lower). Track a point on
-# G1's UPPER torso (torso_link + this local offset ≈ upper chest) so the correspondence is
-# anatomically aligned instead of ~0.27 m off. Measured: jT9T8 in torso_link local frame at a
-# standing posture. (env robot-kpt = torso_link origin + offset; retarget targets the same frame.)
-TORSO_KPT_OFFSET: list[float] = [-0.033, 0.0, 0.274]
-# [smplx-kpts] torso 키포인트를 제거했으므로 오프셋 대상이 없습니다. TORSO_KPT_OFFSET 상수는
-# 되돌릴 때 쓰도록 위에 남겨둡니다(현재 어느 키포인트에도 적용되지 않습니다).
-BODY_KPT_OFFSETS: dict[int, list[float]] = {}
-
-# --- Hands: 20 keypoints per hand = wrist(1) + 4 fingers×4 + thumb×3. ------------------
-# ParaHome hand-local idx (0..24) → Shadow body. Applied to BOTH hands; the left-hand block
-# is offset by +23 in joint_positions, right by +48 (block-offset machinery handles this).
-# Shadow bodies get the robot0_{l,r}_ prefix at build time. Fingertip (Tip) tracks the pad
-# VERTEX (from preprocessing) at the distal body + offset. The WRIST anchors the hand base:
-# ParaHome hand-local 0 → Shadow palm (robot0_{l,r}_palm), matching the single-hand grasp
-# env's MANO-wrist→palm convention (palm is the hand-root body). It is a body-origin keypoint
-# (no pad offset/normal). Complementary to body jRightWrist(10)/jLeftWrist(14)→wrist_yaw_link.
-# ── [ROLLBACK MARKER: hand-kpt-align] 손 키포인트 대응 정정 (2026-08-15) ─────────────────────
-# 이전 대응은 사람 관절과 로봇 링크가 한 칸씩 어긋나 있었습니다. 원인은 Shadow 손가락에서
-# <finger>knuckle 과 <finger>proximal 의 링크 원점이 **같은 위치**라는 점입니다(측정: 간격
-# 0.00 cm — 둘 사이 관절 J2 는 순수 회전이라 병진 오프셋이 없습니다). 그래서 옛 대응은
-# 3.67 cm 떨어진 사람의 MCP 와 PIP 를 항상 같은 지점에 있는 두 링크에 요구했고, 원리적으로
-# 동시에 만족될 수 없었습니다. 그 어긋남이 뒤로 밀리며 DIP 도 한 칸 틀어졌습니다.
-#
-# 리타게팅된 레퍼런스에서 잰 키포인트별 오차(왼손, 옛 대응):
-#     MCP 1.60 / PIP 4.80 / DIP 2.94 / TIP 2.23 cm   <- 가운데 둘만 2~3배
-#
-# 로봇 손가락의 구분되는 위치는 3곳(A=knuckle=proximal, B=middle, C=distal)이고, 여기에 pad
-# 오프셋을 더하면 4번째 점(C+pad = 손끝)이 생깁니다. 그래서 distal 을 두 번 씁니다 —
-# 오프셋 0 이면 DIP, pad 오프셋이면 TIP. 키포인트 수가 20/손으로 유지되므로 관측 차원(54)은
-# 그대로입니다. pad 크기 1.85 cm 가 사람 DIP->TIP 1.79 cm 와 일치하는 것이 이 대응의 근거입니다.
-#
-# 엄지는 사람이 3점(22,23,24=TIP)뿐이라 마디 길이 비율로 후보를 비교해 정했습니다
-# (네 손가락의 로봇/사람 비율 1.03~1.26 이 기준):
-#     옛 대응 22->thproximal,23->thmiddle : 비율 1.39 / 1.92  편차 0.980
-#     채택   22->thmiddle,  23->thdistal  : 비율 1.17 / 0.79  편차 0.388   <- 2.5배 일치
-#
-# `offset` 은 키포인트별입니다. 예전에는 링크 이름으로 FINGERTIP_OFFSETS 를 조회해서 같은 링크를
-# 두 번 쓸 수 없었습니다. ZERO/PAD 는 아래에서 좌우 미러까지 적용해 만듭니다.
-# 되돌리기: 이 블록을 git 이전 판으로 (관측 차원은 어느 쪽이든 54라 형태는 호환되지만, 키포인트의
-# 의미가 바뀌므로 체크포인트는 재학습해야 합니다).
+# 손 키포인트 체인: ParaHome 손 관절 인덱스 ↔ Shadow 링크 (pad=True 면 손끝 pad 오프셋 적용)
 HAND_CHAIN: dict[str, dict] = {
-    #             [ParaHome idx]              [Shadow body]                 [offset key]
-    # [smplx-kpts] "parahome" 키 이름은 그대로 두되 값은 SMPL-X 손 블록 로컬 인덱스입니다
-    # (왼손 base 25 / 오른손 base 40, 블록 순서 index1-3 middle1-3 pinky1-3 ring1-3 thumb1-3).
-    # 손끝(Tip)은 SMPL-X 손 블록에 관절이 없으므로 pad 배열(joints 뒤에 이어붙인 55.. 블록)을
-    # 가리킵니다 — 값 -1..-5 는 "pad 블록의 n번째"를 뜻하고 env 가 해석합니다.
-    # 손목은 SMPL-X 몸통 20/21 이라 손 블록에 없어 -10(왼)/-11(오른) 로 표시합니다.
-    # 엄지 3쌍은 TJ 의 검증된 MANO↔Shadow 매핑(gr_env_cfg.py)과 동일합니다.
     "wrist":  {"parahome": [-10],            "shadow": ["palm"],           "pad": [False]},
-    #             [MCP, PIP, DIP, Tip]        [knuckle, middle, distal, distal(+pad)]
     "index":  {"parahome": [0, 1, 2, -2],    "shadow": ["ffknuckle", "ffmiddle", "ffdistal", "ffdistal"],
                "pad": [False, False, False, True]},
     "middle": {"parahome": [3, 4, 5, -3],    "shadow": ["mfknuckle", "mfmiddle", "mfdistal", "mfdistal"],
@@ -155,19 +48,11 @@ HAND_CHAIN: dict[str, dict] = {
                "pad": [False, False, False, True]},
     "pinky":  {"parahome": [6, 7, 8, -5],    "shadow": ["lfknuckle", "lfmiddle", "lfdistal", "lfdistal"],
                "pad": [False, False, False, True]},
-    #             [MCP, IP, DIP, Tip]         [thbase, middle, distal, distal(+pad)]
     "thumb":  {"parahome": [12, 13, 14, -1], "shadow": ["thbase", "thmiddle", "thdistal", "thdistal"],
                "pad": [False, False, False, True]},
 }
 
-# Robot-side fingertip = distal body origin + LOCAL offset (rotated), pad faces LOCAL normal.
-# Base values (right hand) reused verbatim from the grasp env (Shadow-distal local frame).
-# LEFT-hand fingers need the Y component NEGATED: the left Shadow was built by a geometric
-# Y-reflection (mesh points Y-negated), so the pad surface moved from local −Y to local +Y.
-# VERIFIED on the composite USD (scripts, rest pose): right finger pads → world +Z; left with
-# the SAME local normal → world −Z (wrong; the XZ-mirror preserves Z), left with Y-flipped
-# normal → world +Z (correct). The THUMB normal/offset have Y=0, so they are mirror-invariant
-# and identical on both hands. Keyed by FULL body name (robot0_{l,r}_<body>).
+# 손끝 pad 오프셋과 pad 바깥 법선 (오른손 링크 좌표, TJ gr 과 같음). 왼손은 Y 대칭으로 만든다.
 _FT_OFFSET_BASE: dict[str, list[float]] = {
     "thdistal": [-0.0085, 0.0, 0.02],
     "ffdistal": [0.0, -0.006, 0.0175],
@@ -184,33 +69,23 @@ _FT_NORMAL_BASE: dict[str, list[float]] = {
 }
 
 
-def _mirror_y(v: list[float]) -> list[float]:
-    return [v[0], -v[1], v[2]]
-
-
-def _build_ft(base: dict[str, list[float]]) -> dict[str, list[float]]:
+def _both_hands(base: dict[str, list[float]]) -> dict[str, list[float]]:
+    """오른손 링크 좌표 값을 양손 dict 로. 왼손은 Y 대칭."""
     out: dict[str, list[float]] = {}
     for body, v in base.items():
         out[f"robot0_r_{body}"] = list(v)
-        # thumb (Y=0) is mirror-invariant; the four fingers flip Y for the mirrored left hand.
-        out[f"robot0_l_{body}"] = list(v) if body == "thdistal" else _mirror_y(v)
+        out[f"robot0_l_{body}"] = [v[0], -v[1], v[2]]
     return out
 
 
-FINGERTIP_OFFSETS: dict[str, list[float]] = _build_ft(_FT_OFFSET_BASE)
-FINGERTIP_PAD_NORMALS: dict[str, list[float]] = _build_ft(_FT_NORMAL_BASE)
+FINGERTIP_OFFSETS: dict[str, list[float]] = _both_hands(_FT_OFFSET_BASE)
+FINGERTIP_PAD_NORMALS: dict[str, list[float]] = _both_hands(_FT_NORMAL_BASE)
 
-# Number of tracked keypoints (obs/reward): body 14 (BODY_KPTS entries, GRAIL-aligned) + hands
-# (wrist=1, index/mid/ring/pinky=4, thumb=3 → 20 per hand) × 2 = 54.
-N_BODY_KPTS = len(BODY_KPTS)                      # 13 [smplx-kpts] torso 제거
-N_HAND_KPTS_PER_HAND = sum(len(v["parahome"]) for v in HAND_CHAIN.values())  # 21 (손목1+손가락15+손끝5)
-N_TRACK_KPTS = N_BODY_KPTS + 2 * N_HAND_KPTS_PER_HAND                          # 55
+N_BODY_KPTS = len(BODY_KPTS)  # 13
+# 21 (손목 1 + 손가락 15 + 손끝 5)
+N_HAND_KPTS_PER_HAND = sum(len(v["parahome"]) for v in HAND_CHAIN.values())
 
-# --- Per-link CONTACT set for the Option-A per-link contact-FORCE reward ------------------
-# The wrap links whose object contact is precomputed in hand_contact.npz (parahome_hand_contact.py) and
-# rewarded per-link (force_matrix · reaction-normal, gated by the reference contact mask). Order MUST match
-# parahome_hand_contact.py `link_names`: per hand = palm + [proximal,middle,distal]×[ff,mf,lf,rf,th]; LEFT
-# block then RIGHT block. Each link gets its OWN ContactSensor (object-filtered).
+# 접촉 보상에 쓰는 wrap 링크: 양손 × (palm + 5손가락 × 3마디) = 32
 _LINK_CONTACT_FINGERS = ["ff", "mf", "lf", "rf", "th"]
 _LINK_CONTACT_SEGS = ["proximal", "middle", "distal"]
 LINK_CONTACT_NAMES: list[str] = [
@@ -218,132 +93,58 @@ LINK_CONTACT_NAMES: list[str] = [
     for s in ("l", "r")
     for b in (["palm"] + [f"{fg}{seg}" for fg in _LINK_CONTACT_FINGERS for seg in _LINK_CONTACT_SEGS])
 ]
-N_LINK_CONTACT = len(LINK_CONTACT_NAMES)          # 32 (2 hands × (1 palm + 5 fingers × 3 segs))
+N_LINK_CONTACT = len(LINK_CONTACT_NAMES)  # 32
 
-# Per-link OUTWARD pad/palmar normal (link-LOCAL), one per wrap link — the "grasping face" of each link,
-# used by the per-link contact-force reward: force is projected on the link's OWN inward normal (like the
-# fingertip pad, `force·(-pad_normal)`) instead of the object-anchored reference reaction dir, so touching
-# with the WRONG face (e.g. back of the palm) yields no compressive force; and an ORIENTATION GATE requires
-# the link's inward normal to align with the reference reaction normal within `contact_normal_gate_tol`.
-# Right-hand base; the left hand is a geometric Y-reflection so the four fingers + palm flip local Y (thumb
-# has Y=0 → mirror-invariant, identical on both hands). VERIFIED on G1_shadow.usd rest pose (2026-07-22):
-# every non-thumb face → world +Z (dot>0.7, coplanar open-hand palmar), every thumb face ≤35° from the
-# trusted TJ thumb-distal normal [-1,0,0] (thumb opposes the fingers → not +Z). Keyed by short body name.
+# 링크별 바깥쪽 접촉면 법선 (오른손 링크 좌표). 접촉력은 이 면의 안쪽 방향으로 투영한다.
 _LINK_NORMAL_BASE: dict[str, list[float]] = {
     "palm": [0.0, -1.0, 0.0],
     **{f"{fg}{seg}": [0.0, -1.0, 0.0] for fg in ("ff", "mf", "lf", "rf") for seg in _LINK_CONTACT_SEGS},
     **{f"th{seg}": [-1.0, 0.0, 0.0] for seg in _LINK_CONTACT_SEGS},
 }
+LINK_PAD_NORMALS: dict[str, list[float]] = _both_hands(_LINK_NORMAL_BASE)
 
 
-def _build_link_normals(base: dict[str, list[float]]) -> dict[str, list[float]]:
-    out: dict[str, list[float]] = {}
-    for body, v in base.items():
-        out[f"robot0_r_{body}"] = list(v)
-        out[f"robot0_l_{body}"] = _mirror_y(v)          # thumb has Y=0 → mirror is identity
-    return out
-
-
-LINK_PAD_NORMALS: dict[str, list[float]] = _build_link_normals(_LINK_NORMAL_BASE)  # 32, full body-name keys
-
-
-# =============================================================================== #
-# Joint groups (action + control), by G1/Shadow joint-name regex
-# =============================================================================== #
-# G1_29DOF joint naming (isaaclab_assets/robots/unitree.py) + Shadow robot0_* naming.
+# 액션 관절 그룹 (순서 = legs → waist → arms → hands). 몸 29 는 SONIC 이, 손 36 은 정책이 구동한다.
 JOINT_GROUPS: dict[str, dict] = {
     "legs":  {"expr": [".*_hip_yaw_joint", ".*_hip_roll_joint", ".*_hip_pitch_joint",
                        ".*_knee_joint", ".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
-              "dof": 12, "ema_alpha": 0.3},
+              "dof": 12},
     "waist": {"expr": ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
-              "dof": 3, "ema_alpha": 0.3},
+              "dof": 3},
     "arms":  {"expr": [".*_shoulder_pitch_joint", ".*_shoulder_roll_joint", ".*_shoulder_yaw_joint",
                        ".*_elbow_joint", ".*_wrist_pitch_joint", ".*_wrist_roll_joint", ".*_wrist_yaw_joint"],
-              "dof": 14, "ema_alpha": 0.3},
-    # Shadow 18 actuated per hand (J1/J2/J3 ×5 + LFJ4 + THJ4 + THJ0); J0 tendon-coupled.
+              "dof": 14},
     "hands": {"expr": ["robot0_(l|r)_(FF|MF|RF|LF|TH)J[1-3]",
                        "robot0_(l|r)_LFJ4", "robot0_(l|r)_THJ4", "robot0_(l|r)_THJ0"],
-              "dof": 36, "ema_alpha": 0.5},
+              "dof": 36},
 }
-ACTION_DIM = sum(g["dof"] for g in JOINT_GROUPS.values())   # 65
 
 
-# =============================================================================== #
-# Robot: composite G1 (29-DOF body) + bimanual Shadow (18 actuated DOF/hand) = 65 DOF.
-# =============================================================================== #
-# FLOATING base (fix_root_link=False) with real gravity — the policy must physically
-# balance while tracking the retargeted whole-body trajectory. Actuators reproduce the
-# proven layouts: G1_29DOF_CFG (legs/feet DCMotor, waist/arms implicit) for the body and
-# the robotis_shadow_grasp Shadow finger PD (stiffness 1.0 / damping 0.2 / effort 3.09)
-# for both hands. The 8 J0 coupling joints (FFJ0/MFJ0/RFJ0/LFJ0 ×2) are intentionally left
-# to their USD drive (as in the single-hand task). Validated by spawn_test_g1_shadow.py.
+# G1 + 양손 Shadow 합성 USD.
 G1_SHADOW_CFG = ArticulationCfg(
     prim_path="/World/envs/env_.*/Robot",
     spawn=sim_utils.UsdFileCfg(
         usd_path=_ROBOT_USD,
-        activate_contact_sensors=True,   # per-foot (ground) + per-fingertip (object) sensors
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,       # floating base must balance under real gravity
+            disable_gravity=False,
             retain_accelerations=False,
             linear_damping=0.0,
             angular_damping=0.0,
             max_linear_velocity=1000.0,
             max_angular_velocity=1000.0,
-            # [ROLLBACK MARKER: depen-vel] Cap on how fast PhysX pushes an overlap apart. This is NOT
-            # a bounce — restitution is 0.0 on the robot, the object and every context collider, so
-            # nothing here is elastic. It is the depenetration impulse, and the robot absorbs ALL of
-            # it because the supports are spawned kinematic (infinite mass).
-            #
-            # It fires every reset: the retargeted reference holds the hand a few mm inside whatever
-            # it rests on (measured on s101_seg12_knife: cutting board 6.2 mm on 82% of frames, sink
-            # 6.4 mm on 72%), and PhysX ejects that overlap on the first step. Measured hand speed one
-            # step after a pinned reset: 0.35 m/s with no context objects, 0.57 m/s with them — the
-            # 0.22 m/s difference is this ejection, and it pushed the >3 cm displacement frames from
-            # 25.9% to 39.7%.
-            #
-            # 1.0 -> 0.1 lets the overlap resolve over several steps instead of one kick. The cost is
-            # that a deep overlap now persists longer, so watch the reset-step hand displacement and
-            # the early-episode termination rate together. Raising this value was tried before and did
-            # nothing (at 20 the results were byte-identical — the cap was never binding upward);
-            # lowering it is the untested direction, which is why it is marked for rollback.
             max_depenetration_velocity=1.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            # Match G1_29DOF locomotion setup. Self-collision off (full humanoid + 2 hands is
-            # expensive and destabilizing); revisit if hand↔object/body contact needs it.
             enabled_self_collisions=False,
             fix_root_link=False,
             solver_position_iteration_count=8,
             solver_velocity_iteration_count=4,
         ),
-        # ── [ROLLBACK MARKER: hand-tendon] Shadow 손 J1<->J0 고정 텐던 (2026-08-15) ──────────
-        # 실제 Shadow Hand는 말단 마디(J0)가 중간 마디(J1)에 텐던으로 결합돼 함께 감깁니다. 그게
-        # 물체를 감싸 쥐는 마지막 마디입니다. 이 줄이 없으면 J0는 아무 힘도 받지 않습니다 —
-        # USD에 baked된 텐던 값이 전부 0이라(stiffness 0 / damping 0 / limitStiffness 미저작)
-        # 자산은 "배선"만 갖고 있고 힘은 여기서 공급해야 합니다. 값은 IsaacGymEnvs shadow_hand.py
-        # 및 Isaac Lab SHADOW_HAND_CFG와 동일한 정준값(30 / 0.1~0.2)입니다.
-        #
-        # ★ 자산 쪽 선행 수정이 반드시 함께 가야 합니다 ★
-        # scripts/process_dataset/assets/fix_tendon_axis_drives.py 로 텐던 축 관절 8개
-        # (robot0_{l,r}_{FF,MF,RF,LF}J0)의 USD 조인트 드라이브를 제거했습니다. 그 드라이브
-        # (stiffness=1.0, target=0, maxForce=inf)가 J0를 0에 붙들고 있었고, 액추에이터 정규식
-        # (J[1-3])이 J0를 잡지 않아 그대로 살아 있었습니다. 텐던이 그것과 싸우다 발산합니다.
-        # NVIDIA 원본과 TJ 자산의 J0에는 드라이브가 없습니다. Isaac Lab도 같은 전제입니다 —
-        # sim/schemas/schemas.py:638이 텐던 축 관절의 드라이브 수정을 건너뜁니다.
-        # 둘 중 하나만 적용하면 안 됩니다: 자산만 고치면 J0가 자유 관절로 덜렁거리고,
-        # 이 줄만 넣으면 발산합니다.
-        #
-        # 실측(생산 자산, 손가락 J1을 가동범위 60%까지 왕복):
-        #   수정 전 + ls=30            발산 step 67 (robot0_{l,r}_RFJ1이 10.26 rad)
-        #   수정 후 + 텐던 파라미터 없음  정상, J0 범위 0.000        <- 결합 출처 대조군
-        #   수정 후 + ls=30 d=0.2      정상, J1 0.556 -> J0 0.543, 상관 0.909, 기울기 0.913
-        #   수정 후 + ls=100 d=0.2     정상, 동일(0.912)            <- 강성 3배에도 무감각
-        #   TJ 자산(22-DOF) 참조값                                  기울기 0.912
-        # 되돌리기: 이 줄 삭제 + G1_shadow.usd.pre_tendon.bak 복원 (둘 다 해야 함).
+        # J0-J1 텐던 결합
         fixed_tendons_props=sim_utils.FixedTendonPropertiesCfg(limit_stiffness=30.0, damping=0.2),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        # Standing default (G1_29DOF pose); RSI overrides root+joints from the reference at reset.
         pos=(0.0, 0.0, 0.75),
         rot=(0.7071, 0.0, 0.0, 0.7071),
         joint_pos={
@@ -355,31 +156,7 @@ G1_SHADOW_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        # ---- G1 body: SONIC actuator gains (GEAR SONIC g1.py G1_CYLINDER_MODEL_12_DEX_CFG).
-        #      The frozen SONIC decoder was trained with THESE gains + the per-joint action scale
-        #      SONIC_SCALE = 0.25*effort/stiffness, so its a_sonic maps to the intended PD torque
-        #      ONLY with this exact stiffness/damping/armature (verified via sonic_playback.py).
-        #      Do NOT substitute the locomanip locomotion gains here. Groups mirror
-        #      sonic_playback.py::_sonic_actuators. Shadow fingers unchanged (SONIC has no hands).
-        #
-        # ── [ROLLBACK MARKER: sonic-limits] effort/velocity 한계도 SONIC 원본에 맞춤 (2026-09-04)
-        # 이전에는 effort 를 300/300/200/150/150, velocity 를 전부 100 으로 넓혀 두었습니다
-        # (사유 주석: "SONIC's own 5 Nm wrists saturate under object load"). 상류 커밋
-        # 087f9ac 의 G1_CYLINDER_MODEL_12_DEX_CFG 와 29관절 전체를 대조한 결과 stiffness/
-        # damping/armature 는 29/29 일치하는데 effort/velocity 는 29/29 달랐습니다. 프리어가
-        # 학습된 조건(sonic_release/config.yaml: type g1_model_12_dex)에 맞추는 것이 맞다는
-        # 판단으로 원본 값으로 되돌립니다.
-        #   부수 효과: SONIC_SCALE = 0.25*effort/stiffness 를 담은 sonic_prior.py 의
-        #   _SONIC_SCALE_RULES 는 원래부터 상류 effort(예: 허리 50)로 계산돼 있었습니다. 즉
-        #   이전 cfg 는 "스케일은 50 기준, 시뮬레이터 한계는 200"으로 어긋나 있었고 이제 일치합니다.
-        #   우리 5개 그룹 경계가 상류 값 경계와 정확히 맞아 관절별 dict 없이 스칼라로 됩니다
-        #   (상류 legs/arms 는 dict 지만, 우리 그룹 안에서는 값이 균일합니다).
-        # 실측 여유 (s101_seg29_pot 롤아웃 332스텝, |tau| 최대 / 새 한계):
-        #   hip_knee 95.3/139  hipyaw_waistyaw 27.4/88  ankle_waist 45.0/50
-        #   shoulder_elbow 19.1/25  wrist_pitchyaw 5.0/5   -> 포화 스텝 0%
-        #   velocity 는 최대 10.58/20 로 여유가 큽니다. 다만 wrist_pitch 는 1스텝에서 4.998 까지
-        #   튀어 5.0 과 여유가 거의 없습니다 — 다른 클립에서 간헐 포화가 나올 수 있으니
-        #   Diag 의 토크/포화 지표를 함께 보세요. 되돌리기: 아래 5줄을 옛 값으로.
+        # 몸 29관절: SONIC 이 학습된 게인과 같아야 한다 (sonic_prior 값).
         "sonic_hip_knee": ImplicitActuatorCfg(
             joint_names_expr=[".*_hip_pitch_joint", ".*_hip_roll_joint", ".*_knee_joint"],
             effort_limit_sim=139.0, velocity_limit_sim=20.0,
@@ -402,7 +179,7 @@ G1_SHADOW_CFG = ArticulationCfg(
             joint_names_expr=[".*_wrist_pitch_joint", ".*_wrist_yaw_joint"],
             effort_limit_sim=5.0, velocity_limit_sim=22.0,
             stiffness=16.7783, damping=1.0681, armature=0.00425),
-        # ---- Bimanual Shadow fingers (from robotis_shadow_grasp): 18 actuated DOF/hand ----
+        # Shadow 손가락 18 × 2 (J0 는 텐던으로 J1 에 결합)
         "shadow_fingers": ImplicitActuatorCfg(
             joint_names_expr=[
                 "robot0_(l|r)_(FF|MF|RF|LF|TH)J[1-3]",
@@ -417,152 +194,26 @@ G1_SHADOW_CFG = ArticulationCfg(
 
 @configclass
 class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
-    # --- Robot -----------------------------------------------------------------
-    # Composite G1 + bimanual Shadow (validated). FLOATING base (fix_root_link=False in
-    # G1_SHADOW_CFG.spawn.articulation_props) for locomotion.
-    robot_cfg: ArticulationCfg = G1_SHADOW_CFG
-    # ── [ROLLBACK MARKER: waist-gain-mult] ────────────────────────────────────────────────
-    # 허리 3관절의 PD 게인 배수. 액션 스케일은 건드리지 않습니다 (sonic_prior 값 유지:
-    # roll/pitch 0.4386, yaw 0.5475). 상류 SONIC v1.1 의 발목 배포 튜닝과 같은 성격입니다
-    # (README:164  --motor-kp-scale 4,10=1.5 --motor-kd-scale 4,10=1.5  -> 모터 게인만 1.5배).
-    #
-    #   배수   roll/pitch k, d        yaw k, d           w_n      zeta
-    #   1.0    28.5013, 1.8143        40.1795, 2.5579    10.0 Hz  2.00   (SONIC 원래값)
-    #   1.5    42.7520, 2.7215        60.2693, 3.8369    12.2 Hz  2.45   <- 현재
-    #   2.0    57.0026, 3.6286        80.3590, 5.1158    14.1 Hz  2.83
-    #
-    # 스케일을 같이 바꾸지 않는 이유: `scale = 0.25*effort/k` 는 k 가 약분되어
-    # tau = 0.25*effort*a 가 되도록 맞춘 규약이라 "|a|=1 = 최대 토크의 25%" 가 전 관절에서
-    # 같습니다. 스케일 1.0 이면 허리만 |a|=0.333 에서 토크 한계에 닿고(나머지는 |a|=4),
-    # k 에 맞춰 재계산하면(0.0833) 허리 권한이 5배 줍니다. 둘 다 얼어 있는 SONIC 을 분포
-    # 밖으로 밀어냅니다.
-    #
-    # 참고 실측(agent_26000, s101_seg29_pot): 허리 강성을 0.5/1/2배로 바꿔도 진동 최고점이
-    # 1.00 Hz 로 고정이었고, 부드러울수록 진폭이 컸습니다(46.3 / 26.7 / 21.9도). 게인이
-    # 지배적 지렛대가 아니라는 신호입니다. 같은 게인에서 로봇만 레퍼런스에 고정하면 명령이
-    # 3배 줄었습니다(waist_pitch a_sonic RMS 1.90 -> 0.63).
-    # 되돌리기: 1.0 (블록 전체가 건너뛰어지고 기존 그룹 구성이 그대로 남습니다).
-    waist_gain_scale: float = 1.5
-    # ── [/ROLLBACK MARKER: waist-gain-mult] ───────────────────────────────────────────────
-    # ── [ROLLBACK MARKER: ankle-gain-mult] ────────────────────────────────────────────────
-    # 좌우 ankle_pitch 의 PD 게인 배수. 액션 스케일(0.4386)은 건드리지 않습니다.
-    # 상류 SONIC v1.1 실기 배포 튜닝을 그대로 옮긴 것입니다 (README:164):
-    #     ./deploy.sh --motor-kp-scale 4,10=1.5 --motor-kd-scale 4,10=1.5 real
-    # 인덱스 4/10 = 좌우 ankle_pitch (robot_parameters.hpp:90 enum G1JointIndex 로 확인).
-    # 하드웨어 모터 인덱스라 시뮬레이션 관절 순서가 아닙니다 — G1_ISAACLab_ORDER 였다면
-    # 4/10 은 right_hip_roll / right_knee 입니다.
-    #
-    #   배수   ankle_pitch k, d        w_n      zeta
-    #   1.0    28.5013, 1.8143         10.0 Hz  2.00   (SONIC 원래값)
-    #   1.5    42.7520, 2.7215         12.2 Hz  2.45   <- 현재
-    #
-    # ankle_roll(5, 11번)은 플래그 대상이 아니라 원래 게인을 유지합니다.
-    # 실측(agent_26000, s101_seg29_pot): ankle_pitch 포화율 33.9% / 37.2% 로 허리 다음이었습니다.
-    # 되돌리기: 1.0.
-    ankle_gain_scale: float = 1.5
-    # ── [/ROLLBACK MARKER: ankle-gain-mult] ───────────────────────────────────────────────
+    # ---- 로봇 / 제어 ----
+    robot_cfg: ArticulationCfg = G1_SHADOW_CFG  # G1 + 양손 Shadow, floating base
+    waist_gain_scale: float = 1.5  # 허리 3관절 PD 게인 배수 (액션 스케일은 그대로)
+    ankle_gain_scale: float = 1.5  # ankle_pitch PD 게인 배수 (SONIC v1.1 배포 튜닝과 같음)
+    decimation: int = 4  # 200 Hz 물리 / 4 = 50 Hz 제어 (SONIC 제어 주기)
 
-    # --- Control / sim ---------------------------------------------------------
-    decimation: int = 4                 # 50 Hz control (200/4) — SONIC's native control rate
-    # DERIVED, not a knob: the env OVERWRITES this in __init__ with ref_len / action_fps, because an
-    # episode now runs from its RSI start frame to the END of the reference sequence (variable length).
-    # It therefore only sets max_episode_length, which acts as a safety cap behind the frame-based
-    # time-out in _get_dones. The value below is a placeholder for cfg-dump readability.
-    #   History: this used to be a real 3.0 s chunk (150 frames @50 fps) and the RSI start was clamped
-    #   to [0, ref_len-150] so the chunk always fit — which made the tail of every clip unreachable as
-    #   a start (251-frame clip → [0,101]; a median 151-frame clip → [0,1], i.e. no RSI at all).
-    episode_length_s: float = 3.0
-    # ACTION = SONIC latent residual z_res(64) + bimanual Shadow hand action(36) = 100. The 29 body
-    # DOF are driven by the FROZEN SONIC decoder (z_res perturbs its FSQ latent pre-quantization,
-    # GRAIL Eq.6); the policy never commands body joints directly. Hands = ABSOLUTE action
-    # (user-locked): a_hand ∈ [-1,1] maps DIRECTLY to the Shadow joint range (EMA-smoothed), NOT a
-    # residual/delta. (Body ACTION_DIM=65 constant kept for the joint-group machinery.)
-    sonic_action_dim: int = 64          # z_res latent residual width (SONIC max_num_tokens×token_dim = 2×32)
-    hand_action_dim: int = 36           # bimanual Shadow finger action (ABSOLUTE, EMA-smoothed α=0.5)
-    # ── [ROLLBACK MARKER: soft-limit-hands] Shadow 손가락 관절의 soft 한계 factor (2026-09-10).
-    #    Isaac Lab 의 soft 한계는 PhysX 하드 한계에서 mean ± 0.5·range·factor 로 만든 학습용 안전 구간이고
-    #    ArticulationCfg.soft_joint_pos_limit_factor 는 float 하나라 G1 몸(0.9, SONIC 학습값)과 손이 같은 값을 받는다.
-    #    이 값이 0 보다 크면 env 초기화 직후 손가락 관절(robot0_*_(FF|MF|RF|LF|TH)J*, J0 포함)의 data.soft_joint_pos_limits 만
-    #    이 factor 로 다시 계산한다. 물리 하드 한계는 그대로다. _ctrl_lower/_ctrl_upper(손 액션 범위·PD 목표 클램프·핸드오버
-    #    클램프)가 이 버퍼를 읽으므로 손 액션 범위가 바뀐다. 1단계(hand pretrain) env 도 같은 필드를 읽어 두 단계가 같은 범위를 쓴다.
-    #    1.0 = 하드 한계와 동일(1단계가 지금까지 쓰던 값). 0.9 로 두면 굽힘 관절 양끝 4.5°, 엄지 벌림 6° 가 잘리고
-    #    1단계 롤아웃이 한계에 붙어 쓰는 자세(knife THJ4 71%, LFJ4 90%)를 잃는다. 0 이하 = 재계산 안 함(articulation factor 그대로).
-    soft_joint_pos_limit_factor_hands: float = 1.0
-    # ── [/ROLLBACK MARKER: soft-limit-hands] ──
-    action_space: int = 64 + 36         # 100
-    # ── [ROLLBACK MARKER: joint-residual] 상체 관절 잔차 (NVIDIA video_to_data, SONICJointResidualAction).
-    #    RL 이 SONIC 디코더 출력 뒤에 관절 잔차를 더한다. 켜면 env.__init__ 이 super() 이전에
-    #    action_space 와 observation_space 를 관절 수만큼 늘린다 (100→117, 772→789).
-    #
-    #    수식 (한 스텝):
-    #      z_res   = clamp(z, ±sonic_z_res_clip)
-    #      a_sonic = decode_g1_dyn( FSQ(encode(tok) + residual_scale_latent·z_res), proprio )   (29, SONIC 순서)
-    #      a_out   = a_sonic ;  a_out[S] += scale[S] · u        (S = 잔차 관절, scale = 그룹별 값)
-    #      q_body  = _sonic_default + _sonic_scale ⊙ a_out                                      (관절 단위)
-    #      q_cmd   = clamp(concat(q_body, q_hand), _ctrl_lower, _ctrl_upper)                     (soft 관절 한계)
-    #
-    #    잔차는 _sonic_scale 이 곱해지기 전, SONIC 액션 단위에서 더한다. 따라서 |u|=1 의 실제 관절 변위는
-    #    scale[j] × _sonic_scale[j] 이고 관절마다 다르다 (_sonic_scale = 0.25·effort/stiffness,
-    #    sonic_prior.sonic_scale_vector). 현재 그룹 설정 기준 실측:
-    #      다리 0.15 → 고관절 yaw 0.082, 고관절 pitch/roll·무릎 0.053, 발목 0.066 rad
-    #      허리 0.50 → yaw 0.274, roll/pitch 0.219 rad
-    #      팔  0.50 → 어깨/팔꿈치/손목roll 0.219, 손목 pitch/yaw 0.037 rad
-    #    손목 pitch/yaw 가 작은 것은 그 관절 모터가 약하기 때문이다(effort 5 Nm).
-    #    tanh 도 EMA 도 없다 (video_to_data 의 use_tanh=False, 평활화 없음). u 는 무제한이고 위 클램프로만 잘린다.
-    #    S 에 없는 관절은 SONIC 출력이 그대로 나간다 (mode="upper" 면 다리 12관절).
-    # Ablation 스위치. False 로 두면 상체 관절 잔차가 완전히 빠지고 차원도 줄어듭니다
-    # (action 117->100, obs 789->772) — 켜진 체크포인트와 호환되지 않으니 새로 학습해야 합니다.
-    # env 의 모든 참조가 _upper_on 으로 가드되어 있고 버퍼 생성도 그 블록 안에 있습니다.
-    # [ROLLBACK MARKER: ablation-upper-off] 되돌리기: True.
-    sonic_upper_residual: bool = False
-    # 잔차를 받는 관절 집합.
-    #   현재 조합 (2026-09-15): 하체 = 잠재 잔차(z_res)만, 상체 = 잠재 잔차 + 관절 잔차.
-    #   mode="upper" 라 다리 12관절에는 관절 잔차가 붙지 않고, SONIC 디코더 출력이 그대로 나간다.
-    #   그 디코더 출력 자체는 z_res 가 잠재를 흔든 결과이므로 다리도 정책의 통제 아래 있다 —
-    #   다만 섭동이 FSQ 격자와 디코더를 거치며 전신 협응이 유지된 형태로 감쇠되어 도달한다.
-    #   "all"   = 몸 29관절 전부 (다리 12 + 허리 3 + 팔 14). video_to_data 의 ReconBody 방식이고
-    #             거기서 쓰는 residual_scale 도 0.15 다. 다리까지 정책이 직접 보정한다.
-    #   "upper" = 아래 sonic_upper_residual_joints 의 17관절만. ReconHand 방식으로 다리는
-    #             SONIC 사전값에 그대로 둔다.
-    sonic_residual_joints_mode: str = "upper"
-    # 잠재 잔차 z_res. False 면 액션에서 64차원 블록이 통째로 빠지고 SONIC 디코더에는 0 벡터가
-    # 들어가 순수 디코드가 된다. 몸은 위 관절 잔차만으로 움직인다 (video_to_data 의 JOINT_RESIDUAL
-    # 은 잠재 잔차를 쓰지 않는다). 되돌리기: True.
-    #   action  = 64 z_res + 36 hand + N body  →  끄면 36 + N
-    #   obs     = prev_action 블록이 같은 폭으로 따라 줄어든다
-    sonic_latent_residual: bool = True
-    sonic_upper_residual_scale: float = 0.50   # 아래 그룹 dict 가 비었을 때만 쓰이는 전역 기본값
-    # 그룹별 잔차 scale (SONIC 액션 단위). JOINT_GROUPS 의 경계를 그대로 쓴다 —
-    #   legs  12관절 (고관절 yaw/roll/pitch, 무릎, 발목 pitch/roll ×2)  = 액션 색인 0..11
-    #   waist  3관절 (허리 yaw/roll/pitch)                              = 액션 색인 12..14
-    #   arms  14관절 (어깨 3축, 팔꿈치, 손목 roll/pitch/yaw ×2)          = 액션 색인 15..28
-    #
-    # 다리를 0.15 로 낮춘 이유 (2026-09-14): 몸 잔차에는 tanh 도 EMA 도 없어 탐색 잡음
-    # (σ=0.368)이 PD 목표에 그대로 실린다. scale 0.50 이면 발목 4.6°, 고관절 yaw 5.8° 의
-    # 무상관 지터가 매 스텝 다리에 꽂혀 균형에 필요한 관절 간 협응이 깨진다. 0.15 는
-    # video_to_data 의 ReconBody(29관절 전부에 잔차를 줄 때 쓰는 값)와 같다.
-    #
-    # 허리는 관절 집합으로는 상체에 두되(video_to_data 의 경계와 동일 — RECON_HAND_RESIDUAL_JOINT_NAMES
-    # 가 "다리 12관절을 뺀 나머지"다) scale 은 다리와 같은 0.15 로 내렸다 (2026-09-16).
-    # 이유는 레퍼런스가 허리를 거의 안 쓰는데 팔과 같은 권한을 받고 있었기 때문이다.
-    # knife 클립 실측 (레퍼런스 30 Hz → 제어 50 Hz 환산):
-    #   관절        전체 범위   스텝당 변화 p95   scale 0.50 의 탐색 지터   |u|=1 변위
-    #   허리 pitch    7.32°        0.263°              4.62°/스텝           12.56°
-    #   허리 yaw      2.09°        0.129°              5.77°/스텝           15.68°
-    #   어깨 pitch   39.49°        0.774°              4.62°/스텝           12.56°
-    # 같은 4.62° 가 어깨에서는 자기 범위의 12% 지만 허리에서는 전체 범위의 63% 다. 허리만 비율이
-    # 깨져 있었고, 그것이 "상체가 앞뒤로 왔다갔다" 하는 증상으로 나타났다. 0.15 면 허리 pitch
-    # 지터가 4.62° → 1.39°, |u|=1 변위가 12.56° → 3.77° 가 된다.
-    # 되돌리기: "waist": 0.50.
+    # ---- 액션 ----
+    sonic_action_dim: int = 64  # z_res 잠재 잔차 폭
+    hand_action_dim: int = 36  # 양손 손가락
+    finger_ema_alpha: float = 0.5  # 손가락 액션 EMA α (새 액션 가중치)
+    soft_joint_pos_limit_factor_hands: float = 1.0  # 손가락 soft 관절 한계 factor (1.0 = PhysX 한계 그대로)
+    action_space: int = 64 + 36  # 상체 관절 잔차를 켜면 __init__ 에서 +17
+
+    # ---- SONIC 잔차 (잠재 / 상체 관절 / 손) ----
+    sonic_upper_residual: bool = True  # 상체 17관절 잔차. 켜고 끄면 action/obs 가 ±17 → 체크포인트 비호환
+    sonic_residual_joints_mode: str = "upper"  # "upper" = 허리+팔 17관절, "all" = 몸 29관절
+    sonic_latent_residual: bool = True  # 끄면 액션에서 z_res 64 차원이 빠진다 → 체크포인트 비호환
+    # 관절 잔차 scale (SONIC 액션 단위, 그룹별)
     sonic_residual_scale_groups: dict = {"legs": 0.15, "waist": 0.15, "arms": 0.50}
-    sonic_upper_hist_from_applied: bool = False  # SONIC 디코더 히스토리의 상체 항목: False=SONIC 원출력(video_to_data),
-                                                 # True=실제 적용 목표(ResMimic). A/B 스위치.
-    sonic_upper_residual_joints: list = [
-        # [waist-noresidual 해제 2026-09-16] 허리 3축을 잔차 대상으로 되돌렸다. rew_waist_acc 가
-        # 달성 각도의 가속도를 벌주는데, 잔차가 없으면 정책이 허리를 직접 움직일 수단이 없어
-        # 그 벌점에 반응할 길이 다리·팔을 통한 간접 경로뿐이었다. scale 은 그룹 dict 의
-        # waist=0.15 가 그대로 적용된다 (|u|=1 에 pitch 3.77°, yaw 4.71°).
-        # 다시 빼려면 아래 한 줄을 주석 처리한다 (action 117→114, obs 789→786 자동).
+    sonic_upper_residual_joints: list = [  # 허리 3 + 팔 14
         "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
         "left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
         "left_shoulder_roll_joint", "right_shoulder_roll_joint",
@@ -572,86 +223,18 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
         "left_wrist_pitch_joint", "right_wrist_pitch_joint",
         "left_wrist_yaw_joint", "right_wrist_yaw_joint",
     ]
-    #    zero-actor: 정책 마지막 층의 출력 행 가중치·바이어스를 0 으로 만든다 (scripts/skrl/train.py,
-    #    체크포인트 로드 이전). video_to_data 의 --zero-actor 와 같은 목적. 끄면 skrl 기본 초기화
-    #    그대로라 차원당 표준편차 0.3~0.6 의 고정 오프셋이 첫 스텝부터 잔차에 실린다.
-    #      zero_actor_residual  손(36) + 몸 관절 잔차(N) 행
-    #      zero_actor_latent    잠재 잔차 z_res(64) 행까지 → 마지막 층 전체가 0
-    #    둘 다 켜면 첫 스텝의 정책 평균이 117 차원 전부 0 이다. z_res=0 이라 SONIC 은 잠재 섭동 없이
-    #    순수 디코드를 하고, 손은 1단계 목표를 그대로 재생한다. 학습이 "얼어 있는 SONIC + 1단계 손
-    #    재생" 이라는 정확히 알려진 지점에서 시작하므로, 초기 보상이 곧 그 조합의 성능이 된다.
-    #    zero_actor_latent=False 로 두면 z_res 행은 기본 초기화가 남아 다리가 처음부터 섭동을 받는다.
-    zero_actor_residual: bool = True
-    zero_actor_latent: bool = True
-    # ── [/ROLLBACK MARKER: joint-residual] ──
-    # --- SONIC-mode DELTA-ACTION switches (default OFF = the absolute/raw behavior above) --------------
-    # When ON, the policy output is a per-step INCREMENT that is EMA-smoothed and integrated into a
-    # clamped target (delta=0 ⟺ HOLD), instead of an absolute value. Independent per channel; enable
-    # per experiment. (Distinct from the non-SONIC group *_delta_action switches, which are bypassed here.)
-    #   hand:  integrate a_hand·scale (rad/step) into the hand JOINT target, clamped to joint limits.
-    #   latent: integrate z_res_raw·scale into the SONIC latent residual, clamped to ±clip (anti-windup).
-    sonic_hand_delta: bool = False
-    sonic_hand_delta_scale: float = 0.25        # rad/step at raw=1
-    sonic_hand_delta_smoothing: float = 1.0    # EMA α on the delta (1.0 = no smoothing)
-    # ── [ROLLBACK MARKER: stage1-hand] 잔차 손 액션 — hand_pretrain(1단계) 과 같은 방식 (2026-09-09) ──
-    # ON 이면 a_hand 는 프레임별 기준(base)에 대한 잔차입니다. DexMachina 마진 매핑: a≥0 → 기준에서
-    # 그 관절 상한까지의 거리 × a, a<0 → 하한까지의 거리 × |a| (결과가 항상 한계 안). 정규화 액션에만
-    # EMA(α = 손 그룹 ema_alpha 0.5) 를 걸고 기준은 지연 없이 통과시킵니다(1단계 env 의 fing_ema_res).
-    # 리셋 씨딩 = (복원된 손 PD 목표 − 그 프레임의 기준) 의 역매핑 — 캐시 히트는 담아둔 목표를 되살리고,
-    # 레퍼런스 리셋은 리셋 자세(리타게팅)에서 기준으로 EMA 가 몇 스텝에 걸쳐 이어집니다.
-    # 기준(base) 선택 sonic_hand_residual_base:
-    #   "stage1_target": 1단계 롤아웃이 낸 손가락 PD 목표(finger_target) — a=0 이면 1단계가 낸 지령을
-    #                    그대로 재생하므로 그때의 악력(목표가 접촉면 안쪽으로 파고든 양)까지 재현됩니다.
-    #   "stage1_qpos"  : 1단계 롤아웃의 실측 관절각 — a=0 이면 자세는 같지만 파고드는 양이 없어 악력이 약합니다.
-    #   "reference"    : 리타게팅 레퍼런스(_ref_joints) — 1단계 파일이 없을 때의 대체값이기도 합니다.
-    # sonic_hand_delta 와 동시에 켤 수 없습니다. 되돌리기: False.
-    sonic_hand_residual: bool = True
-    sonic_hand_residual_base: str = "reference"  # [ablation-stage1-off] 원래 "stage1_target"
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
-    sonic_latent_delta: bool = False
-    sonic_latent_delta_scale: float = 0.5      # latent-units/step at raw=1
-    sonic_latent_delta_smoothing: float = 1.0
-    sonic_latent_delta_clip: float = 4.5       # |integrated z_res| bound (anti-windup). Sized from the
-    #   trained absolute policy's z_res range (measured on agent_60000/pan: p99 |z|≈2.3, |max|≈3.9, std≈0.87),
-    #   so the delta integrator can reach the same latent-residual extent the absolute policy uses (+ margin).
-    sonic_z_res_clip: float = 5.0              # ABSOLUTE-mode z_res env clip [-5,5] (user 2026-07-23): the
-    #   frozen SONIC decoder never sees extreme latents. Bounds the ENV action (not the PPO log-prob, which
-    #   is on the raw Gaussian sample). p99 |z|≈2.3 in the trained policy, so 5.0 rarely bites in practice.
-    #   This clip does NOT bound `rew_action_reg`'s latent block: it is computed on the RAW (unclipped)
-    #   residual after the 2026-07-28 rollback, so it stays unbounded and keeps a restoring gradient on
-    #   mu outside the clip. (While it briefly ran on the clipped value, its ceiling was
-    #   weight · clip² ; widening the clip to 20 raised that enough to help pin the total reward on the
-    #   clamp(min=0) floor — that widening was also reverted.)
-    # obs = A proprio(190) + B reference(342) + C object/contact/history(182) = 714.
-    #   A: root_linvel(3)+root_angvel(3)+jpos(65)+jvel(65)+palm_ori6d(12)+palm_linvel(6)+palm_angvel(6)
-    #      +fingertip_vel(30)   [bimanual palm state + ft vel]. root absolute height/ori6d + projected_gravity
-    #      REMOVED from the policy (user 2026-07-20) — SONIC's decoder still gets gravity/root proprio, and the
-    #      policy sees the root only via block-B reference + deltas (robot root = ref − delta).
-    #   B: kpts(54×3)+delta(54×3)+ref_root_pos(3)+ref_root_ori6d(6)+delta_root_pos(3)+delta_root_ori6d(6)
-    #      (ref_root_pos = full xyz, was height-only; NO phase — look-ahead deltas convey progress)
-    #   C: obj(15)+delta_obj(9)+delta_ft_obj(30)+artic_reserved(8)+future_contact(10)+ft_force(10)+prev_action(100)
-    #      [delta_ft_obj = object-local ft→target offset; foot contact/force obs REMOVED 2026-07-20]
-    #   prev_action = the 100-D policy action (z_res 64 + a_hand 36), GRAIL-style (not the realized 65-D
-    #   joint target — the policy sees its own last residual). This is the RAW action. The ENV-EFFECTIVE
-    #   (clipped, per-block normalized to [-1,1]) copy was tried on 2026-07-28 and ROLLED BACK the same
-    #   day: it did not change the frozen-policy dead state (the analytic KL still read exactly 0 on
-    #   76/80 logged points), so it bought nothing and the obs is kept faithful to what the policy
-    #   emitted. The bounded copy is still used for the action_rate reward. See the block-C comment in
-    #   _get_observations for the measurement, and note the real chain is the 100-D joint log-ratio
-    #   feeding the `A<0` branch of PPO's `-min(A·r, A·clip(r))`, unbounded for r ≫ 1+ε.
-    # [smplx-kpts] 766 -> 772: 추적 키포인트가 54(몸통 14 + 손 20x2) -> 55(몸통 13 + 손 21x2)
-    # 로 바뀌었고 키포인트가 3차원 블록 두 곳에 들어가므로 +1 kpt = +6 차원입니다.
-    # (54x3x2=324 -> 55x3x2=330; 766-324+330=772). env 를 띄워 측정한 값입니다.
-    observation_space: int = 772   # [backward-dir] +1 = 진행 방향 비트        # asserted in _get_observations. Per-link contact (Option A): the
-    #   fingertip future_contact(10)+fingertip force(10) obs were REPLACED by per-link mask(32)+force(32) → +44.
-    state_space: int = 0
+    zero_actor_residual: bool = True  # 정책 마지막 층의 관절 잔차 출력을 0 으로 초기화 (train.py)
+    zero_actor_latent: bool = True  # 정책 마지막 층의 z_res 출력을 0 으로 초기화 (train.py)
+    sonic_hand_residual: bool = True  # 손 액션 = 기준 자세 대비 margin 잔차
+    sonic_hand_residual_base: str = "hand_pretrain_target"  # "hand_pretrain_target" | "hand_pretrain_qpos" | "reference"
+    sonic_z_res_clip: float = 5.0  # env 가 z_res 를 [-clip, clip] 으로 자른다 (PPO log-prob 은 자르기 전 값)
 
-    # Enlarged GPU contact buffers (mirrors the grasp envs). The default buffers overflow for the
-    # 78-body G1+bimanual-Shadow robot + object with track_contact_points on the fingertips
-    # (ContactSensor._unpack_contact_buffer_data device-side assert) once the fingers press on the
-    # object. Larger gpu_max_rigid_patch_count / aggregate-pair capacities fix it.
+    # ---- 관측 / 시뮬레이션 ----
+    # 상체 관절 잔차를 켜면 __init__ 에서 +17. 역방향 롤아웃 비트 자리(항상 0) 포함
+    observation_space: int = 772
+    state_space: int = 0  # 별도 critic 상태 없음
     sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 200.0,                 # 50 Hz control with decimation 4 (SONIC's native rate)
+        dt=1.0 / 200.0,
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.80665),
         physx=sim_utils.PhysxCfg(
@@ -661,17 +244,6 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
         ),
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=3.0)
-    # Viewer / video camera. Default origin_type="world" leaves the camera fixed in world coords, so
-    # a FLOATING-BASE robot walks out of frame — video is hard to watch. The grasp/shadow envs use
-    # origin_type="env" (env-local origin), which is enough for their FIXED-BASE arm. This robot walks,
-    # so use origin_type="asset_root": eye/lookat are offsets from the ROBOT's root (pelvis) center in
-    # env_index, i.e. a stable third-person camera that TRACKS the robot as it walks (world-aligned, no
-    # spin). For a near-static station-manip clip this is ~identical to "env". To pin the camera to the
-    # env origin instead (static frame), set origin_type="env" and drop asset_name.
-    # ENV-FIXED camera (origin_type="env"): stable, no per-frame shake. asset_root (follow the robot
-    # root) was too shaky. eye/lookat are ENV-LOCAL; the env re-points them at load to the reference-
-    # root centroid (env-local) so the fixed camera still frames the robot wherever its clip places it
-    # in the ParaHome world (the default here is only a fallback if that override does not run).
     viewer: ViewerCfg = ViewerCfg(
         eye=(1.5, 1.5, 1.0),
         lookat=(0.0, 0.0, 0.8),
@@ -679,1012 +251,194 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
         env_index=0,
     )
 
-    # --- Debug visualization ---------------------------------------------------
-    # When True, spawn VisualizationMarkers for the REFERENCE keypoints (green), the robot's
-    # ACTUAL keypoints (cyan), and the reference fingertip pad targets (magenta) so tracking can
-    # be inspected in the viewer. Off by default (no overhead in headless training); toggle for
-    # play/rollout with a GUI. debug_vis_num_envs caps how many envs get markers (keep small —
-    # each env draws 56+56+10 spheres).
-    debug_vis: bool = True
-    debug_vis_num_envs: int = 64
-    # --- Tensorboard logging ---------------------------------------------------
-    # "Episode_Reward /" holds ONE graph per reward TERM (the weighted per-term contribution) and
-    # nothing else — no group aggregates, no diagnostics. The reward-shaping diagnostics
-    # (tracking_penalty clamped/raw + clamp_frac) go to the "Diag /" tab instead; set False to drop
-    # them entirely. NOTE the total reward is deliberately NOT logged by the env: skrl already
-    # writes the identical value as "Reward / Instantaneous reward (mean)" (its base agent records
-    # the rewards BEFORE rewards_shaper is applied).
-    log_reward_diag: bool = True
-    # env-fixed video/viewer camera zoom: scales the eye offset from the robot (smaller = closer).
-    # 1.0 = the default close framing aimed at chest/hands; set 0.6 to zoom in further on the hands.
-    viewer_zoom: float = 0.6   # [ROLLBACK MARKER: cam-A] 1.0 → 0.6 (2026-09-09 사용자 확정 구도 A: 손 확대)
-    # env-fixed video/viewer camera ANGLE — matched to render_retarget.py so training videos and the
-    # retarget playbacks share one viewpoint. yaw=315° (+X,−Y), 18° elevation, aimed at the OBJECT
-    # centroid (where the hands work) so the hands are not occluded by the torso. yaw=45/elev≈0/look_obj=
-    # False reproduces the old +X+Y root-aimed view.
-    viewer_yaw: float = 270.0  # [ROLLBACK MARKER: cam-A] 315 → 270 (수도꼭지가 손을 가리지 않는 각도, 구도 A)        # azimuth around the look target (deg)
-    viewer_elev: float = 18.0        # elevation (deg)
-    viewer_look_obj: bool = True     # aim at the object centroid (else the root centroid)
+    # ---- 시각화 / 로깅 ----
+    debug_vis: bool = True  # 레퍼런스/로봇 키포인트 마커
+    debug_vis_num_envs: int = 64  # 마커를 그릴 env 수
+    log_reward_diag: bool = True  # 항별 보상과 진단 지표를 tensorboard 에 기록
+    viewer_zoom: float = 0.6  # 학습 영상 카메라 거리 배율 (작을수록 가까이)
+    viewer_yaw: float = 270.0  # deg
+    viewer_elev: float = 18.0  # deg
+    viewer_look_obj: bool = True  # True 면 물체를, False 면 루트를 조준
 
-    # --- Body links used as tracking anchors / balance / contact ---------------
-    # (torso / wrist link names live in BODY_KPTS above — the env resolves every tracking anchor from
-    # there, so there are no separate torso_body_name / *_wrist_body_name fields.)
-    # Shadow fingertip bodies (bimanual), order thumb,index,middle,ring,little per hand.
-    # CONFIRMED against the composite USD (all robot0_{l,r}_*distal bodies present).
-    fingertip_body_names: list = [
+    # ---- 추적 링크 ----
+    fingertip_body_names: list = [  # 왼손 → 오른손, 엄지·검지·중지·약지·소지
         "robot0_l_thdistal", "robot0_l_ffdistal", "robot0_l_mfdistal", "robot0_l_rfdistal", "robot0_l_lfdistal",
         "robot0_r_thdistal", "robot0_r_ffdistal", "robot0_r_mfdistal", "robot0_r_rfdistal", "robot0_r_lfdistal",
     ]
 
-    # =========================================================================== #
-    # Reward weights (starting values — tune)
-    # =========================================================================== #
-    # A. Imitation (pose tracking) — extended from grasp
-    # These A–D imitation/tracking terms are grouped into a tracking_penalty CLAMPED at -rew_alive
-    # (mirrors the proven grasp RSI reward): a poorly-tracking-but-alive step nets ≤0 (no free
-    # survival reward). foot_contact/foot_slip/force/regs stay OUTSIDE the clamp (as in grasp).
-    # NOTE: all three errors are MEAN per-keypoint distances (.norm().mean()), so the count of
-    # keypoints is already normalized out — the weight multiplies a "mean metres" quantity and is
-    # directly comparable to grasp's weight on the SAME quantity (do NOT divide by keypoint count).
-    # The 14 BODY keypoints are split into TWO reward groups, each a plain mean over its own group:
-    #   CORE (9)  pelvis, shoulders×2, elbows×2, hips×2, knees×2      → rew_body_kpts
-    #   EE   (5)  wrists×2, ankles×2, torso                           → rew_ee_kpts
-    # The termination gate still uses the UNIFORM mean over ALL 14 (e["body"]).
-    # ── [ROLLBACK MARKER: body-kpt-off] 몸 키포인트 감독 스위치 (2026-08-14 실험) ─────────────
-    # 몸 키포인트 목표(_np_ref_kpts의 body 14개)는 SMPL-X 사람 키포인트를 그대로 쓰므로 몸 비율
-    # 차이가 영구 잔차로 남는다. False로 두면 env __init__이 (1) rew_body_kpts→0 (2)
-    # term_body_kpt_err→1e6 (3) cache_body_bar→1e6 을 일괄 적용해 코어 몸 감독을 빼고, body
-    # 게이트가 겸하던 낙상 감지는 아래 term_root_pos/rot_err 루트 게이트(기준 = 리타게팅된 로봇
-    # 골반 g1_root_pose — SMPL-X가 아님)가 대신한다. 목적: EE/손/루트 목표만 남겼을 때 SONIC
-    # prior가 몸을 얼마나 유지하는지 관찰 (감독 제거이지 정보 제거가 아님 — 관측 54kpt와
-    # e["body"] 계산·로깅 Error / body_kpts 는 그대로 남아 진단 지표가 된다).
-    # 유지되는 항: rew_ee_kpts(손목2+발목2+몸통1), rew_hand_kpts, rew_link_kpts, rew_fingertip,
-    # rew_root_pos/ori, 물체 항, 캐시 root/fingertip bar. 되돌리기: True (아래 값들은 원본 유지).
-    # ── [ROLLBACK MARKER: body-kpt-fk] 몸통 키포인트 목표를 리타게팅 FK 로 (2026-09-06) ──────
-    # 기본(False)은 SMPL-X 사람 키포인트를 그대로 목표로 씁니다. 그런데 그 목표는 G1 이 도달할 수
-    # 없습니다 — 리타게팅 측정에서 사람 발목이 로봇 발목보다 5.4~5.8 cm 위, 어깨 잔차 22 cm,
-    # 골반 잔차 9.4 cm 입니다. 실제로 2026-09-05 run 에서 Error/body_kpts 가 0.108 m 에 고정되고
-    # Episode_Reward/body_kpts 가 0.0 이었습니다 (도달 불가라 학습 신호가 되지 않음).
-    # True 면 목표를 "리타게팅된 로봇 자세의 링크 위치"(g1_joint_pos + g1_root_pose 에 로봇 FK)로
-    # 바꿉니다. 리타게팅이 이미 임베디먼트 절충을 푼 결과이므로 도달 가능한 목표가 됩니다.
-    # 손 키포인트(42)와 손목은 영향받지 않습니다 — 몸통 13개만 교체합니다.
-    # 계산은 init 에서 한 번, 제거된 _solve_ref_link_local() 과 같은 방식(로봇을 프레임마다 레퍼런스
-    # 자세로 세워 body_pos_w 를 읽음)입니다. 되돌리기: False.
-    body_kpt_from_retarget_fk: bool = True
-    body_kpt_supervision: bool = True
-    # ── [ROLLBACK MARKER: stage1-hand] 손·손목 보상 목표를 1단계(떠 있는 양손) 롤아웃 키포인트로 (2026-09-09) ──
-    # 사람(SMPL-X) 손 키포인트 대신 1단계 정책이 실제로 물체를 잡은 롤아웃(hand_traj_best.npz)에서
-    # 손 목표를 가져옵니다. 바뀌는 것은 보상/오차에 들어가는 목표만입니다:
-    #   _ref_kpts 손 블록 42개 + 몸통 블록의 손목 2개, _ref_ft_pad 손끝 10개, 그로부터 다시 만드는
-    #   _ref_link_kpt_local, 그리고 _ref_palm_quat. 손목 회전 오차는 _ref_kpts 세 점으로 만드는
-    #   랜드마크 프레임을 쓰므로 같은 교체로 함께 바뀝니다.
-    # 바뀌지 않는 것: RSI/리셋 자세와 SONIC 레퍼런스 토큰(_ref_joints, trajectory_pyroki.npz),
-    #   물체 레퍼런스(ParaHome), 몸통 13개 중 손목을 제외한 11개.
-    # 키포인트는 롤아웃이 기록한 손바닥 자세 + 손 관절각으로 이 로봇(USD)을 FK 해 얻습니다 —
-    #   _apply_body_kpt_fk 와 같은 방법으로 로봇을 세우되 손 관절만 롤아웃 값으로 바꾸고, 각 손 링크를
-    #   손바닥 기준으로 읽어 롤아웃 손바닥 자세에 다시 붙입니다(팔 자세와 무관).
-    # 파일 위치: <dataset_root>/<stage1_subdir>/<clip_class>/<clip>/0/<stage1_hand_file>, 없으면 같은
-    #   폴더의 evaluation_*/<stage1_hand_file> 중 가장 최근 것. 둘 다 없으면 SMPL-X 목표를 유지합니다.
-    # 시간축: 롤아웃 control_fps(50) → 레퍼런스 control_fps 로 선형 보간, 끝은 마지막 값 유지.
-    hand_kpt_from_stage1: bool = False  # [ablation-stage1-off] 원래 True
-    stage1_subdir: str = "g1_shadow_hand_pretrain"
-    stage1_hand_file: str = "hand_traj_best.npz"
-    # 접촉 중 물체 기준 보정: 롤아웃의 물체가 ParaHome 물체와 어긋난 만큼(측정 p50 0.5 cm / 3°) 손바닥
-    # 자세를 "롤아웃 물체 기준 상대 자세 → ParaHome 물체에 다시 붙임" 으로 옮깁니다. 접촉 판정은 롤아웃의
-    # 링크 접촉력(어느 링크든 > thresh N, 손별), 가중치는 ±blend 프레임 상자 평균으로 0↔1 을 잇습니다.
-    stage1_obj_correction: bool = False
-    stage1_contact_force_thresh: float = 1.0     # N
-    stage1_blend_frames: int = 5
-    # ── [ROLLBACK MARKER: stage1-vertex] 접촉 프레임 손끝 목표를 사람 접촉점 대신 1단계 pad(1단계 물체 좌표)로 (2026-09-09).
-    #    hand_kpt_from_stage1 이 켜져 있고 1단계 파일에 obj_pos 가 있을 때만 작동. 측정: 사람 접촉점과 1단계가 실제로
-    #    잡은 위치는 물체 좌표에서 1~4 cm (knife 검지 4.3 cm) 떨어져 있어 rew_hand_kpts 와 rew_fingertip 이 서로
-    #    다른 곳을 가리켰다. 물체 레퍼런스는 건드리지 않는다.
-    stage1_contact_vertex: bool = False  # [ablation-stage1-off] 원래 True
-    # ── [/ROLLBACK MARKER: stage1-vertex] ──
-    # ── [ROLLBACK MARKER: stage1-contact-map] 32링크 접촉 맵(mask/normal/target)을 사람(SMPL-X) 대신 1단계 롤아웃에서
-    #    같은 방식(물체 정점 → gamma 안 최근접 손 정점 → FPS → 링크별 평균)으로 만든 파일로 교체 (2026-09-09).
-    #    파일 위치: 1단계 롤아웃 파일(stage1_hand_file) 과 같은 폴더의 stage1_contact_map_file.
-    #    스키마 = hand_contact.npz 와 동일: link_names (L,), mask (T,L), normal (T,L,3) 물체 로컬 바깥 표면 법선,
-    #    target (T,L,3). 추가: frame (T,) = 롤아웃 프레임 번호(hand_traj_best.npz 의 frame 과 같은 시간축),
-    #    coord = "object"(target 이 1단계 물체 자세 기준 물체 로컬) 또는 "world"(로더가 1단계 물체 자세로 변환),
-    #    normal_source (사람 맵과 같이 "surface" 기대). 시간축은 롤아웃 50 Hz 행을 최근접으로 맞춘다(선형 혼합 없음).
-    #    hand_kpt_from_stage1 이 켜져 있고 파일이 있을 때만 작동. 로드되면 stage1_contact_vertex 는 자동으로 건너뛴다
-    #    (맵이 손끝 행을 포함). 파일이 없으면 경고를 찍고 사람 맵 + stage1_contact_vertex 로 동작한다.
-    #    측정 근거: 사람 마스크와 1단계 실접촉(>1 N)의 링크별 IoU 가 knife 중지 distal 0.22 / middle 0.07,
-    #    pan 소지 distal 0.12 등 — Shadow 손은 얇은 손잡이를 손끝이 아니라 중간 마디로 감싼다.
-    stage1_contact_map: bool = False  # [ablation-stage1-off] 원래 True
-    stage1_contact_map_file: str = "hand_contact_stage1.npz"
-    # ── [ROLLBACK MARKER: cws-human-ref] CWS 보상의 레퍼런스 지지함수 σ_h 에 쓰는 접촉 집합 (2026-09-09).
-    #    "human" = 사람 접촉 맵(hand_contact.npz, 이전과 동일). stage1_contact_map 이 로드돼도 σ_h 만은 사람 접촉으로
-    #    비교한다(사용자 판단: CWS 는 "사람이 물체에 낸 렌치 공간"과 비교하는 것이 맞다). 손끝 목표·접촉 관측·force
-    #    게이트는 1단계 맵을 그대로 쓴다. "stage1" = 로드된 1단계 맵으로 σ_h 계산. 사람 맵이 없으면 로드된 맵으로 떨어진다.
-    cws_ref_contact_source: str = "human"
-    # ── [/ROLLBACK MARKER: cws-human-ref] ──
-    # ── [/ROLLBACK MARKER: stage1-contact-map] ──
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
-    rew_body_kpts: float = -1.0 # -0.5        # mean over the 9 CORE body kpts (pelvis/shoulders/elbows/hips/knees)
-    # ── [ROLLBACK MARKER: ee-kpts] 손목2 + 발목2 를 한 항으로 (2026-09-01) ───────────────────
-    # [smplx-kpts 2026-09-04] 몸통 키포인트는 제거됐다 (사용자 결정) — 이 항은 손목2 + 발목2 의
-    # 4개 mean 이다. 아래 "몸통" 관련 설명은 제거 전 이력으로 남긴다.
-    # (제거 전) 몸통은 BODY_KPTS 4번 torso_link + TORSO_KPT_OFFSET(윗가슴, jT9T8 대응)이었다. G1 은
-    # 목 관절이 없고 head_link 가 torso_link 에 융합돼 독립 머리 키포인트가 존재하지 않는다.
-    # 몸통을 넣었던 이유: core 는 body_kpt_supervision=False 로 가중치 0 이라, 골반(rew_root_pos/ori)
-    # 과 손목·발목 사이의 몸통만 무감독이었고 허리가 자유로워 상체가 앞뒤로 들썩였다
-    # (실측: 허리 yaw 진폭 로봇 3.37° vs 레퍼런스 0.47°, roll 3.52° vs 1.12°, pitch 1.37° vs 0.61°).
-    # 제거 후 그 감독이 다시 없어졌으므로, 상체 들썩임이 재발하면 여기가 되돌아볼 지점이다.
-    # 한 mean 에 섞어도 되는 근거: exp 형태의 기울기 ∂/∂err_i = w·Sat·(-2·mean/σ²)·(1/N) 은 자기
-    # 오차 크기와 무관하게 1/N 로 균등 배분된다. 몸통 오차는 mm, 발목은 cm 스케일이지만 발목이
-    # mean 을 0 에서 떼어놓아 몸통도 단독 항보다 큰 기울기를 받는다. 키포인트당 배분은 균등하다.
-    # 손목 종료 게이트(term_wrist_pos_err)와 Error / wrist_kpts 로그는 그대로 살아 있다 —
-    # _wrist_kpt_idx 는 보상에서만 빠졌다.
-    # 되돌리기: env 의 _EE_NAMES 에서 빼낼 이름을 지우고 해당 항의 가중치/σ 를 되살린다.
-    rew_ee_kpts: float = -3.0 # -1.76         # mean over 5 kpts: WRIST ×2 + ANKLE ×2 + TORSO ×1
-    rew_hand_kpts: float = -3.0 # -1.76        # mean over 40 finger-chain kpts (dexterity)
-    rew_fingertip: float = -6.0 # -5.2        # mean over 10 bimanual pads ≈ grasp -5.2 (both are means)
-    # ── [ROLLBACK MARKER: link-kpt] 손끝 외 wrap 링크의 접촉 목표 추종 ────────────────
-    # 손끝 외의 손가락 마디(뿌리/중간)도 제 위치를 지키게 하는 항입니다. 손끝 10개만으로는 손
-    # 방향이 거의 안 묶입니다 — 손목을 60도 돌려도 손끝을 목표 근처에 놓는 자세가 여럿이라 옆면
-    # 으로 잡는 자세가 허용됩니다. 뿌리/중간 마디는 한 방향에서만 자기 목표에 닿으므로 이 항이
-    # 실제로 자세의 자유도를 묶습니다.
-    # 목표는 "물체 기준 좌표로 기록해 둔 레퍼런스에서의 링크 위치"를 살아있는 물체 자세로 되돌린
-    # 점입니다(_solve_ref_link_local이 시작할 때 한 번 계산). 따라서 물체가 굴러가면 손이 따라가야
-    # 할 자세도 같이 돌아갑니다. 물체 표면의 접촉점을 목표로 쓰던 이전 방식은 물체가 회전해도
-    # 목표가 그대로여서 회전을 따라가지 못했습니다. 접촉 요구와 무관하게 매 프레임 정의되므로
-    # 접촉 마스크로도 걸지 않습니다. 어떤 링크를 셀지는 link_kpt_include_palm이 정합니다.
-    rew_link_kpts: float = 0.0 # -1.0 # -3.5
-    # 목표가 물체 표면의 접촉점이던 시절에는 손바닥을 뺐습니다. 레퍼런스 자세에서조차 오른손바닥은
-    # 요구 프레임의 12.6%만 그 목표에 닿았고(측정값), 도달 불가능한 목표를 강제하면 정책이 손바닥을
-    # 물체로 밀어 넣어 관통을 만들기 때문입니다. 목표를 레퍼런스 링크 위치로 바꾼 뒤로는 손바닥
-    # 목표도 로봇이 실제로 취했던 자세라 도달 가능하므로 다시 포함합니다.
-    link_kpt_include_palm: bool = True
-    # B. Locomotion / root — root_ori up-weighted over root_pos (GRAIL-aligned: orientation > position).
-    rew_root_pos: float = -1.0 # -0.5         # was -2.5 (user 2026-07-20: de-emphasize root position)
-    rew_root_ori: float = -1.0 # -0.5         # was -1.0 (user 2026-07-20: emphasize root orientation)
-    # C. Balance / feet — REMOVED (user 2026-07-20, GRAIL-aligned): the frozen SONIC base owns feet +
-    #   balance, so the residual policy has NO foot-contact obs/reward (no rew_foot_contact/foot_slip,
-    #   foot_force_cap, foot_kpt_gate, foot flatness). Feet are still tracked as part of the 14-kpt body reward.
-    # D. Object manipulation — reused from grasp (inside the clamped tracking_penalty)
-    # ── [ROLLBACK MARKER: z-weight] 중력 방향 오차 가중 (grasp 규약 포팅, 2026-09-01) ──────────
-    # grasp env 는 위치 오차의 z 성분에 ×1.5 를 걸어 보상에 씁니다 (논문 S4.2 "higher weights to
-    # gravity direction"): robotis_shadow_grasp_env.py:1498/1516 의 delta_obj_pos_w / delta_kpts_w.
-    # 그 규약의 핵심은 **무가중/가중 두 벌을 따로 유지**하는 것입니다 —
-    #     무가중 → 종료 게이트(term_*), RSI good 게이트(enough_*), 캐시 bar, Error / 로그
-    #     가중   → 보상만
-    # 가중값으로 통째로 바꾸면 종료 임계와 실패 판정까지 같이 조여집니다(z 가 오차의 절반이면
-    # 노름이 약 1.12배 → term_obj_pos_err 0.15 가 실효 0.134). 그래서 e 딕셔너리에 *_w 키를
-    # 병행 추가하고 보상 조립부만 그쪽을 읽습니다.
-    # 적용 범위는 hand_kpts 와 obj_pos 둘로 한정합니다 (사용자 지정). grasp 는 여기에 21 MANO
-    # 키포인트와 팔 항까지 포함했지만, 우리 쪽 ee/link/fingertip/root 는 무가중으로 둡니다.
-    # 1.0 이면 가중이 사라져 이전 거동과 정확히 같습니다.
-    z_weight_reward: float = 1.5
-    rew_obj_pos: float = -5.0 # -4.26
-    rew_obj_rot: float = -1.5 # -1.0
-    # (no rew_obj_artic: objects always spawn as a single rigid base, so the articulation-DOF error was
-    #  identically zero — see the NOTE in _get_rewards. Re-add it with the live joint read.)
-    # PER-LINK contact-force reward (Option A / DexMachina, extends the old fingertip-only force reward to
-    # all wrap links): compressive object force on each of the 32 wrap links, projected on the link's OWN
-    # inward pad normal (LINK_PAD_NORMALS, like the fingertip `force·(-pad_normal)`) so the WRONG face (e.g.
-    # back of the palm) registers no compressive force. Gated by (a) the reference per-link contact mask
-    # (which links SHOULD touch), (b) a spatial gate (link near its object-surface target), and (c) an
-    # ORIENTATION gate (link inward normal aligned with the reference reaction normal within
-    # contact_normal_gate_tol). Normalized ∈[0,1] over the active links.
-    rew_contact_force: float = 0.7     # per-link contact-force reward weight (was rew_fingertip_force)
-    # ── [ROLLBACK MARKER: contact-vel-gate] 접촉력 보상의 물체-속도 게이팅 ─────────────
-    # grasp env(robotis_sh5_grasp_env.py:258-261, 출처 TJ GR env `is_contact`)가 쓰던 게이트를
-    # 복원한다. 거기서는 future_contact = (물체가 움직임) AND (손끝이 물체 근처) 였고, 접촉력
-    # 보상과 손끝 목표 전환을 모두 이 플래그로 걸었다:
-    #     fforce_contact = raw_forces * contact_flag_gated * contact_condition
-    # sonic_residual 은 2026-07-22 에 Option-A per-link 맵으로 갈아타면서 이 게이트가 빠졌다
-    # (parahome_hand_contact.py 에 같은 상수 0.05/0.25 가 --use-velocity-gate 로 남아 있으나
-    #  "정적 홀드도 잡으려고" 기본 비활성). 여기서는 hand_contact.npz 자체는 건드리지 않고
-    # (CWS 가 같은 맵을 읽는다) 소비 지점 네 곳에만 게이트를 얹는다 — grasp env 와 같은 범위다:
-    #   (1) 접촉력 보상 link_mask            → 물체 정지 시 force_rew = 0
-    #   (2) 그 관측 (FUTURE per-link mask)   → 보상이 0 인 프레임을 정책이 구분할 수 있게
-    #   (3) 손끝 목표 전환 · 보상 (ft_reward)
-    #   (4) 손끝 목표 전환 · 관측 (delta_ft_obj)
-    #
-    # 의미: 물체가 정지해 있으면 "눌러도 보상 없음". 물체를 실제로 옮기는 순간에만 접촉력을
-    # 요구하므로, 가만히 놓인 물체를 눌러 점수를 버는 행동이 사라진다.
-    #
-    # (3)(4) 의 부작용 — 정지 구간에서 손끝 목표가 "물체 표면 접촉점" → "레퍼런스 패드"로 되돌아
-    # 간다. 실측상 사람 패드는 얇은 손잡이 옆 약 3.6 cm 에 있으므로, 그 구간 동안 손끝이 물체에서
-    # 떨어지는 방향으로 끌린다. 사용자 판단으로 grasp env 와 같은 범위를 택했다 (2026-09-01).
-    # 이 절반만 되돌리려면 env 의 in_contact 두 곳에서 _ref_obj_vel_gate 곱을 빼면 된다.
-    #
-    # 측정 (레퍼런스, env 50Hz 기준 OR 조건 통과율):
-    #   칼   s101_seg12 89.7% / s53_seg19 90.7% / s55_seg31 80.8%  ← 자르는 동안 계속 회전
-    #        (칼 각속도 중앙값 0.59 rad/s = 34°/s, 임계 0.25 의 2.4배)
-    #   팬·볼 s100_seg00 pan / s33_bowl / s71_bowl 은 정적 홀드가 길어 통과율이 크게 낮다
-    # 즉 칼에서는 게이트가 약 10% 프레임만 닫히고, 집어-들고-있는 동작에서 크게 작동한다.
-    # 임계는 TJ 원값 그대로 (OakInk/HO-Cap 탁상 집기 과제에서 온 값이라 ParaHome 보정은 안 됨).
-    # 되돌리기: contact_vel_gate=False (게이트가 전부 1 이 되어 거동이 정확히 이전과 같다).
-    contact_vel_gate: bool = True
-    contact_vel_gate_lin: float = 0.05   # m/s,   레퍼런스 물체 선속도 임계
-    contact_vel_gate_ang: float = 0.25   # rad/s, 레퍼런스 물체 각속도 임계
-    contact_force_cap: float = 1.0     # N; per-link compressive force at/above this = full credit (saturates)
-    # [ROLLBACK MARKER: force-fingertip-only] 접촉력 보상을 손끝 10개로만 계산합니다. False면
-    # wrap 링크 32개 전체를 씁니다. 전체를 쓰면 분모(레퍼런스가 요구하는 링크 수)에 손바닥처럼
-    # 달성 불가능한 링크가 섞여 보상이 눌립니다(실측: 프레임당 7개 요구, 실제 접촉 3개).
-    contact_force_fingertip_only: bool = False
-    force_obs_clip: float = 300.0      # N; OBS-side clip on per-link + foot contact forces (user 2026-07-23).
-    #   Raw forces spike to ~hundreds of N (foot ≈ body weight; measured obs var ~7e5) → destabilize the
-    #   RunningStandardScaler. Clip the OBS copy only (reward uses contact_force_cap). Stabilizes scaling.
-    use_contact_normal_gate: bool = False   # gate the per-link force reward by link-face ↔ reference-reaction alignment
-    # rad (=75°); reward only if angle(link inward normal, ref reaction) ≤ this. 75° (not a tighter value)
-    # because the human-derived reference reaction vs the robot Shadow link palmar face is inherently ~55°
-    # misaligned even at the clean retarget-reference grasp (embodiment); measured on s100_seg00_pan, a 45°
-    # gate passed only 14–50% of genuine reference-contact links (starves the reward), while 75° passes
-    # ~62–80% yet still culls clearly-wrong faces. The force is already projected on the link's own inward
-    # normal, so back-of-palm contact (reaction ≈ +palmar-outward) yields ≤0 compressive force regardless —
-    # this gate is the secondary orientation filter, hence kept lenient.
-    contact_normal_gate_tol: float = 1.00
-    # E. Alive / regularization
-    # rew_alive sets the tracking_penalty clamp floor (-rew_alive). Above the grasp default (1.5)
-    # because the grouped full-body/bimanual tracking penalty is larger; kept high enough that good
-    # tracking stays unsaturated (else the clamp kills the gradient) while flooring bad steps at 0.
-    # ── [ROLLBACK MARKER: exp-tracking] tracking-reward SHAPE (복원 2026-09-02) ────────────────
-    # False = 선형 (sum of -w*err, clamped at -rew_alive). True = SONIC 형태, 항마다
-    # w*exp(-err²/σ²). 이 플래그 하나가 추적 그룹 전체를 바꾸고 나머지 항은 건드리지 않는다.
-    # 항별 가중치는 아래 rew_* 에서 파생된다 (|rew_*| 를 exp_tracking_budget 으로 정규화) —
-    # 두 형태가 같은 상대 강조를 유지하므로, 결과가 나빠져도 "동시 재밸런싱" 탓으로 돌릴 수 없다.
-    #
-    # 선형 형태의 문제: clamp 가 물면 그 샘플의 추적 기울기가 EXACTLY 0 이 되어 12cm 의 물체
-    # 오차와 40cm 가 같은 점수를 받는다. 복원 직전 측정 `Diag / clamp_frac` = 0.168 (16.8%).
-    # exp 형태는 항마다 [0, w] 로 유계라 clamp 가 필요 없고 모든 항이 기울기를 유지한다.
-    # 포화가 합 하나가 아니라 항별로 일어나므로 나쁜 손끝이 몸 신호를 침묵시키지 않는다.
-    exp_tracking_reward: bool = True
-    # 여덟 추적 항이 한 스텝에 지급할 수 있는 총량. 선형 형태의 clamp 크기(rew_alive = 1.5)에
-    # 맞춰 둔다 — contact_force 0.7 / com_support -0.5 / action_reg 가 전부 그 스케일에 맞춰
-    # 튜닝됐고, SONIC 의 절대 예산(항 합 7.0)을 쓰면 그것들이 값 변경 없이 5배 약해진다.
-    exp_tracking_budget: float = 1.50
-    exp_rew_alive: float = 0.5   # exp_tracking_reward 가 켜지면 rew_alive 를 대체한다. 훨씬 작은
-    # 이유: 지수 항이 전부 양수라 긴 에피소드가 이미 더 큰 할인 수익을 얻고 별도 생존 보너스가
-    # 필요 없다 (SONIC 은 alive 항이 아예 없다). 0 이 아닌 이유는 음의 정규화 항들이 총합을 최종
-    # clamp(min=0) 아래로 밀어 그 기울기까지 죽이는 걸 막기 위해서다.
-    # σ: 그 항이 exp(-1) = 0.37 을 지급하는 오차. SONIC (gear_sonic/config/manager_env/rewards/
-    # terms/*.yaml) 에서 대응하는 항의 값을 가져오고, 우리 오차가 더 작게 측정된 곳은 조였다.
-    # 직관이 아니라 `Sat /` 로그로 튜닝할 것 (0.3~0.7 대역이 실제로 학습을 이끄는 구간).
-    # 복원 시점 예측 Sat (사용자 지정으로 구값 유지): fingertip 0.24 / obj_pos 0.57 / hand 0.56 /
-    #   ee 0.25 / obj_rot 0.68 / root_pos 0.97 / root_rot 0.92.
-    #   root_pos·root_rot 는 0.9 대라 사실상 상수다 — 대역에 넣으려면 0.045 / 0.10 근처가 필요하고,
-    #   ee 는 손목 병합으로 오차가 0.119 로 커져 0.16 근처가 맞다. 지금은 의도적으로 구값 유지.
-    sigma_body: float = 0.10 # 0.20 # 0.30        # SONIC tracking_relative_body_pos std
-    sigma_ee: float = 0.075 # 0.10          # [wrist-into-ee] 손목2+발목2+몸통1 공통 σ
-    sigma_hand: float = 0.075 # 0.10
-    sigma_fingertip: float = 0.05  # half of term_ft_err
-    # 링크 원점과 표면 접촉점 사이에는 링크 두께만큼의 하한이 있습니다(실측 약 4cm).
-    # Sat / link_kpt 이 1에 붙지 않는 게 정상이고, 0.3~0.7 대역에 오도록 맞추세요.
-    sigma_link_kpts: float = 0.075 # 0.05
-    sigma_root_pos: float = 0.15 # 0.20 # 0.30    # SONIC tracking_anchor_pos std
-    sigma_root_rot: float = 0.30 # 0.40    # SONIC tracking_anchor_ori std
-    sigma_obj_pos: float = 0.05    # half of term_obj_pos_err
-    sigma_obj_rot: float = 0.30    # half of term_obj_rot_err
-    # ── [/ROLLBACK MARKER: exp-tracking] ─────────────────────────────────────────────────────
-    # 선형 모드에서만 유효: `Diag / clamp_frac` 이 오르면 rew_alive 를 올릴 것.
-    # ── [ROLLBACK MARKER: nan-guard] NaN 폭주 차단 (2026-09-15) ──────────────────────────────
-    # 오염 사슬 (실측으로 좁힌 것):
-    #   1) 손가락 J0 는 액추에이터가 없고 고정 텐던(limit_stiffness 30, damping 0.2)만 걸려 있어
-    #      리셋 직후 손↔물체 파지 임펄스를 흡수하지 못한다. 512env × 240스텝 무작위 액션에서
-    #      |q̇| 최대 7335 rad/s, 100 rad/s 초과가 103 env-스텝 (상위 관절이 전부 *J0).
-    #   2) 그 값이 vel_obs_scale(0.2) 배로 관측에 실린다. 환경 단독에서는 비유한 값이 0건이라
-    #      NaN 은 여기서 나지 않지만, 스케일러 분산을 부풀리는 출발점이 된다.
-    #   3) skrl 은 업데이트 안에서 관측 스케일러를 갱신한다(ppo.py `train=not epoch`). 롤아웃과
-    #      업데이트의 정규화가 어긋나 PPO 비율이 병적으로 커지고, dual-clip 의 A<0 가지는
-    #      r ≫ 1+ε 에서 상한이 없다.
-    #   4) mixed_precision 이 False 라 GradScaler 가 꺼져 있고, scaler.step() 이 비유한
-    #      그래디언트를 걸러내지 않는다. clip_grad_norm_ 은 NaN 을 지우지 못한다 — 노름이 NaN 이면
-    #      계수도 NaN 이라 모든 파라미터의 그래디언트가 NaN 이 된다.
-    #   5) Adam 이 전 가중치에 NaN 을 쓰면 정책은 영구히 NaN 을 출력한다.
-    #
-    # 잠재 잔차 + 상체 관절 잔차 조합에서 더 잘 터지는 이유는 액션 차원이 117 이기 때문이다.
-    # log_prob 이 차원별 합이라 차원이 늘수록 결합 로그비의 분산이 커지고 exp() 가 더 극단으로 간다.
-    #
-    # 아래 셋은 환경 쪽 층이고, 네 번째 층(비유한 옵티마이저 스텝 건너뛰기)은 scripts/skrl/train.py
-    # 의 [ROLLBACK MARKER: nan-guard] 에 있다.
-    nan_guard_joint_vel: float = 100.0   # |q̇| 가 이 값을 넘는 env 를 강제 리셋. 0 = 끔.
-                                         #   드라이브 속도 한계는 몸 20~37, 손가락 15 rad/s 라
-                                         #   100 이상은 정상 범위가 아니다. Diag / blowup_frac 로 본다.
-    nan_guard_object: bool = True        # 물체 pose/속도 유한성도 리셋 게이트에 포함 (관측이 쓴다)
-    nan_guard_obs_clip: float = 1.0e4    # 관측 비유한 치환 + 크기 제한. 0 = 끔.
-                                         #   정상 관측 최댓값 실측 767 이라 1e4 는 정상 학습을 건드리지
-                                         #   않고, 제곱해도 1e8 이라 float32(3.4e38) 누적에서 안전하다.
-                                         #   Diag / obs_sanitized 가 0 이 아니면 게이트가 놓친 경로가 있다.
-    # ── [/ROLLBACK MARKER: nan-guard] ──
-    rew_alive: float = 1.5
-    # ── [ROLLBACK MARKER: reg-merge] action_reg 를 잠재+손 하나로, SUM 으로 통일 (2026-09-01) ──
-    # 이전에는 두 항이 서로 다른 관행을 따랐다:
-    #   rew_action_reg_hands -0.004  ·  sum(smoothed_hand²)  36차원, EMA 평활  ← grasp 관행
-    #   rew_latent_reg       -0.1    ·  mean(z_raw²)         64차원, RAW      ← GRAIL LatentL2 관행
-    # 집계(sum/mean)·피연산자(평활/raw)·차원이 모두 달라 차원당 압력이 어긋났다 (실측 차원당 제곱
-    # 0.467 vs 1.23). grasp 관행인 SUM 으로 통일한다 — robotis_shadow_grasp_env.py:1603 의
-    # `(self.actions[:, :N_f] ** 2).sum(dim=-1)` 와 같은 형태이고 가중치도 같은 -0.004 다.
-    # 피연산자: 잠재 64 는 _last_z_res (절대 모드에서 _cur_policy_action[:, :64] 와 동일한 값),
-    # 손 36 은 _cur_policy_action 의 손 블록(raw, 클램프 이전). 둘 다 raw 라 클립 밖에서도 복원
-    # 기울기가 남는다(클립된 값을 벌하면 외부가 평평해져 mu 가 되돌아오지 않는다). delta 모드에서는
-    # _last_z_res 가 적분된 잠재라 그쪽을 써야 한다 — raw 증분을 제곱하면 속도 페널티가 되어버린다.
-    #
-    # 배점 (실측 차원당 제곱값 기준):
-    #   손   36 × 0.467 = 16.8  → -0.004 × 16.8 = -0.067   ← 이전 action_reg 와 정확히 동일
-    #   잠재 64 × 1.23  = 78.7  → -0.004 × 78.7 = -0.315   ← 이전 latent_reg -0.123 의 2.6배
-    #   합                        -0.382                    ← 이전 두 항 합 -0.190 의 2.0배
-    # 즉 손 항은 그대로 보존되고, 잠재 항이 같은 관행을 따르면서 2.6배 강해진다. 참고로 GRAIL
-    # LatentL2 는 coef 0.01 · mean(64) = 차원당 1.56e-4 이므로, 차원당 0.004 는 그 약 25배다.
-    # z_res 는 정책이 몸에 가하는 유일한 손잡이라, 과하면 z_res→0 으로 수렴해 잔차가 무력해진다.
-    # 첫 런에서 Diag / zres_absmax 와 Episode_Reward / action_reg 를 함께 볼 것.
-    rew_action_reg: float = -0.002   # SUM over 100 of (z_res 64 + a_hand 36) 제곱
-    rew_pose_reg_hands: float = -0.001   # HANDS-only: pull achieved hand joints toward the DEFAULT (rest/neutral) pose
-    #   — a task-agnostic regularizer (grasp/TJ convention), NOT toward the retarget reference (that would just
-    #   duplicate rew_hand_kpts/rew_fingertip tracking). NOT applied to the SONIC-driven body.
-    # action_rate: RAW 100-D 정책 액션의 스텝간 변화 제곱합 (z_res 64 + a_hand 36 한 항).
-    # 2026-08-18~09-01 사이 잠재/손으로 분리돼 있었으나 두 가중치가 같아 다시 하나로 합쳤다 —
-    # 선형이므로 -0.001·Σ(잠재) + -0.001·Σ(손) == -0.001·Σ(전체), 비트 단위로 동일하다.
-    # 실현된 65-D 관절 목표가 아니라 RAW 정책 액션 기준이다 (user 2026-07-20; GRAIL
-    # meta_action_rate_l2) — 실현된 목표를 벌하면 SONIC 자신의 몸 추종까지 벌하게 된다.
-    # (GRAIL 은 전체 meta-action rate 에 -0.1 을 쓴다 — 튜닝 여지.)
-    rew_action_rate: float = -0.001
-    # ── [ROLLBACK MARKER: energy] 허리·다리 역학적 파워 페널티 (2026-09-02) ────────────────
-    # Σ|τ·q̇| over 허리 3 + 다리 12 = 15관절. τ 는 robot.data.applied_torque (implicit actuator 가
-    # computed_effort = k·err_pos + d·err_vel 로 채우고 클립한 값), q̇ 는 joint_vel.
-    #
-    # 왜 τ² 이 아니라 τ·q̇ 인가: 파워는 정지 유지에서 0 이다(q̇=0). 상체를 중력에 대해 버티는
-    # 정적 토크(허리 pitch 약 60 N·m 규모)가 구조적으로 배제되므로, τ² 처럼 정적 부하가 진동
-    # 신호를 압도하는 일이 없다. τ² 에서는 진동분이 1.3% 밖에 안 됐다.
-    #
-    # 왜 상체 들썩임을 겨냥하는가: action_rate 는 차분(고역통과)이라 저주파 대진폭 진동에 둔감하다
-    # (실측: 로봇 부호 반전 5회 vs 레퍼런스 16회 — 로봇이 더 느리고 크게 흔들린다. 진폭은 루트
-    # 피치 5.7배인데 각속도로는 1.8배로 줄어든다). 파워는 진폭과 주파수를 함께 본다.
-    #
-    # 왜 팔을 제외하는가: 팔·손목 14관절의 레퍼런스 감쇠 파워 중앙값이 7.54 W 로 세 그룹 중
-    # 가장 크고(허리 0.20 / 다리 5.96), 실측상 팔은 로봇이 레퍼런스보다 이미 느리다(가속도 0.6배).
-    # 넣으면 이 항의 절반 이상을 차지하면서 정당한 리치 동작을 벌한다.
-    #
-    # 배점: 절대 형태(레퍼런스 대비 초과분이 아님)라 레퍼런스 기저까지 함께 청구된다. 레퍼런스
-    # 감쇠 파워 실측(허리+다리): s101_seg12_knife 0.94 W / s55_seg31_knife 2.09 W / 중앙값 6.15 W /
-    # 최대 s66_seg26_pan 10.90 W. 여기에 들썩임 초과분(추정 3~8 W)과 강성분이 더해진다.
-    # 칼 클립 운용값을 5~10 W 로 보면 -0.001 은 -0.005 ~ -0.010 — action_rate(-0.028)보다 약하다.
-    # 첫 런에서 `Diag / energy` 실측을 보고 조정할 것 (-0.003 ~ -0.01 이 권장 대역).
-    # 클립 간 실효 가중치가 4배까지 벌어진다(절대 형태의 대가). 클립 하나씩 학습하면 런 안에서는
-    # 일관되지만, train_sequences.sh 로 전 클립을 같은 cfg 로 돌릴 때는 클립별 조정이 필요하다.
-    # 0 이면 항이 사라진다.
-    rew_energy: float = -0.0001
-    # ── [ROLLBACK MARKER: anti-shake] SONIC 사전학습의 anti_shake_ang_vel_l2 를 그대로 가져옴 (2026-09-11).
-    #    penalty = mean_i max(‖ω_i‖ − θ, 0)²,  ω_i = 링크 i 의 월드 각속도(robot.data.body_ang_vel_w), θ = 1.5 rad/s,
-    #    링크 = 양 손목 yaw + 머리 (SONIC v1.1: weight −0.005, threshold 1.5, body_names [left/right_wrist_yaw_link, head_link]).
-    #    데드존 아래는 0 이어서 의도된 회전을 벌하지 않고 말단 링크의 고주파 떨림만 벌한다. 추종 클램프 바깥의 페널티 항.
-    #    이 USD 에 head_link 가 별도 바디로 없으면(머리가 torso_link 에 융합) torso_link 로 대체하고 초기화 로그에 적는다.
-    #    0 이면 항이 사라진다.
-    # ── [ROLLBACK MARKER: ankle-acc] 발목 관절 가속도 벌점 (ResMimic 의 ankle_dof_acc) ──────────
-    #   ankle_acc = Σ_j ( data.joint_acc[j] )²        rad/s² 단위, Isaac Lab 이 계산한 값
-    #
-    # 가속도는 ArticulationData.joint_acc 를 그대로 읽는다. 직접 차분하지 않는 이유는 두 가지다.
-    #   (1) Isaac Lab 이 물리 스텝마다 갱신한다. ArticulationData.update 가 매 서브스텝 joint_acc 를
-    #       건드려 유한차분을 돌리므로, 차분 창이 제어 주기(20 ms)가 아니라 물리 주기(5 ms)다.
-    #       읽는 시점에는 그 제어 스텝의 마지막 서브스텝 값이 들어 있다.
-    #   (2) 리셋 불연속이 자동으로 처리된다. write_joint_velocity_to_sim 이 _previous_joint_vel 을
-    #       새 속도로 맞추고 joint_acc 를 0 으로 만들기 때문에, 리셋 직후 한 스텝이 터지지 않는다.
-    #
-    # anti_shake 가 "빠르게 움직이는 것"을 벌준다면 이것은 "급격히 바꾸는 것"만 벌준다. 일정한
-    # 속도로 도는 발목은 대가가 0 이고, 매 스텝 방향이 바뀌는 떨림에만 값이 붙는다. 발목은 압력중심을
-    # 직접 만드는 관절이라 여기의 고주파 성분이 곧 균형 흔들림이다.
-    #
-    # 출발값 −1e-7 은 ResMimic 의 ankle_dof_acc(−5e-8 × 2) 에서 가져왔다. 다만 그쪽은 제어 주기
-    # 차분(20 ms)이라 우리 물리 주기 차분(5 ms)보다 값이 작게 나오므로 같은 숫자가 같은 세기는
-    # 아니다. 실측 크기는 `Diag / ankle_acc` (가중 이전) 와 `Episode_Reward / ankle_acc` 로 본다.
-    # 0.0 = 끔 (관절 색인도 만들지 않는다). 다리 전체로 넓히려면 아래 정규식에 무릎/고관절을 더한다.
-    rew_ankle_acc: float = -1e-7
+    # ---- 추적 목표 ----
+    body_kpt_from_retarget_fk: bool = True  # 몸통 키포인트 목표를 SMPL-X 대신 리타게팅 로봇 FK 로
+
+    # ---- hand_pretrain(1단계) 결과 사용 ----
+    # ablation 은 sonic_hand_residual_base 와 아래 세 플래그를 함께 바꾼다.
+    hand_kpt_from_hand_pretrain: bool = True  # 손·손목 목표를 hand_pretrain 롤아웃 키포인트로
+    hand_pretrain_subdir: str = "g1_shadow_hand_pretrain"  # data/processed/parahome/ 아래 hand_pretrain 결과 트리
+    hand_pretrain_traj_file: str = "hand_traj_best.npz"
+    hand_pretrain_contact_vertex: bool = True  # 접촉 프레임 손끝 목표를 hand_pretrain pad 위치로
+    hand_pretrain_contact_map: bool = True  # 32링크 접촉 맵을 hand_pretrain 롤아웃 것으로
+    hand_pretrain_contact_map_file: str = "hand_contact_stage1.npz"  # 파일 이름은 기존 데이터 그대로
+    cws_ref_contact_source: str = "human"  # "human" | "hand_pretrain": CWS 레퍼런스 렌치에 쓸 접촉 맵
+
+    # ---- 보상: 추적 (exp 가중치는 |rew_*| 를 exp_tracking_budget 으로 정규화해 만든다) ----
+    rew_body_kpts: float = -1.0  # 몸통 코어 키포인트 (골반·어깨·팔꿈치·엉덩이·무릎)
+    rew_ee_kpts: float = -3.0  # 손목 2 + 발목 2
+    rew_hand_kpts: float = -3.0  # 손가락 체인 키포인트
+    rew_fingertip: float = -6.0  # 손끝 pad 10개
+    rew_root_pos: float = -1.0  # 루트(골반) 위치
+    rew_root_ori: float = -1.0  # 루트(골반) 방향
+    z_weight_reward: float = 1.5  # 손·물체 위치 오차의 z 성분 가중 (보상에만)
+    rew_obj_pos: float = -5.0  # 물체 위치
+    rew_obj_rot: float = -1.5  # 물체 회전
+
+    # ---- 보상: 링크 접촉력 ----
+    rew_contact_force: float = 0.7  # contact_reward_mode 가 "force"/"both" 일 때만 보상에 들어간다
+    contact_vel_gate: bool = True  # 레퍼런스 물체가 멈춘 프레임은 접촉력 보상을 끈다
+    contact_vel_gate_lin: float = 0.05  # m/s
+    contact_vel_gate_ang: float = 0.25  # rad/s
+    contact_force_cap: float = 1.0  # N, 링크당 이 힘 이상이면 만점
+    force_obs_clip: float = 300.0  # N, 관측의 접촉력 상한 (보상에는 영향 없음)
+
+    # ---- 보상: exp 추적 형태 ----
+    exp_tracking_budget: float = 1.50  # 추적 항 전체가 한 스텝에 줄 수 있는 총 보상
+    exp_rew_alive: float = 0.5  # 생존 보너스
+
+    # σ = 그 항이 exp(-1) = 0.37 을 지급하는 오차 (m / rad)
+    sigma_body: float = 0.10
+    sigma_ee: float = 0.075
+    sigma_hand: float = 0.075
+    sigma_fingertip: float = 0.05
+    sigma_root_pos: float = 0.15
+    sigma_root_rot: float = 0.30
+    sigma_obj_pos: float = 0.05
+    sigma_obj_rot: float = 0.30
+
+    # ---- NaN 가드 ----
+    nan_guard_joint_vel: float = 100.0  # rad/s, |q̇| 가 넘으면 강제 리셋 (0 = 끔)
+    nan_guard_object: bool = True  # 물체 상태 유한성도 리셋 게이트에 포함
+    nan_guard_obs_clip: float = 1.0e4  # 관측 비유한값 치환 + 크기 제한 (0 = 끔)
+
+    # ---- 보상: 정규화 / 안정성 ----
+    rew_action_reg: float = -0.002  # z_res + 손 액션 제곱합
+    rew_pose_reg_hands: float = -0.001  # 손 관절을 기본 자세 쪽으로
+    rew_action_rate: float = -0.001  # 액션 변화량
+    rew_energy: float = -0.0001  # 허리+다리 Σ|τ·q̇|
+    rew_ankle_acc: float = -1e-7  # 발목 관절 가속도
     ankle_acc_joints: list = [".*_ankle_pitch_joint", ".*_ankle_roll_joint"]
-    # ── [/ROLLBACK MARKER: ankle-acc] ──
-    # ── [ROLLBACK MARKER: waist-acc] 허리 관절 가속도 벌점 (2026-09-16) ──────────────────────
-    #   waist_acc = Σ_j ( data.joint_acc[j] )²      rad/s² 단위, ankle-acc 와 같은 형태
-    #
-    # 왜 따로 두는가: 대상이 다르고 크기가 달라 가중치를 독립으로 조절해야 한다. 실측으로 허리는
-    # 6.5 Hz, 진폭 ±6.5° 로 진동하는데 그 각가속도가 A·ω² = 0.113 × 1668 = 188 rad/s² 이고
-    # 제곱하면 관절당 3.5e4 다. 발목 실측 p50(2.65e4, 4관절 합)과 자릿수가 비슷하다.
-    #
-    # 무엇을 벌주는가: 가속도이므로 천천히 굽히는 것은 대가가 0 이고, 앞뒤로 급하게 방향을 바꾸는
-    # 진동에만 값이 붙는다. anti_shake 는 속도를 보므로 일정하게 도는 동작까지 벌주지만 이것은
-    # 그러지 않는다. 정상적인 상체 기울임을 막지 않고 떨림만 겨냥한다.
-    #
-    # 가중치 −1e-7 은 ankle-acc 와 같은 출발값이다. 위 추정대로면 3관절 합 약 1e5 에서 스텝당
-    # −0.01 이 되어 anti_shake(−0.005 가중치) 보다 조금 크고 action_reg(−0.13) 보다 훨씬 작다.
-    # 실측은 `Diag / waist_acc`(가중 이전)와 `Episode_Reward / waist_acc` 로 본다.
-    # 0.0 = 끔 (관절 색인도 만들지 않는다).
-    rew_waist_acc: float = -1e-7
+    rew_waist_acc: float = -1e-7  # 허리 관절 가속도
     waist_acc_joints: list = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
-    # ── [/ROLLBACK MARKER: waist-acc] ──
-    rew_anti_shake: float = -0.005
-    anti_shake_ang_vel_thresh: float = 1.5           # rad/s 데드존
+    rew_anti_shake: float = -0.005  # 손목·머리 각속도의 데드존 초과분
+    anti_shake_ang_vel_thresh: float = 1.5  # rad/s 데드존
     anti_shake_bodies: list = ["left_wrist_yaw_link", "right_wrist_yaw_link", "head_link"]
-    # ── [/ROLLBACK MARKER: anti-shake] ──
+    rew_com_support: float = -0.5  # CoM 투영이 지지 영역을 벗어난 거리 (0 = 끔)
+    com_support_l_front: float = 0.10  # m, 발목 → 발끝 지지 반길이
+    com_support_l_back: float = 0.05  # m, 발목 → 뒤꿈치 지지 반길이
+    com_support_foot_halfw: float = 0.03  # m, 좌우 지지 반폭에 더하는 값
+    rew_feet_contact_match: float = 0.05  # 발 접촉이 레퍼런스와 맞으면 보너스 (0 = 끔)
+    foot_plant_h: float = 0.05  # m, 레퍼런스 발 높이가 이보다 낮으면 접지
+    foot_plant_v: float = 1.00  # m/s, 레퍼런스 발 속도가 이보다 느리면 접지
+    foot_contact_force_thresh: float = 20.0  # N, 실제 발-지면 힘이 이 이상이면 접지
 
-    # CoM-OVER-SUPPORT balance penalty (anti-fall). err = out-of-support excess (m) of the mass-weighted
-    # CoM horizontal projection, in the foot-defined frame: relu(e_fwd - L_front) + relu(-e_fwd - L_back)
-    # + relu(|e_lat| - L_side), L_side = ½‖ankleL-ankleR‖ + foot_halfw. err=0 when the CoM is inside the
-    # support box (feasibility → does NOT fight the reference lean, verified err≈0 on the retarget ref);
-    # grows only when the robot tips past the feet. Applied OUTSIDE the tracking clamp (like the regs).
-    rew_com_support: float = -0.5        # weight on the out-of-support excess (0 = disable)
-    com_support_l_front: float = 0.10    # ankle→toe forward support half-extent (m); ref CoM max ~0.066 → headroom
-    com_support_l_back: float = 0.05     # ankle→heel backward support half-extent (m)
-    com_support_foot_halfw: float = 0.03 # added to ½‖ankleL-ankleR‖ for the lateral support half-extent (m)
+    # ---- 종료 조건 (레퍼런스 이탈) ----
+    term_body_kpt_err: float = 0.50  # m, 몸 키포인트 평균 오차 (낙상 포함)
+    term_root_pos_err: float = 0.40  # m, 루트 위치 이탈 (지금은 실패 덤프 원인 기록에만 쓴다)
+    term_root_rot_err: float = 1.0  # rad, 루트 회전 이탈 (위와 같음)
+    term_obj_pos_err: float = 0.15  # m, 물체 위치 오차
+    term_obj_rot_err: float = 0.75  # rad, 물체 회전 오차
+    term_ft_err: float = 0.15  # m, 손끝 평균 오차
+    term_wrist_pos_err: float = 0.15  # m, 손목 위치 이탈 (두 손 중 큰 쪽)
+    term_wrist_rot_err: float = 0.75  # rad, 손바닥 회전 이탈
+    termination: bool = True  # 종료 조건 전체 스위치 (평가 때 False)
 
-    # FEET-CONTACT-MATCH reward (VideoMimic/BSTRO): fraction of feet whose ACTUAL contact state matches the
-    # REFERENCE contact schedule. r = mean_{i∈{L,R}} 𝟙[c_i == c*_i] ∈ [0,1] (NORMALIZED by #feet so both-
-    # match = 1.0, not 2 — the weight is the true max bonus), POSITIVE bonus (outside the tracking clamp).
-    # c_i = actual foot i in contact (ground-filtered force_matrix projected on the sole normal > force_thresh);
-    # c*_i = reference foot i in contact, precomputed at load from the ParaHome ball keypoints via the SAME
-    # rule PyRoki used for retargeting: ball_z < foot_plant_h AND ball_3d_speed < foot_plant_v. Rewards correct
-    # contact TIMING (planted-when-should-be AND swing-when-should-be) → complements the CoM-over-support net.
-    rew_feet_contact_match: float = 0.05   # POSITIVE max bonus (both feet matching → +this; 0 = disable)
-    # [ROLLBACK MARKER: foot-plant-3d] 속도를 수직 성분(|vz|)에서 3D 노름으로 바꿨습니다
-    # (SONIC/motionbricks foot_detect_from_pos_and_vel 와 같은 형태). 임계는 2026-09-04 에
-    # 높이 0.05 / 속도 1.00 으로 조정했습니다 — SONIC 기본(0.10 / 0.15)은 속도 항이 지나치게
-    # 조여 체중 이동을 스윙으로 오판하고, 높이 항은 느슨해 발이 사람보다 높이 떴습니다.
-    # 리타게팅의 _FOOT_PLANT_H / _FOOT_PLANT_V 와 반드시 같은 값이어야 합니다
-    # (이 스케줄이 rew_feet_contact_match 의 정답 c* 입니다).
-    foot_plant_h: float = 0.05            # reference contact: ball height below this = planted (m)
-    foot_plant_v: float = 1.00            # reference contact: ball 3D speed below this (m/s)
-    foot_contact_force_thresh: float = 20.0  # actual contact: compressive foot↔ground force above this = in contact (N)
+    # ---- 물체 / 맥락 물체 ----
+    freeze_inactive_objects: bool = True  # 조작하지 않는 물체를 정적 지지물로 스폰
+    context_radius: float = 1.0  # m, 물체 궤적 주변에서 맥락 물체를 고르는 XY 반경
+    context_support_radius: float = 1.5  # m, 물체 아래 지지물을 찾는 XY 반경
+    context_z_auto: bool = True  # 스폰 뒤 측정한 만큼 맥락 물체를 내려 물체가 레퍼런스 높이에 놓이게 한다
 
-    # =========================================================================== #
-    # Termination — DEVIATION FROM REFERENCE (so reference crouch/bend never triggers)
-    # =========================================================================== #
-    # All gates compare robot vs the reference pose at that frame. NO separate root pos/tilt/height
-    # gates: the mean body-keypoint error subsumes them (a root shift moves every keypoint, a tilt
-    # rotates the far keypoints away, a fall drives foot/pelvis keypoints off) — one clean body gate.
-    term_body_kpt_err: float = 0.50        # m, mean body-keypoint tracking error (covers root/fall).
-    # [ROLLBACK MARKER: body-kpt-off] 루트 낙상 게이트 — body_kpt_supervision=False일 때만 활성
-    # (_dones_deviation). body 게이트가 겸하던 낙상/루트 이탈 감지의 대체물. 기준은 리타게팅된
-    # 로봇 골반(g1_root_pose) 대비 e["root_pos"]/e["root_rot"] — 이미 매 스텝 계산되는 값이라
-    # 추가 비용 없음. 감독이 켜진 기준선에서는 body 게이트가 이를 포섭하므로 여기는 잠잠하다.
-    term_root_pos_err: float = 0.40        # m, root(pelvis) position deviation (fall/drift substitute gate)
-    term_root_rot_err: float = 1.0         # rad, root(pelvis) rotation deviation (tilt/fall substitute gate)
-    term_obj_pos_err: float = 0.15         # m, active-object position tracking error (= grasp max_obj_pos_err; was loosened to 0.20, now grasp-parity)
-    term_obj_rot_err: float = 0.75         # rad, active-object rotation tracking error (= grasp max_obj_rot_err; was 0.80)
-    # Fingertip + wrist-POSITION deviation gates (mirror grasp max_ft_mean_err / max_wrist_pos_err;
-    # bimanual → worst-of-two-hands). Together with obj + wrist-rot + the added body-kpt gate, these are
-    # the full termination set (= original grasp 5 gates + body_kpt). The finger-chain (hand) keypoint
-    # mean is REWARD-only (rew_hand_kpts) and is NOT a termination gate — matching grasp, which never
-    # terminates on its keypoint mean. (A prior misport terminated on the hand-chain mean AND dropped the
-    # wrist-position gate; corrected 2026-07-20.)
-    term_ft_err: float = 0.15              # m, mean fingertip (pad) tracking error (= grasp max_ft_mean_err)
-    term_wrist_pos_err: float = 0.15       # m, wrist (arm end-effector) POSITION deviation, worst-of-two-hands (= grasp max_wrist_pos_err)
-    # Wrist/palm ROTATION deviation gate (mirrors grasp max_wrist_rot_err). DISABLED (2026-07-20): the
-    # robot palm orientation is not a reliable target in this embodiment — the position-only PyRoki
-    # retarget + Shadow≠human hands don't reproduce the human wrist orientation, and any human-keypoint-
-    # derived reference drifts up to ~90° over a clip (measured) → false terminations. So wrist ROTATION
-    # is left unconstrained (positions are still gated by body/ft/wrist_pos). Re-enable only with a
-    # self-consistent reference (e.g. retarget-FK: the robot's own palm quat FK'd at each retarget frame)
-    # AND a retarget that emits g1_palm_quat / that reference in _ref_palm_quat.
-    enable_wrist_rot_termination: bool = True    # [wrist-rot] 키포인트 좌표계 비교로 되살림
-    term_wrist_rot_err: float = 0.75       # rad [wrist-rot]       # rad, per-hand palm-rotation deviation (= grasp max_wrist_rot_err)
-    termination: bool = True               # master switch (False during eval/warm-up)
-    # GRACE PERIOD: suppress the deviation (tracking) termination for the first N steps of each episode
-    # so an episode is not born-dead while the policy has not yet corrected the reset pose (e.g. the
-    # absolute hand drifting off the reference in the first ~12 steps). The NON-FINITE containment reset
-    # is NOT graced (a NaN env always resets). Applies to train + eval resets alike.
-    enable_termination_grace: bool = False  # on/off switch for the grace window below
-    termination_grace_frames: int = 10     # steps at episode start with deviation-termination disabled
+    # ---- RSI / 시작 프레임 샘플링 ----
+    use_rsi: bool = True  # False 면 항상 frame 0 레퍼런스 자세에서 시작
 
-    # =========================================================================== #
-    # Objects — active (dynamic, tracked) vs others (frozen for collision only)
-    # =========================================================================== #
-    # (no num_active_objects knob: the env always tracks exactly ONE active object — the first
-    #  `obj__*__base` key in the clip npz — and freezes the rest as context.)
-    freeze_inactive_objects: bool = True   # spawn non-manipulated scene objects as static support/collision
-    # Context (support/collision) objects are the non-manipulated scene objects (shelf/table/counter)
-    # the active object rests on / is manipulated near. Spawned KINEMATIC-frozen at their reference
-    # pose so the dynamic active object has something to rest on (otherwise it falls through to the
-    # floor). Selected per clip = {objects within context_radius (XY) of the active object's SWEPT
-    # trajectory}  ∪  {the SUPPORT: nearest object whose frame-0 centroid is below the active object,
-    # within context_support_radius}. The support term is a safety net because a large-footprint
-    # support (a table/counter) can have its CENTROID outside context_radius even though its top is
-    # right under the object (centroid distance is an approximation of a proper AABB/footprint test).
-    context_radius: float = 1.0            # m, XY centroid distance to the active object's swept path
-    context_support_radius: float = 1.5    # m, XY cap for the always-included below-object support
-    # [ROLLBACK MARKER: context-z] Sink every context object at spawn, as an alternative to lifting
-    # the object (object_spawn_declear). Both fix the same defect — the reference holds the object a
-    # few mm INSIDE whatever it rests on — but they leave the error in different places, and that
-    # difference decides the reward.
-    #
-    # Lifting the object spawns it at the height it will actually settle at, which is ABOVE the
-    # reference. The reward compares against the untouched reference, so on every resting frame the
-    # object is being marked down for a position the SUPPORT PHYSICALLY BLOCKS it from reaching —
-    # unreachable reward, which no amount of training recovers. Sinking the support moves the
-    # settling height DOWN onto the reference, so the target becomes achievable.
-    #
-    # Measured 0.3 s after spawn, median over the resting frames (lift -> sink):
-    #     s101_seg29_pot     49.9 -> 22.4 mm      s100_seg02_kettle  28.6 ->  7.4 mm
-    #     s100_seg00_pan     29.2 ->  5.3 mm      s101_seg30_bowl    23.1 -> 18.4 mm
-    #     s10_seg03_book     70.4 -> 35.9 mm      s101_seg12_knife    5.7 ->  3.4 mm
-    # and the vertical component specifically goes from +23..33 mm to -0.4..+4.4 mm on all of them.
-    #
-    # What it does NOT fix, so expectations stay honest: only the VERTICAL error. The object also
-    # slides horizontally (the bowl's z error goes to zero while 18 mm of horizontal error remains)
-    # and tips over (pot 9.6 deg, book 21.2 deg, cup 61.8 deg even after the fix) — both come from the
-    # reference pose not being a stable resting pose on the collider, which no z shift can address.
-    context_z_offset: float = 0.0          # m, how far DOWN to move the context objects at spawn
-    # Measure that number instead of hard-coding it: it is per-clip (5.5 mm on s101_seg12_knife,
-    # 19.5 mm on s100_seg00_pan, 24.1 mm on s100_seg02_kettle) and cannot be known before the
-    # contexts are spawned, because it comes from settling the object ON them. So: spawn, run the
-    # declear solve, sink the contexts by the median lift it asked for, re-solve. Costs one extra
-    # declear solve at startup. Composes with context_z_offset above — the solve always measures
-    # whatever is left over from wherever the contexts currently are. Leave object_spawn_declear ON
-    # alongside it: the ~2 mm the single constant cannot cover is what that per-frame lift is for.
-    context_z_auto: bool = True
-    # [/ROLLBACK MARKER: context-z]
+    # ---- 물체 스폰 관통 해소 ----
+    object_spawn_declear: bool = True  # 스폰 때 물체를 지지면에서 띄워 관통을 없앤다
+    declear_settle_steps: int = 12  # 물체가 멈추는 위치를 재는 자유 정착 스텝 수
+    declear_max_lift: float = 0.05  # m, 띄우는 양 상한
+    declear_rest_lin: float = 0.05  # m/s, 이보다 느리면 정지
+    declear_rest_ang: float = 0.25  # rad/s, 이보다 느리면 정지
 
-    # =========================================================================== #
-    # Adaptive frame-sampling curriculum + pretrain-cache RSI (reused from grasp)
-    # =========================================================================== #
-    # ── MASTER RSI SWITCH ─────────────────────────────────────────────────────────────────────
-    # False → NO Reference State Initialization. Every episode starts at FRAME 0 and the robot is
-    # reset to the frame-0 retarget-reference pose — deterministic and identical every episode
-    # (classic fixed-start imitation baseline). The train / pretrain state caches are never READ
-    # (still written, so flipping this back to True mid-run works); the object is seeded at its
-    # frame-0 reference pose+velocity. Every knob below (adaptive/failure-weighted sampling,
-    # adaptive_back_seconds, uniform_sampling_steps, rsi_curriculum_steps, pretrain_cache_warmstart)
-    # is inert while this is False. Episode length is unaffected: frame 0 → end of the sequence.
-    # Confirm it is live via `Diag / rsi_start_mean` == 0.
-    #   TEMPORARILY DISABLED (2026-07-28) to A/B the PPO ratio explosion — diverse-from-step-0 RSI
-    #   onto cold nets is the leading suspect (see the rsi_curriculum_steps note below, and the
-    #   A<0 unclipped-surrogate branch that turns one large log-ratio into an fp32 gradient
-    #   overflow). Set back to True once that is settled; the pretrain cfg pins it True because
-    #   pretrain exists to visit every frame and fill the cache.
-    use_rsi: bool = True
-    # [ROLLBACK MARKER: retarget-joint-order] map the retarget's g1_joint_pos columns onto the env's
-    # action joints BY NAME instead of trusting position. The two orders silently diverged when
-    # G1_shadow.usd was rebuilt after g1_shadow_joint_order.json was dumped: 24 of 65 slots were
-    # crossed, all in the hands (MF<->TH, FF<->RF at J1/J2/J3), so MFJ1 was fed THJ2's value and the
-    # middle finger stuck out in every rollout while body tracking looked fine. _ref_joints is the
-    # residual action base, the RSI reset pose and the state-cache seed, so it poisoned all three.
-    # False restores the pre-fix positional read.
-    remap_ref_joint_order: bool = True
+    # ---- 적응 샘플링 / 상태 캐시 ----
+    adaptive_sampling: bool = True  # 실패 가중 시작 프레임 샘플링
+    failure_weighted_sampling: bool = True  # True = 실패 가중, False = 균등 (pretrain)
+    cache_min_episode_length: int = 10  # 이보다 짧게 끝난 에피소드는 캐시에 쓰지 않는다 (종료 때 일괄 기록)
+    adaptive_alpha: float = 0.001  # 실패 카운트 EMA
+    adaptive_uniform_ratio: float = 0.1  # 균등 샘플링을 섞는 비율
+    adaptive_back_seconds: float = 1.0  # s, 샘플한 프레임보다 이만큼 앞에서 시작 (run-up)
+    adaptive_back_min_seconds: float = 0.6  # s, run-up 을 [이 값, adaptive_back_seconds] 에서 무작위로 (0 = 고정)
+    ref_start_prob: float = 0.01  # 이 확률로 캐시를 무시하고 레퍼런스 자세에서 시작
 
-    # [ROLLBACK MARKER: spawn-declear] -----------------------------------------------------------
-    # Clear the object out of its support at SPAWN, solved once at env startup against whatever
-    # colliders and physics are actually loaded.
-    #
-    # Why this replaces object_settle_lift: that one bakes a precomputed lift into the reference
-    # trajectory, so it is solved against ONE scene and silently goes stale. Raising the context
-    # colliders from 16 to 64 hulls and friction to 1.0 did exactly that — measured across four
-    # clips it now HURTS two of them (pan 3.38 -> 3.58 deg, pot 2.06 -> 2.40 deg settled rotation).
-    #
-    # Method (see scripts/process_dataset/diagnostics/test_runtime_declear.py, which is where the
-    # numbers below come from): pin the object at the reference pose with zero velocity, step once,
-    # and read the velocity the solver tried to give it. Nonzero means it was overlapping something.
-    # Raise 0.5 mm and repeat. This needs no penetration query — IsaacLab's ContactSensor exposes
-    # forces and contact positions but not separation depth, and "the solver pushed a body we
-    # pinned" carries the same information.
-    #
-    # REFERENCE-REST ONLY: applied where the reference object is stationary, and held CONSTANT
-    # across each contiguous rest segment. Everywhere else the lift is zero. A moving object is
-    # either in flight or being carried, where "release it and see where it settles" is not a
-    # spawn question at all, and a per-frame lift there would inject spurious reference velocity.
-    #
-    # SPAWN ONLY: _np_obj_base / _ref_obj_* stay exactly as captured, so reward, observations and
-    # the finite-diff reference velocities all still see pure GT. Only the reset pose moves, and
-    # only on the reference path — RSI cache hits restore a genuinely simulated state that is
-    # already clear. The object settles back down onto its support, so this does not cost position
-    # accuracy: distance from the UNCORRECTED reference after settling drops on every clip tested.
-    #
-    # Settled spawn rotation over the frames where the reference is at rest, raw -> declear:
-    #   s101_seg12_knife  42.04 +- 59.48  ->   9.94 +- 1.83 deg   (and 1.97 -> 0.70 cm from GT)
-    #   s101_seg30_bowl   28.02 +- 17.57  ->   2.38 +- 1.02 deg   (penetrating frames)
-    #   s100_seg00_pan     3.38 +-  1.45  ->   2.56 +- 0.78 deg
-    #   s101_seg29_pot     2.06 +-  0.44  ->   2.13 +- 0.66 deg   (no penetration problem to fix)
-    # The spread is what matters: a thin knife or a round bowl tips unpredictably out of a
-    # penetrating spawn, and a policy cannot learn a grip whose object pose is a coin flip. Flat
-    # wide-based objects (pan, pot) sink into their support just as much but do not topple, so
-    # they show little change. The residual ~9 deg on the knife is a genuine settled tip under
-    # gravity, not a spawn artifact, and no height offset can remove it.
-    object_spawn_declear: bool = True
-    # Steps of FREE settling used to measure where the object actually comes to rest. Convergence is
-    # fast (the pan is within 0.6 mm of final by step 5); 12 leaves margin without costing much, since
-    # this now runs ONCE per frame instead of once per bisection iteration.
-    declear_settle_steps: int = 12
-    declear_max_lift: float = 0.05         # m, safety clip so a pathological frame cannot launch it
-    declear_rest_lin: float = 0.05         # m/s   reference speed under which the object counts as at rest
-    declear_rest_ang: float = 0.25         # rad/s reference angular speed for the same test
+    # ---- 리셋 상태 ----
+    ref_reset_joint_vel: bool = True  # 레퍼런스 리셋에 관절 속도도 넣는다
+    ref_reset_joint_vel_scale: float = 1.0  # 넣는 배율
+    ref_reset_joint_vel_clip: float = 10.0  # rad/s, 몸 29관절 상한
+    ref_reset_joint_vel_clip_hands: float = 10.0  # rad/s, 손 36관절 상한
 
-    adaptive_sampling: bool = True
-    failure_weighted_sampling: bool = True   # TRAIN: True (failure-weighted). PRETRAIN overrides → False (uniform).
-    # [ROLLBACK MARKER: deferred-cache] ----------------------------------------------------------
-    # Commit the RSI state cache in BULK AT TERMINATION instead of per-step.
-    #
-    # Today `_save_state_cache` runs inside `_get_rewards`, i.e. EVERY control step, and writes the
-    # env's CURRENT frame immediately. The only quality filter is `_enough_continued` (tracking has
-    # been continuously good since reset) — which a born-dead episode PASSES for its first few steps,
-    # because at reset the state IS the reference/cache so the errors are still small. Such an episode
-    # therefore writes states that lead to death into frames whose cache was empty or worse, and those
-    # states are then restored by later resets.
-    #
-    # With this > 0 the writes are held per-env and only committed when the episode ENDS, and only if
-    # it lasted at least this many control steps. Episodes that die sooner contribute nothing. The
-    # per-frame quality gate and the "keep the higher reward" rule are unchanged — this adds a
-    # hindsight filter on top of them.
-    #
-    # COST: a (num_envs, max_episode_length, 222) fp32 staging buffer. 2048 envs x 251 frames =
-    # 442 MB; 4096 x 501 = 1.76 GB. If that is too much, lowering it does NOT shrink the buffer (the
-    # buffer must span a whole episode) — cap `episode_length_s` or reduce num_envs instead.
-    # 0 disables the deferral entirely and restores the per-step write, byte-identical to before.
-    cache_min_episode_length: int = 10
-    # [/ROLLBACK MARKER: deferred-cache] ---------------------------------------------------------
-    adaptive_alpha: float = 0.001
-    adaptive_uniform_ratio: float = 0.1
-    adaptive_back_seconds: float = 1.0 # 0.8       # run-up before the sampled target frame (= 50 frames @50 fps)
-    # [ROLLBACK MARKER: rand-runup] 되감기를 [이 값, adaptive_back_seconds] 사이에서 프레임마다
-    # 무작위로 뽑습니다. 0이면 기존처럼 고정(TJ와 동일한 방식)입니다. 하한은 에피소드가
-    # cache_min_episode_length를 넘길 여지를 남기기 위한 것입니다.
-    runup_rand_min_frames: int = 30 # 10
-    # [ROLLBACK MARKER: ref-start-prob] 이 확률로 캐시 히트를 무시하고 레퍼런스 자세에서 시작합니다.
-    # 캐시는 프레임당 슬롯이 하나라, 한 번 들어간 상태가 나쁘면 그 프레임이 영구히 그 상태로
-    # 고정됩니다(그 상태에서 시작 -> 또 실패 -> 더 나은 상태가 그 프레임을 지나갈 일 없음).
-    # 레퍼런스를 가끔 섞으면 비교 대상이 생겨 교체가 일어날 수 있습니다. 0이면 기존 동작입니다.
-    ref_start_prob: float = 0.01
-    # ── [ROLLBACK MARKER: ref-reset-jvel] 레퍼런스 리셋에 관절 속도 주입 (2026-08-14) ────────────
-    # 지금까지 where_ref 리셋 경로는 관절 위치·루트 자세·루트 선/각속도·물체 선/각속도를 모두
-    # 레퍼런스에서 채우면서 관절 속도만 0으로 남겼습니다(jvel = zeros_like(jpos) 뒤로 대입 없음).
-    # 그래서 클립 중간에서 시작하면 "몸통과 물체는 움직이는데 관절만 정지"인, 물리적으로 어긋난
-    # 조합이 됩니다. 더 중요한 것은 SONIC과의 불일치입니다 — sonic_hist_from_reference=True 이므로
-    # 리셋 직후 SONIC의 10프레임 속도 이력은 레퍼런스 속도(_ref_hist["jvr"])로 채워지는데, 정작
-    # 시뮬레이터의 관절 속도는 0이었습니다. 즉 프리어는 "지난 10프레임 동안 움직여 왔다"고 듣고
-    # 로봇은 멈춰 있었습니다. True로 두면 그 두 이야기가 같아집니다.
-    #
-    # 값은 _ref_joint_vel (F,65) = 리샘플된 _ref_joints의 후방차분 x control_fps. 루트 속도와 같은
-    # 규약(후방차분, 역방향 에피소드에서 부호 반전, 0번 프레임 0)입니다.
-    #
-    # 12클립 실측(30->50fps 보간 후 차분, |v| rad/s): p99 = 다리 1.18 / 허리 0.81 / 팔 3.11 /
-    # 손 0.81, 전체 최대 6.92. 10 rad/s 초과 프레임 0%, max/p99 비율 2.2~4.0 (IK 지터 스파이크
-    # 없음). 30->50 보간이 저역통과로 작용해 차분 노이즈가 증폭되지 않습니다. 그래서 평활도
-    # 그룹별 축소도 넣지 않았습니다. clip은 지금 데이터에서는 걸리지 않는 안전밸브입니다.
-    #
-    # 기본값 False인 이유: 지금 12클립 벤치마크 스윕이 진행 중이라, 켜면 아직 시작하지 않은
-    # 클립만 새 조건으로 학습해 벤치마크가 반쪽씩 다른 조건이 됩니다. 스윕이 끝난 뒤 True로
-    # 뒤집어 새 스윕을 돌리면 깨끗한 A/B가 됩니다. 되돌리기: False.
-    # ── [ROLLBACK MARKER: tendon-reset] 리셋 시 텐던 축 J0 를 제약에 맞춰 쓰기 ─────────────────
-    # 손가락 말단 J0 8개는 액추에이터가 없고 PhysX 고정 텐던으로 J1 에 묶여 있습니다
-    # (q_J0 = gear * q_J1). 액션 관절 65개에 없으므로 _reset_idx 는 항상 default(=0) 로 두는데,
-    # 상태 캐시도 65열만 저장하므로 어느 리셋 경로에서도 J0 는 복원되지 않습니다. J1 이 굽은
-    # 프레임에서 리셋하면 텐던 제약이 최대 1.14 rad 위반된 채로 시작합니다.
-    # 실측(J1=1.0 rad 로 리셋): J0 는 4스텝(20 ms) 만에 따라잡지만 그 과정에서 말단 링크가
-    # 1.705 m/s 로 튑니다 — 리셋 직후 손 속도(0.35~0.57 m/s)의 3배입니다. 제약에 맞춰 쓰면
-    # 그 과도응답이 사라집니다. 되돌리기: False.
-    tendon_reset_couple: bool = True
-    # USD physxTendon gearing 비 (root -0.00805 / axis +0.00705). 리타게팅 URDF 의 <mimic>
-    # multiplier 와 같은 값이어야 합니다 — 두 곳이 어긋나면 레퍼런스와 시뮬레이터가 다른 손 모양을
-    # 갖게 됩니다(scripts/process_dataset/assets/add_urdf_tendon_mimic.py).
-    tendon_gear_ratio: float = 0.00805 / 0.00705      # = 1.14184
-    ref_reset_joint_vel: bool = True
-    ref_reset_joint_vel_scale: float = 1.0    # 주입 배율 (0.5 = 절반 속도로 시작)
-    # 성분별 상한(rad/s). 몸통과 손을 나눈 이유: 자연 스케일이 3배, 액추에이터 한계가 6.7배
-    # 차이나서 스칼라 하나로는 손 쪽 안전밸브가 작동하지 않습니다. 12클립 3671프레임 실측:
-    #   몸통 29개: p99 2.42 / p99.9 4.56 / max 6.92, 액추에이터 한계 100 (max가 한계의 6.9%)
-    #   손  36개: p99 0.81 / p99.9 1.67 / max 3.25, 액추에이터 한계  15 (max가 한계의 21.7%)
-    # 10.0은 손 p99의 12배라, 손가락이 8 rad/s로 튀는 명백한 이상값(손 액추에이터로 실제 명령
-    # 가능한 값)을 그냥 통과시킵니다. 6.0이면 실측 최대의 1.8배로 여유는 남기되 밸브가 됩니다.
-    # 두 값 모두 현재 12클립에서는 걸리지 않습니다(몸통은 8 이상, 손은 4 이상이면 비활성) —
-    # 잘라낼 이상값이 있어서가 아니라 미래 클립 대비용입니다. 관절별 max/p99가 1.3~2.1로 지금
-    # 데이터에는 IK 결함 스파이크가 없습니다(있으면 이 비율이 10을 넘습니다). 상위 관절은 전부
-    # 어깨/팔꿈치/손목 — 실제 리치 동작입니다(right_wrist_roll 6.92, right_shoulder_pitch 6.87).
-    ref_reset_joint_vel_clip: float = 10.0        # 몸통(다리+허리+팔) 29개
-    ref_reset_joint_vel_clip_hands: float = 10.0   # 손 36개
-    # No-pretrain regime: RSI is seeded DIRECTLY from the PyRoki retarget reference (every frame is a valid
-    # start via the where_ref reset path), so the pretrain-cache warm-start is OFF. The train cache still
-    # supplies better (physical) restore states for frames it covers as training fills it.
-    pretrain_cache_warmstart: bool = False   # was True (pretrain→train warm-start); now reference-seeded RSI
-    #   RESET on pretrain→train transfer (loaded policy fed RAW obs → diverged), NOT the warm-start.
-    #   Fixed in train.py _load_partial_checkpoint (floored scaler transfer). Warm-start gives
-    #   reference-matching reset poses (lower initial wrist_rot). Set False for vanilla RSI (rollback).
-    # [ROLLBACK MARKER: late-gate] fraction of the clip an episode must survive, on top of finishing
-    # within 3 frames of the end, before the cache quality gate switches to the tight 'late' object
-    # bars. The two together mean "started inside the first 20% and completed the clip". > 1.0 keeps
-    # the gate off for good; 0.0 drops the length requirement and the switch reduces to "any episode
-    # reached the end", which under reference-seeded RSI fires on the first control step.
-    late_gate_survival_frac: float = 0.8
+    # ---- 샘플링 일정 ----
+    late_gate_survival_frac: float = 0.8  # late 캐시 기준으로 넘어가려면 클립의 이 비율 이상 생존해야 한다
+    uniform_sampling_steps: int = 2000  # 처음 이 제어 스텝 동안은 균등 샘플링
+    ref_dt: float = 1.0 / 30.0  # 레퍼런스 원본 프레임 간격 (30 fps)
 
-    uniform_sampling_steps: int = 2000
-    # RSI START-FRAME CURRICULUM (cold-start mitigation). Diverse-from-step-0 RSI onto a COLD
-    # value/policy/obs-scaler (no pretrain warm-start) ignites a PPO ratio explosion (policy loss
-    # → e12–e21): the cold nets face the whole clip's state range at once → huge early value errors
-    # / mis-normalized obs shove μ far in one update (amplified by the UNBOUNDED z_res + FSQ-flat
-    # reward + kl_threshold=0). Confirmed via run diff: the explosion appeared exactly when
-    # episode_length_s 5→3 (RSI start range upper 1→101 = diverse) + pretrain_cache_warmstart T→F.
-    # This ramps the sampleable start-frame CEILING from ~frame 0 to the full trajectory over the
-    # first rsi_curriculum_steps CONTROL STEPS, so the cold nets warm up on a narrow, well-conditioned
-    # near-frame-0 distribution before deep frames appear. Unlike the old _reached_frame crawl this is
-    # TIMESTEP-scheduled (not success-gated) so it ALWAYS reaches full range — no stuck-at-0.
-    # 0 → disabled (diverse-from-step-0, previous behaviour). Tune ≳ the early explosion window
-    # (~first 2k steps); default warms up then runs full RSI for the rest of training.
-    rsi_curriculum_steps: int = 0
-    ref_dt: float = 1.0 / 30.0
+    # ---- 상태 캐시 품질 게이트 (리셋 뒤 계속 이 기준 안이어야 캐시에 기록) ----
+    enough_ft_threshold: float = 0.10  # m, 손끝 평균 오차
+    enough_obj_threshold: float = 0.085  # m, 초반 물체 위치 오차
+    enough_obj_rot_threshold: float = 0.425  # rad, 초반 물체 회전 오차
+    enough_obj_threshold_late: float = 0.05  # m, 후반 물체 위치 오차
+    enough_obj_rot_threshold_late: float = 0.25  # rad, 후반 물체 회전 오차
+    enough_body_threshold: float = 0.30  # m, 몸 키포인트 평균 오차
+    enough_root_pos_threshold: float = 0.10  # m, 루트 위치 오차
+    enough_root_rot_threshold: float = 0.30  # rad, 루트 회전 오차
 
-    # --- State-cache quality gate (mirrors grasp _save_state_cache): a frame's state is cached
-    # only while tracking is CONTINUOUSLY "good enough" since reset (self._enough_continued), so
-    # RSI restores from good states, not barely-alive ones. Thresholds are TIGHTER than the
-    # termination gates. body+fingertip are the always-present bars; object uses a frame-dependent
-    # (start-loose / early / late) phase like grasp. When has_object is False (pretrain / no-object
-    # clips) the object conditions are trivially satisfied (obj errs = 0) → gate = body+ft only.
-    # enough_* now use the SAME VALUES as grasp (user: do not loosen). Matches grasp's gate exactly:
-    # fingertip + object phase only (NO body/hand enough thresholds — grasp never gated on those).
-    enough_ft_threshold: float = 0.10          # m, mean fingertip err (= grasp enough_ft_threshold; was loosened to 0.13)
-    enough_obj_threshold: float = 0.085        # m, early-phase obj pos err (= grasp; was 0.11)
-    enough_obj_rot_threshold: float = 0.425    # rad, early-phase obj rot err (= grasp; was 0.45)
-    enough_obj_threshold_late: float = 0.05    # m, late-phase obj pos err (= grasp; was 0.07)
-    enough_obj_rot_threshold_late: float = 0.25  # rad, late-phase obj rot err (= grasp; was 0.27)
-    # Floating-base cache quality bars (analog of grasp pretrain's fixed-base wrist bars): only
-    # cache a frame if the WHOLE BODY / ROOT also track well, not just the fingertips. Needed
-    # because with has_object=False the object phase-gate is a tautology → the gate would collapse
-    # to fingertip-only, letting a drifted torso with a compensating arm poison the RSI cache.
-    # Default inf = OFF (TRAIN unchanged); the PRETRAIN cfg tightens them (obj gate is inert there).
-    cache_body_bar: float = 0.30       # < term_body_kpt_err 0.25 (~0.65×); seed body err ~0.066 passes
-    cache_root_pos_bar: float = 0.10
-    cache_root_rot_bar: float = 0.30
+    # ---- 물체 마찰 커리큘럼 ----
+    friction_curriculum: bool = True  # 물체 마찰을 높게 시작해 friction_min 까지 낮춘다
+    friction_min: float = 1.0  # 최종 마찰 (물체 USD 기본값과 같음)
+    friction_max_init: float = 3.0  # 초기 상한
+    friction_decay_steps: int = 30000  # 제어 스텝
 
-    # =========================================================================== #
-    # Per-LINK contact reward (Option A / DexMachina — the single env contact map, from hand_contact.npz)
-    # =========================================================================== #
-    # The old fingertip-only contact map (obj-velocity gate + nearest-object-vertex: obj_contact_linvel/
-    # angvel_thresh, contact_dist_threshold, contact_near_vertex_thresh, use_grounded_normal,
-    # use_fingertip_to_vertex_dir, use_contact_point_gate, use_contact_normal_gate, contact_normal_tol) was
-    # REMOVED 2026-07-22 — superseded by the per-link Option-A map (rew_contact_force + contact_force_cap
-    # above; LINK_CONTACT_NAMES). Only the SPATIAL-gate tolerance remains, now reused by the per-link force
-    # reward (a link's force counts only if the robot link is within this of its object-surface target).
-    # [ROLLBACK MARKER: cws-contact] 링크별 접촉 센서가 접촉점 위치도 보고하게 합니다. 접촉 렌치의
-    # 모멘트 팔에 필요합니다. 켜면 프림당 접촉 데이터 버퍼를 실제로 쓰게 되는데, 이 버퍼는 넘쳐도
-    # 잘리지 않고 장치 단언으로 죽으므로 (ft_max_contact_points가 그 상한) 환경 수를 올릴 때 한 번은
-    # 확인이 필요합니다. 접촉 렌치 보상을 안 쓰면 꺼서 비용을 아낄 수 있습니다.
-    # ── 물체 마찰 커리큘럼 [ROLLBACK MARKER: friction-curriculum] ──────────────────────
-    # 에피소드마다 물체 마찰을 [friction_min, friction_max(t)]에서 뽑습니다. friction_max(t)는
-    # friction_max_init에서 friction_min까지 friction_decay_steps 제어 스텝에 걸쳐 선형 감소하고,
-    # 그 뒤로는 friction_min 고정입니다. 쉬움→어려움: 초반엔 잘 안 미끄러지니 대충 쥐어도 잡히고,
-    # 점차 실제 마찰로 조입니다. friction_min은 물체 USD에 구워진 값(DEFAULT_FRICTION=1.0)과
-    # 같게 두어, 감쇠가 끝나면 커리큘럼이 없던 것과 동일한 조건이 됩니다.
-    # False로 두면 물체 마찰은 USD의 구워진 값 그대로입니다.
-    # ── 역방향 롤아웃 [ROLLBACK MARKER: backward-dir] ──────────────────────────────────
-    # 이 비율만큼의 환경을 시간 역방향으로 굴립니다. 0.0이면 모든 관련 코드가 항등이 되어 기존
-    # 동작과 완전히 같습니다. 목적은 정방향이 통과하지 못하는 병목 프레임의 캐시를 채우는 것.
-    backward_ratio: float = 0.00
-    # 역방향이 쓴 상태가 정방향 항목을 밀어내려면 보상이 이 비율만큼 더 높아야 합니다. 점수 척도는
-    # 같지만(둘 다 그 프레임 레퍼런스와의 일치도) 정방향 항목에는 "정방향 동역학으로 실제 도달했다"
-    # 는 보증이 붙는 반면 역방향에는 없습니다. 보상 크기가 1.1~1.5 수준이라 2%는 절대값 0.02~0.03
-    # 으로, 프레임 간 흔들림보다는 크고 "쥐었다/아니다"의 차이(0.1 단위)보다는 훨씬 작습니다.
-    # `Curriculum / cache_bwd_frac`로 확인하세요 — 0에 붙으면 너무 빡빡, 1로 오르면 너무 느슨,
-    # 0.1~0.3이면 의도대로 병목 구간만 채우는 중입니다.
-    backward_replace_margin: float = 0.02
-    friction_curriculum: bool = True
-    friction_min: float = 1.0          # 하한이자 최종 고정값 (물체 USD의 기본 마찰과 동일)
-    friction_max_init: float = 3.0     # 초기 상한
-    friction_decay_steps: int = 30000  # 이 제어 스텝 동안 상한이 friction_min까지 내려옴
-    track_contact_points: bool = True
+    # ---- 접촉 센서 ----
+    track_contact_points: bool = True  # 센서 접촉점 기록 (CWS 에 필요)
 
-    # ── [ROLLBACK MARKER: failure-dump] 실패 에피소드 덤프 (2026-08-17) ────────────────────────
-    # 목적: 실패의 원인을 기하학적으로 진단하려면 "실패 직전 몇 스텝 동안 무슨 일이 있었는지"와
-    # "그 상태로 시뮬레이터를 되돌릴 수 있는 정보"가 함께 필요합니다. 되돌릴 수 있어야 나중에
-    # 액션을 조금 흔들어보는 반사실 실험(±d)을 할 수 있습니다. 그래서 RSI 상태 캐시가 쓰는
-    # 것과 똑같은 222차원 복원 상태(_build_cache_state)를 그대로 재사용합니다.
-    #
-    # False면 버퍼조차 만들지 않아 기존 동작과 완전히 같습니다.
-    #
-    # 용량: 한 스텝 한 환경이 360 float32 = 1.44 KB. 창 20스텝이면 에피소드당 28.8 KB.
-    #       기본값(4000 에피소드)에서 약 115 MB. 시작할 때 예상 용량을 출력합니다.
-    failure_dump: bool = False
-    failure_dump_envs: int = 64          # 앞쪽 N개 환경에서만 기록 (전체를 담으면 수백 GB)
-    failure_dump_window: int = 20        # 실패 직전 몇 스텝을 담을지 (원인은 죽은 순간이 아니라 접근 구간)
-    failure_dump_budget: int = 4000      # 총 에피소드 상한 — 용량을 정하는 주 손잡이
-    failure_dump_bucket: int = 1000      # 이 제어 스텝마다 예산을 균등 배분 (학습 초기에만 쏠리지 않게)
-    failure_dump_total_steps: int = 41000  # 예산을 나눌 기준 총 스텝. --timesteps 와 맞춰야 고르게 담깁니다.
-    # RSI 복원 직후의 죽음은 정책의 실수가 아니라 초기화 여파입니다(캐시 상태가 물체와 살짝 겹쳐
-    # 있으면 물리가 밀어내며 1~2스텝에 종료). 그걸 진단에 넣으면 "물체에서 멀어져라"라는 정반대
-    # 방향이 쌓이므로 반드시 걸러야 합니다. 캐시 쓰기 게이트(cache_min_episode_length)보다 깁니다.
-    failure_dump_min_len: int = 10
-    failure_dump_dir: str = ""           # 빈 문자열이면 로그 디렉터리 아래 failure_dump/
 
-    # ── [/ROLLBACK MARKER: failure-dump] ──────────────────────────────────────────────────────
+    # ---- CWS 접촉 렌치 보상 ----
+    contact_reward_mode: str = "cws"  # "cws" | "force" | "both"
+    rew_cws: float = 0.50  # CWS 보상 가중치
+    cws_beta: float = 0.1  # 로봇 렌치가 사람의 (1±beta)배 안이면 만점
+    cws_v: float = 0.1  # 부족/과잉 벌점 세기
+    cws_n_dir: int = 512  # 비교 방향 수 (논문 값)
+    cws_n_edge: int = 8  # 마찰 원뿔 옆면 수 (논문 값)
+    cws_link_chunk: int = 4  # 링크를 몇 개씩 나눠 계산할지 (0 = 한 번에, 메모리 주의)
+    cws_mu: float = 0.1  # 마찰계수 (논문 값)
+    cws_seed: int = 0  # 비교 방향 시드 (사람/로봇이 같은 방향을 써야 해서 고정)
+    cws_force_thresh: float = 0.1  # N, 접촉으로 볼 최소 법선 힘
+    contact_match_dist: float = 0.03  # m, 링크-접촉 목표 거리 허용치 (접촉력 보상 게이트)
+    ft_max_contact_points: int = 64  # 링크당 접촉점 버퍼 (≤ 16 hull × 4점)
 
-    # ── [ROLLBACK MARKER: cws-contact] 접촉 렌치 보상 (CHORD, arXiv 2607.00033) ────────────────
-    # "force"  기존 힘 기반만  |  "cws"  접촉 렌치만  |  "both"  둘 다 (기본)
-    # 렌치 점수는 접촉의 배치만 보고 세기는 안 봅니다(마찰 원뿔의 대표 방향이 크기 1인 힘이라).
-    # 그래서 힘 보상을 없애면 "실제로 눌러라"를 가르치는 항이 사라집니다. 논문도 접촉 보상을 다른
-    # 보상들과 더하기로 붙이므로 병행이 기본입니다.
-    contact_reward_mode: str = "cws" # "force"
-    # 접촉 그룹 총량을 기존 힘 보상과 같은 0.7로 맞춥니다. 나머지 보상(com_support -0.5,
-    # latent_reg -0.1 등)이 그 크기를 기준으로 튜닝돼 있어서, 배점을 0.35로 두면 접촉만 절반이
-    # 됩니다. "both"로 되돌릴 때는 0.35로 낮추고 rew_contact_force도 0.35로 내려야 총량이 유지됩니다.
-    # [ROLLBACK MARKER: cws-diag] 진단 전용 모드 (2026-08-18). True 면 contact_reward_mode 가
-    # "force" 여도 접촉 렌치를 계산해 로그와 실패 덤프에만 남기고 보상에는 넣지 않습니다.
-    # 목적: 실패 창에서 "지금 파지가 만들 수 있는 렌치가 필요한 렌치를 담고 있는가"를 관찰만 하기.
-    # 보상 경로는 비트 단위로 불변이므로 기존 런과 직접 비교할 수 있습니다.
-    cws_log_only: bool = False
-    rew_cws: float = 0.50 # 0.30
-    # 아래 4개는 논문 공개 구현에서 실제로 쓰는 값입니다 (2026-09-02 확인). 논문 본문에는
-    # 없어서 예전에는 우리가 정했는데, 저장소 전체를 훑어 오버라이드가 없음을 확인했습니다.
-    #   tolerance=0.1, var=0.1  -> g1_sonic_env_cfg.py:644 와 v2d_hand_env_cfg.py (두 태스크 동일)
-    #   friction_coefficients=0.1, num_friction_cone_edges=8  -> tracking_command_cfg.py:138-142
-    #     (utils.py 함수 시그니처 기본값 0.5 는 cfg 가 항상 덮어써서 쓰이지 않습니다)
-    cws_beta: float = 0.1        # 여유 범위. 로봇이 사람의 (1-beta)~(1+beta)배 안이면 만점.
-    # 레퍼런스 자세 실측(덮은 방향 비율 평균)은 여유 0.2에서 칼 66% 냄비 71% 그릇 74% 팬 40%,
-    # 0.3에서 75/80/82/47% 였습니다. 0.1 로 좁히면 이 비율이 더 내려가지만, 이제 cws_reward 가
-    # 방향별 평균이라 덮지 못한 방향이 전부 0 이 아니라 분모에만 비례 감점으로 들어갑니다.
-    # 0은 쓰면 안 됩니다 — 접촉점이 정확해지면서 오히려 값이 떨어졌습니다.
-    cws_v: float = 0.1            # 벌점 세기. 이제 방향 하나의 (부족²+과잉²)을 나눕니다(합이 아님).
-    # sigma 는 힘 성분이 크기 1, 회전 성분이 |p|/rc 라 대략 0~1.4 범위입니다. v=0.1 이면 방향당
-    # 부족 0.32 에서 exp=0.37, 0.48 에서 0.10 이라 구분 대역이 맞습니다.
-    cws_n_dir: int = 512         # 비교 방향 개수 (논문 num_wrench_space_basis_samples)
-    cws_n_edge: int = 8          # 마찰 원뿔 옆면 개수 (논문 num_friction_cone_edges). 여기에
-    # 순수 법선 1개가 더해져 생성자는 9개입니다(논문 friction_cone_edges_jit 의 append_normal).
-    # 회전 시 값이 달라지는 오차(중앙/최대)는 mu=1.0 에 법선 없던 시절 4개 5.1%/42%, 8개
-    # 1.1%/10.2%, 16개 0.3%/2.5% 였습니다. mu=0.1 에서는 옆면이 법선에 거의 붙어 훨씬 작습니다.
-    cws_link_chunk: int = 4      # 링크를 몇 개씩 나눠 계산할지. 0이면 한 번에(환경 2048에서 2 GB 초과).
-    cws_mu: float = 0.1          # 마찰계수. 논문 값입니다.
-    # 주의: 우리 시뮬레이터의 실제 물체 마찰은 DEFAULT_FRICTION=1.0 이고 friction_min 도 1.0 이라
-    # 물리적으로는 1.0 이 맞습니다. 논문의 0.1 은 마찰을 거의 없다고 보는 보수적 선택으로, 원뿔이
-    # 반각 5.7도로 좁아져 점수가 "마찰을 얼마나 활용하나"보다 "접촉 위치와 법선이 맞나"를 주로
-    # 봅니다. sigma_h 와 sigma_r 이 같은 mu 를 쓰므로 비교 자체는 유효합니다. 논문 재현을 우선해
-    # 0.1 로 두었고, 시뮬레이터 물리와 맞추려면 1.0 으로 되돌리면 됩니다.
-    cws_seed: int = 0            # 비교 방향을 뽑는 시드. 사람/로봇이 같은 방향을 써야 하므로 고정.
-    cws_force_thresh: float = 0.1  # N, 접촉으로 칠 최소 법선 힘
-    # 논문은 힘 임계를 아예 두지 않습니다. 활성 판정이 접촉점 위치의 노름(> 1e-3)이고, 이는
-    # "PhysX 가 접촉점을 보고했는가"와 같습니다(utils_jit.py:wrench_preprocess_jit). 논문
-    # ContactSensorCfg 의 force_threshold=0.1 은 렌치와 무관합니다 — IsaacLab 구현에서 그 값은
-    # track_air_time 블록의 체공/접촉 시간과 시각화 마커에만 쓰입니다(contact_sensor.py:422,519).
-    # 우리는 1.0 N 이었는데, PhysX 접촉 노이즈 하한 정도인 0.1 N 으로 낮춰 논문 거동에 붙입니다.
-    # 완전히 같게 하려면 0 으로 두고 isfinite(contact_pos_w) 만 보면 됩니다.
-    # ── [/ROLLBACK MARKER: cws-contact] ──────────────────────────────────────────────────────
+    # ---- 관측 스케일 ----
+    vel_obs_scale: float = 0.2  # 관측의 각속도·관절 속도 배율
 
-    contact_match_dist: float = 0.03          # m, robot-link ↔ contact-target tolerance for the force gate
-    ft_max_contact_points: int = 64           # per-link contact-data buffer cap. DERIVED bound, not a guess:
-    #   PhysX reduces a convex-vs-convex manifold to ≤4 points, and parahome_convert_obj_to_usd.py caps the
-    #   object convex decomposition at max_convex_hulls=16, so a link can straddle ≤16 sub-hulls → ≤16×4 = 64
-    #   contacts. ContactSensor buffer overflow is a HARD device-side assert, so the cap MUST upper-bound the
-    #   real count (tied to the hull cap at the source). If max_convex_hulls changes, set this to hulls×4.
-    #   RAISED 32 → 64 on 2026-07-30 to satisfy that derivation. It had been 32 (half the bound) while the
-    #   14 RIGID object USDs were additionally still cooked from 2026-07-07, i.e. BEFORE the max_convex_hulls
-    #   =16 line existed — `maxConvexHulls` was simply NOT AUTHORED on their collider prims, so PhysX used its
-    #   schema default of 32 (generatedSchema.usda:577) and the real worst case was 32×4 = 128, four times the
-    #   configured cap. Verified by reading the Sdf layer text of every objects/*/Props/instanceable_meshes.usd
-    #   (config.yaml is NOT a reliable record: one file per DIRECTORY, so a later <obj>_ctx.usd cook overwrites
-    #   the <obj>.usd entry). All 22 objects were re-cooked with `--rigid-only --overwrite` and now author
-    #   hulls=16 / verts=64, which makes 16×4 = 64 the true bound again.
-
-    # =========================================================================== #
-    # Observation scaling + action smoothing (per-group EMA + optional delta)
-    # =========================================================================== #
-    vel_obs_scale: float = 0.2             # scale on all angular + joint velocities in obs
-    # Per-group EMA alphas live in JOINT_GROUPS[*]["ema_alpha"] (legs/waist/arms 0.3, hands 0.5).
-    # NOTE (SONIC mode = this env): the per-group delta switches + residual_action below are BYPASSED.
-    # The 29 body DOF come from the FROZEN SONIC decoder (no EMA/delta); the 36 hands use ABSOLUTE action
-    # with the hands EMA (α=0.5). These fields govern ONLY the inherited non-SONIC fallback path (dead here).
-    # Fallback semantics (kept for that path): delta switch OFF → absolute per-group EMA; ON → integrate
-    # raw·scale (EMA-smoothed by *_delta_smoothing) into a clamped target. scale = rad/step (raw∈[-1,1]).
-    leg_delta_action: bool = True
-    leg_delta_scale: float = 0.25
-    leg_delta_smoothing: float = 1.0
-    waist_delta_action: bool = True
-    waist_delta_scale: float = 0.25
-    waist_delta_smoothing: float = 1.0
-    arm_delta_action: bool = True
-    arm_delta_scale: float = 0.25
-    arm_delta_smoothing: float = 1.0
-    hand_delta_action: bool = True
-    hand_delta_scale: float = 0.4
-    hand_delta_smoothing: float = 1.0
-
-    # RESIDUAL-POLICY mode (hybrid with the delta integrator above). When True AND the retarget joint
-    # trajectory is present, the per-group delta integrator gains a REFERENCE-FEEDFORWARD term so the
-    # commanded target tracks the retargeted joints (target ≈ ref_joints[frame] + accumulated policy
-    # correction); the policy then learns only the physics/contact/balance CORRECTION on top of the
-    # reference. No offset window — the correction is bounded by joint limits (anti-windup via the delta
-    # clamp) and kept small by the delta clamp. Falls back to free-running delta if the
-    # retarget joints are absent (guarded). Re-pretrain when toggling (action semantics change).
-    residual_action: bool = False   # BYPASSED in SONIC mode (governs only the non-SONIC fallback path).
-    # PER-STEP residual: target = clamp(ref_joints[frame] + residual_scale·a, limits), scaled PER GROUP.
-    # Body (legs+waist+arms) gets a tighter residual (closer reference tracking); hands get a wider one
-    # (grasp adaptation needs more finger authority than the reference provides).
-    # BOTH are read ONLY on the use_sonic=False fallback path (_pre_physics_step → residual_action
-    # branch), via _residual_scale_t. Under the default use_sonic=True the 29 body DOF come from the
-    # frozen SONIC decoder and the hands are an ABSOLUTE action, so neither value affects training —
-    # they are not dead code, just inactive in the shipped configuration.
-    residual_scale_body: float = 0.50    # legs (12) + waist (3) + arms (14) = 29 DOF
-    residual_scale_hands: float = 0.50   # bimanual Shadow fingers (36 DOF)
-
-    # =========================================================================== #
-    # Frozen SONIC body prior (GEAR universal-token whole-body controller)
-    # =========================================================================== #
-    # The 29 G1 body DOF are driven by a FROZEN SONIC decoder; the policy outputs z_res(64) added
-    # to SONIC's FSQ latent BEFORE quantization (GRAIL Eq.6, λ=residual_scale_latent) then decoded.
-    # SONIC runs at 50 Hz (sim.dt 1/200 × decim 4) and consumes a 10-frame proprio history + a
-    # 10-frame future SMPL reference window (sonic_smpl_file, produced by parahome_smpl_for_sonic.py
-    # at control_fps). The env resamples ALL per-frame references 30 fps → control_fps at load so
-    # one control step == one reference frame. Built in _post_init_buffers (needs env_isaaclab +
-    # gear_sonic + vector_quantize_pytorch installed).
-    use_sonic: bool = True
-    # ── [ROLLBACK MARKER: sonic-v11] 프리어를 SONIC v1.1 로 전환 (2026-09-04) ─────────────
-    # v1.1 = 릴리스에서 resume 학습한 변형 (실험명 sonic_release_3pt_heading_wrist_81):
-    #   1) 참조 루트 자세를 로봇 heading(요)만으로 정규화 (릴리스는 펠비스 전체 자세).
-    #      env 가 레이아웃 키로 자동 판별합니다 — env.py 의 _sonic_heading / _sonic_anchor_q.
-    #   2) randomize_wrist_poses=True 손목 자세 증강 + tracking_vr_2wrists_local_ori 보상(0.4).
-    #   3) 디코더 MLP 확대 [4096,4096,2048,2048,1024,1024,512,512] → ckpt 469MB → 1.14GB.
-    #   4) 새 보상 energy_consumption(-0.0001) — 우리 rew_energy(-0.001)의 1/10 크기.
-    # 같은 것: robot type g1_model_12_dex(허리 stiffness 28.5 그대로 — waist_pitch 문제는
-    # v1.1 도 해결하지 않습니다), FSQ 32레벨, action_clip 20.0, 10프레임 step5 룩어헤드,
-    # 토크나이저 레이아웃 오프셋(총 2102), 디코더 proprio 930-D 구조.
-    #
-    # ★ 잔차 정책을 처음부터 다시 학습해야 합니다 ★ 릴리스로 학습한 agent.pt 를 v1.1 에 얹으면
-    # 보상 합이 550 → 4.2 로 붕괴합니다(실측, s101_seg29_pot). 프리어 단독(z_res=0, 117~124)
-    # 보다도 낮습니다 — λ·z_res(최대 0.32)가 인코더 잠재(최대 0.20)보다 커서 잔차가 잠재를
-    # 지배하기 때문입니다. pretrain 도 함께 다시 돌려야 합니다(이 클래스를 상속).
-    # 되돌리기: 아래 두 경로를 sonic_release/ 로. env 쪽은 자동 판별이라 수정 불필요.
+    # ---- SONIC 프라이어 ----
+    use_sonic: bool = True  # 이 env 는 SONIC 전용 (False 면 오류). hand_pretrain cfg 가 False 로 덮어쓴다
     sonic_config_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/config.yaml"
     sonic_ckpt_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/last.pt"
-    # [ROLLBACK MARKER: sonic-encoder-g1] SONIC에 무엇을 명령으로 줄지.
-    #   "smpl" : 사람 SMPL 관절 위치 + 손목 관절 6개 (기존 동작)
-    #   "g1"   : 로봇 자신의 29개 관절 각도 + 속도 (사람->로봇 변환 단계가 없음)
-    # 리타게팅(_ref_joints)이 없는 클립에서는 자동으로 smpl로 되돌아갑니다.
-    # 실측(SONIC 단독, residual 0, 오른손 손목 회전 오차 rad):
-    #                     smpl    g1
-    #   전체 p50          0.490  0.337
-    #   나이 3~10         0.504  0.299
-    #   나이 25~60        1.080  0.439   <- smpl은 시간이 갈수록 62도까지 벌어짐(옆면이 물체를 향함)
-    # 레퍼런스 고정 시 바닥값이 0.229이므로 SONIC이 만드는 순수 오차는 0.261 -> 0.108로 60% 감소.
-    # 에피소드도 훨씬 오래 삽니다(나이 60+ 표본 173 -> 7740).
-    sonic_encoder: str = "g1"
-    # ── [ROLLBACK MARKER: token-frame-skip] ───────────────────────────────────────────────
-    # g1 인코더 토큰의 미래 프레임 간격 (control_fps 프레임 단위). SMPL 분기에는 영향이 없습니다.
-    # 상류 sonic_v1_1/config.yaml:
-    #     dt_future_ref_frames: 0.1        num_future_frames: 10       (g1 경로)
-    #     smpl_dt_future_ref_frames: 0.02  smpl_num_future_frames: 10  (smpl 경로)
-    #     target_fps: 50
-    # commands.py:346  frame_skips = dt_future_ref_frames // (1/target_fps) = 0.1 // 0.02 = 5
-    # commands.py:360  future_time_steps_init = arange(num_future_frames) * frame_skips
-    # 즉 g1 토큰은 0.1초 간격 10프레임 = 1.0초 앞을 봅니다. 우리는 스킵 1(0.2초)을 쓰고 있었고,
-    # 그러면 SONIC 이 0.2초 구간을 1.0초로 읽어 레퍼런스가 5배 느린 것처럼 보입니다. 거의 정지한
-    # 목표로 해석해 액션이 뒤처지고, 뒤처진 만큼 자세 오차가 커집니다. 실측(agent_26000,
-    # s101_seg29_pot)에서 waist_pitch 명령 47.7도 RMS / 가동폭 ±26.8도 / 포화 75.9% 였고,
-    # 로봇을 레퍼런스에 고정하면 15.8도로 떨어졌습니다 — 뒤처짐이 사라지면 밀 이유도 사라집니다.
-    # 부작용: 창이 45프레임(0.9초) 앞까지 가므로 클립 끝에서 clamp 로 마지막 프레임이 반복됩니다
-    # (상류도 동일 구조). 332프레임 클립이면 마지막 13.6% 구간이 해당됩니다.
-    # 되돌리기: 1 로 두면 기존 동작과 비트 단위로 같습니다.
-    sonic_token_frame_skip: int = 5
-    # ── [/ROLLBACK MARKER: token-frame-skip] ──────────────────────────────────────────────
-    residual_scale_latent: float = 0.10   # λ on z_res (GRAIL pre-quantization latent residual scale)
-    control_fps: float = 50.0            # resample reference 30 fps → this; MUST match parahome_smpl_for_sonic TGT_FPS
-    sonic_smpl_file: str = "sonic_smpl_50fps.npz"   # SONIC SMPL encoder arrays (sibling of the retarget npz)
-    # [ROLLBACK MARKER: hist-from-reference] What SONIC's 10-frame proprioception window is filled
-    # with at reset. The window is history — there is none at the first step of an episode, so it has
-    # to be fabricated, and the choice decides what the frozen decoder believes just happened.
-    #   True  = the REFERENCE's own last 10 frames. The window is then a real trajectory whose
-    #           positions, velocities and orientation agree with each other, and it is the SAME
-    #           trajectory the tokenizer feeds as the FUTURE.
-    #   False = replicate the current row into all 10 slots. That says "the robot has not moved for
-    #           10 frames" while the tokenizer says the reference is mid-motion — two different
-    #           stories, and a frozen robot past contradicts any non-zero velocity restored from the
-    #           state cache.
-    # Ported from the RePHO variant, where it was written and measured.
-    sonic_hist_from_reference: bool = True      # [ROLLBACK MARKER: hist-grail] True→False (2026-09-10): GRAIL/SONIC 원본과 같이 리셋 직후
-    #                                          #   실제 상태를 10칸 복제 + 액션 0. (seed_zero_vel / act_seed_from_pose 는 False 유지)
-    # The two below only apply to the REPLICATED fallback (from_reference=False); with the reference
-    # window the velocities and the action already agree with the positions.
-    #   seed_zero_vel   zero the seeded joint velocity so the frozen positions and the velocity stop
-    #                   contradicting each other.
-    #   act_seed_from_pose  seed last_action with the action that commands the CURRENT pose
-    #                   (jpr / sonic_scale, the exact inverse of the decode) instead of 0. Off because
-    #                   IsaacLab's action manager zeroes the action at reset, so 0 is what the frozen
-    #                   decoder actually saw during its own training.
-    sonic_hist_seed_zero_vel: bool = False
-    sonic_act_seed_from_pose: bool = False
+    sonic_encoder: str = "g1"  # "g1" | "smpl": SONIC 에 줄 명령 인코더
+    sonic_token_frame_skip: int = 5  # g1 토큰의 미래 프레임 간격 (5 → 1초 창)
+    residual_scale_latent: float = 0.10  # z_res 에 곱하는 λ (GRAIL)
+    control_fps: float = 50.0  # 레퍼런스를 이 주기로 리샘플 (parahome_smpl_for_sonic 와 같아야 한다)
+    sonic_smpl_file: str = "sonic_smpl_50fps.npz"  # 리타게팅 npz 옆의 SONIC SMPL 입력
+    # 리셋 때 SONIC 10프레임 히스토리를 레퍼런스로 채운다 (False = 현재 상태 복제)
+    sonic_hist_from_reference: bool = True
 
-
-
-    # =========================================================================== #
-    # Data — reference clip (ParaHome). Keypoint targets come from the SMPLX tree
-    # (available now); per-frame retargeted G1 joints (if present in the retarget tree)
-    # seed reset poses, else fall back to the G1_SHADOW_CFG standing pose.
-    # =========================================================================== #
-    dataset_root: str = str(_DATA_DIR / "processed" / "parahome")   # absolute (package data dir)
-    smplx_subdir: str = "smplx"            # keypoint/object reference tree (produced by parahome.py)
-    retarget_subdir: str = "g1_shadow"     # per-frame G1 joint refs (produced by retargeting; optional)
-    retarget_file: str = "trajectory_pyroki.npz"  # retarget npz filename under the tree (PyRoki output; g1_joint_pos/g1_root_pose)
-    clip_class: str = "single_rigid"       # single_rigid | single_articulated | ...
-    clip_name: str = ""                    # "" → auto-pick the first available clip in clip_class
-    # (clip selection is dataset_root + smplx_subdir/retarget_subdir + clip_class + clip_name; the old
-    #  data_subset / dataset_dir aliases were never read by the env and are gone.)
+    # ---- 데이터 ----
+    dataset_root: str = str(_DATA_DIR / "processed" / "parahome")
+    smplx_subdir: str = "smplx"  # 키포인트·물체 레퍼런스 트리
+    retarget_subdir: str = "g1_shadow"  # 리타게팅 결과 트리
+    retarget_file: str = "trajectory_pyroki.npz"
+    clip_class: str = "single_rigid"  # single_rigid | single_articulated | ...
+    clip_name: str = ""  # "" 이면 clip_class 의 첫 클립

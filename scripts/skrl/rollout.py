@@ -57,13 +57,13 @@ parser.add_argument("--keep_termination", action="store_true",
                          "종료 유무에서 오는지 판정하는 스위치 — 학습은 termination=True 로 돌아 "
                          "벗어나는 env 가 리셋되지만 평가는 그걸 끄고 끝까지 굴린다.")
 parser.add_argument("--cfg_set", type=str, nargs="*", default=[], metavar="KEY=VAL",
-                    help="env_cfg 필드를 직접 덮어쓴다 (예: hand_delta_action=True). 체크포인트가 "
+                    help="env_cfg 필드를 직접 덮어쓴다 (예: residual_action=False). 체크포인트가 "
                          "학습된 cfg 와 현재 cfg 가 어긋날 때 맞추기 위한 것 — 액션 의미가 다른 "
                          "cfg 로 rollout 하면 결과가 무의미하다. bool/int/float/str 자동 변환.")
 parser.add_argument("--zero_action", action="store_true",
                     help="[wrist-stability] 정책 액션 전체를 0 으로 덮어씁니다. 떠 있는 손에서 "
-                         "액션 0 은 손목 힘 0 + (rot6d 항등 바이어스 덕에) 토크 0 을 의미하므로, "
-                         "손목이 제자리에 머무는지 = 컨트롤러가 안정한지 보는 진단입니다. "
+                         "액션 0 은 손목 잔차 0 (= 레퍼런스 손목 관절값 추종)을 의미하므로, "
+                         "손목이 레퍼런스를 따라가는지 = 컨트롤러가 안정한지 보는 진단입니다. "
                          "잔차 손가락 액션도 0 이 되어 손가락은 레퍼런스 자세를 그대로 따릅니다. "
                          "체크포인트는 여전히 필요하지만(Runner 구성용) 결과에 영향은 없습니다.")
 parser.add_argument("--dump_joints", action="store_true",
@@ -232,7 +232,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[rollout] termination=True — 학습과 동일한 오차 기반 종료를 유지합니다")
 
     # [cfg-match] 체크포인트가 학습된 cfg 와 현재 cfg 를 맞추기 위한 직접 덮어쓰기. cfg 가 드리프트
-    # 하면(예: hand_delta_action 을 나중에 끄면) 같은 체크포인트가 다른 액션 의미로 해석되어
+    # 하면(예: residual_action 을 나중에 끄면) 같은 체크포인트가 다른 액션 의미로 해석되어
     # rollout 결과가 무의미해진다. 적용값을 출력해 무엇이 바뀌었는지 기록한다.
     for _kv in args_cli.cfg_set:
         _k, _, _v = _kv.partition("=")
@@ -249,15 +249,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _nv = _v
         setattr(env_cfg, _k, _nv)
         print(f"[rollout] cfg_set {_k}: {_cur!r} → {_nv!r}")
-    # [ROLLBACK MARKER: cache-obj-layout] wrist_mode 는 action/observation 차원과 손 에셋을
-    # __post_init__ 에서 유도한다. 속성만 바꾸면 54/559 · shadow_float 그대로라 joint6 체크포인트를
-    # 읽을 수 없으므로 train.py 와 같이 다시 호출한다 (그 함수는 멱등하다).
-    if any(_kv.partition("=")[0] == "wrist_mode" for _kv in args_cli.cfg_set) \
-            and hasattr(env_cfg, "__post_init__"):
-        env_cfg.__post_init__()
-        print(f"[rollout] wrist_mode={env_cfg.wrist_mode} → action={env_cfg.action_space} "
-              f"obs={env_cfg.observation_space}")
-    # [/ROLLBACK MARKER: cache-obj-layout]
 
     # Dataset / sequence overrides
     if args_cli.dataset is not None:
@@ -499,22 +490,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _h_env = actual_env
             _h_hands = (_h_env.hand_l, _h_env.hand_r)
             _h_fids = [getattr(_h_env, f"_finger_joint_ids_{_sd}") for _sd in "lr"]
-            _h_w6 = bool(getattr(_h_env, "_w6", False))
-            _h_wids = [getattr(_h_env, f"_wrist6_joint_ids_{_sd}") for _sd in "lr"] if _h_w6 else None
+            _h_wids = [getattr(_h_env, f"_wrist6_joint_ids_{_sd}") for _sd in "lr"]
             _h_sensors = list(getattr(_h_env, "_link_contact_sensors", []) or [])
             print(f"[hand-traj] {n} env 기록 시작: 손가락 {sum(len(f) for f in _h_fids)}관절, "
-                  f"wrist_mode={'joint6' if _h_w6 else 'wrench'}, 접촉 링크 {len(_h_sensors)}")
+                  f"손목 관절 {sum(len(w) for w in _h_wids)}, 접촉 링크 {len(_h_sensors)}")
 
     def _hand_traj_state():
         """스텝 전 상태 (E,…) 를 _hrec 에 추가."""
         _org = _h_env.scene.env_origins
         _cpu = lambda t: t.detach().clone().cpu()
-        _hrec["frame"].append(_cpu(_h_env._rframe()))
+        _hrec["frame"].append(_cpu(_h_env._frame()))
         _hrec["finger_qpos"].append(_cpu(torch.cat([_h.data.joint_pos[:, _f] for _h, _f in zip(_h_hands, _h_fids)], 1)))
         _hrec["finger_qvel"].append(_cpu(torch.cat([_h.data.joint_vel[:, _f] for _h, _f in zip(_h_hands, _h_fids)], 1)))
         _hrec["joint_pos_all"].append(_cpu(torch.stack([_h.data.joint_pos for _h in _h_hands], 1)))
-        if _h_w6:
-            _hrec["wrist_dof6"].append(_cpu(torch.stack([_h.data.joint_pos[:, _w] for _h, _w in zip(_h_hands, _h_wids)], 1)))
+        _hrec["wrist_dof6"].append(_cpu(torch.stack([_h.data.joint_pos[:, _w] for _h, _w in zip(_h_hands, _h_wids)], 1)))
         _hrec["palm_pos"].append(_cpu(_h_env._gather_body(_h_env._palm_sides, _h_env._palm_body_ids, "body_pos_w") - _org[:, None]))
         _hrec["palm_quat"].append(_cpu(_h_env._gather_body(_h_env._palm_sides, _h_env._palm_body_ids, "body_quat_w")))
         _hrec["palm_linvel"].append(_cpu(_h_env._gather_body(_h_env._palm_sides, _h_env._palm_body_ids, "body_lin_vel_w")))
@@ -550,8 +539,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _tg = getattr(_h_env, "_hand_target_ema", None)
         if _tg is not None:
             _hrec["finger_target"].append(_cpu(_tg))
-        if _h_w6:
-            _hrec["wrist6_target"].append(_cpu(torch.stack(list(_h_env._wrist6_target), 1)))   # (E,2,6)
+        _hrec["wrist6_target"].append(_cpu(torch.stack(list(_h_env._wrist6_target), 1)))   # (E,2,6)
         _r = rewards_t if rewards_t.ndim == 1 else rewards_t[:, 0]
         _hrec["reward"].append(_cpu(_r))
         _hrec["done"].append(done_t.clone())
@@ -693,7 +681,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                    object_name=_np.asarray(str(getattr(actual_env, "_obj_name", ""))),
                    checkpoint=_np.asarray(str(args_cli.checkpoint)),
                    control_fps=_np.asarray(round(1.0 / (env_cfg.sim.dt * env_cfg.decimation))),
-                   wrist_mode=_np.asarray(str(getattr(env_cfg, "wrist_mode", "wrench"))),
+                   wrist_mode=_np.asarray("joint6"),   # 파일 형식 호환용 (wrench 모드는 제거됨)
                    stochastic=_np.asarray(bool(args_cli.stochastic)),
                    joint_names=_np.array(actual_env._action_joint_names),
                    joint_names_all_l=_np.array(actual_env.hand_l.joint_names),
@@ -701,9 +689,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                    link_contact_names=_np.array(list(getattr(_hm, "LINK_CONTACT_NAMES", []))),
                    fingertip_body_names=_np.array(list(getattr(env_cfg, "fingertip_body_names", []))),
                    ctrl_lower=actual_env._ctrl_lower.cpu().numpy(), ctrl_upper=actual_env._ctrl_upper.cpu().numpy())
-        if _h_w6:
-            _sv["wrist6_joint_names_l"] = _np.array([actual_env.hand_l.joint_names[i] for i in _h_wids[0].tolist()])
-            _sv["wrist6_joint_names_r"] = _np.array([actual_env.hand_r.joint_names[i] for i in _h_wids[1].tolist()])
+        _sv["wrist6_joint_names_l"] = _np.array([actual_env.hand_l.joint_names[i] for i in _h_wids[0].tolist()])
+        _sv["wrist6_joint_names_r"] = _np.array([actual_env.hand_r.joint_names[i] for i in _h_wids[1].tolist()])
         # 레퍼런스(같은 50 Hz 프레임 색인) — 비교·변환용
         for _k, _a in (("ref_joints", getattr(actual_env, "_ref_joints", None)),
                        ("ref_wrist_dof6", getattr(actual_env, "_ref_wrist_dof6", None)),

@@ -1,33 +1,10 @@
-"""ArticulationCfg for the two FREE-FLOATING Shadow hands (stage-1 dexterous pretrain).
+"""ArticulationCfg for the two floating Shadow hands (stage-1 dexterous pretrain, hand_pretrain env).
 
-Assets are produced by `scripts/process_dataset/assets/build_shadow_floating_usd.py`, which slices
-`robot0_{l,r}_palm` and everything below it out of `G1_shadow.usd`. Verified inventory per hand:
-23 links, 22 joints (18 actuated + 4 tendon-axis J0, no fixed joints), ArticulationRootAPI on
-`robot0_{s}_palm`, tendon attributes present on 8 joints, 0 dangling references.
-
-The G1 `robot0_{s}_wrist` link was DROPPED (2026-09-07). `WRJ0` was a PhysicsFixedJoint, so that
-link carried zero degrees of freedom — a 0.300 kg body welded to the palm, inherited from the arm
-mount. Removing it takes the hand from 0.911 to 0.611 kg (gravity 8.94 -> 6.00 N) and removes one
-rigid body + one joint per hand from the solver. TJ's asset also keeps a base link before the palm,
-but it is a 0.100 kg `hand_mount` stub, so rooting at the palm is closer to TJ than keeping the
-G1 wrist was.
-
-Why the palm has NO actuator
-----------------------------
-The palm is the free-floating articulation ROOT, driven by external force/torque on the root body
-(see the env's `_apply_action`), not by a joint. That mirrors workspaceTJ's
-`shadow_hand_wristfree.py`, where only the fingers appear in `actuators` and the 6-DOF base comes
-from `fix_root_link=False` plus a stiffness gain applied as force. The consequence is that the
-"wrist controller" is an impedance law, not a joint PD:
-
-    F = K_pos * pos_offset * action_dt        (K_pos = 4000, from TJ)
-    T = K_rot * axis_angle(R_offset) * action_dt   (K_rot = 160, from TJ)
-    F, T low-passed with a 0.2 moving average
-    the D term is the rigid body's linear/angular damping below, NOT a controller term
-
-Damping 100.0 is what keeps that law from diverging; it is the only velocity-proportional term in
-the loop. K_pos/K_rot are TJ's values; `action_dt` is derived from OUR control period (1/50),
-which is what TJ's own cfg means by the symbol (`action_dt = 1 / action_fps`).
+Each hand hangs from a fixed anchor at the env origin through six wrist joints
+(tx, ty, tz, rot1, rot2, rot3 — YZX) and is driven by joint PD, like DexMachina.
+Assets: `scripts/process_dataset/assets/build_shadow_floating_usd.py --side both --wrist6`
+→ `shadow_float6_{l,r}.usd`. The G1 `robot0_{s}_wrist` link (zero-DOF, 0.3 kg) is not part of
+the hand; the wrist joints attach directly to `robot0_{s}_palm`.
 
 Tendon prerequisite (do not change one without the other)
 ---------------------------------------------------------
@@ -59,77 +36,9 @@ _FINGER_EXPR = [
     "robot0_{s}_THJ0",
 ]
 
-# TJ (`shadow_hand_wristfree.py`) free-base damping. This is the D term of the wrist impedance law.
-FLOAT_LINEAR_DAMPING = 50.0 # 100.0
-FLOAT_ANGULAR_DAMPING = 50.0 # 100.0
-
-
-def shadow_float_cfg(side: str, prim_path: str) -> ArticulationCfg:
-    """One free-floating Shadow hand. `side` is "l" or "r"."""
-    if side not in ("l", "r"):
-        raise ValueError(f"side must be 'l' or 'r', got {side!r}")
-    usd = _ROBOTS / f"shadow_float_{side}.usd"
-    if not usd.exists():
-        raise FileNotFoundError(
-            f"{usd} 없음 — scripts/process_dataset/assets/build_shadow_floating_usd.py 를 먼저 실행하세요")
-    return ArticulationCfg(
-        prim_path=prim_path,
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=str(usd),
-            activate_contact_sensors=True,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                # [float-gravity] TJ 와 동일하게 중력을 끕니다 (2026-09-07, 사용자 결정).
-                # 켜두면 정책이 액션 범위의 일부를 상시 "들고 있기" 바이어스로 써야 합니다 —
-                # 실측: 무액션 20스텝(0.4 s)에 손목이 17.5 mm 처짐(0.038 m/s). 게다가 2단계에서는
-                # 실제 G1 팔이 중력을 받쳐주므로, 1단계가 스스로 중력과 싸우는 걸 배우면 전이가
-                # 나빠집니다. TJ 의 shadow_hand_wristfree.py 도 disable_gravity=True 입니다.
-                disable_gravity=True,
-                retain_accelerations=False,
-                # [float-damping] TJ 의 자유 베이스 감쇠. 손목 임피던스 법칙의 D 항이고, 제어기에는
-                # 미분 항이 없으므로 이 값이 유일한 속도 비례 항입니다. 빼면 외력 제어가 발산합니다.
-                linear_damping=FLOAT_LINEAR_DAMPING,
-                angular_damping=FLOAT_ANGULAR_DAMPING,
-                max_depenetration_velocity=1.0,
-            ),
-            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                # [float-selfcoll] 손가락끼리 통과하지 않도록 (2026-09-07, 사용자 결정).
-                # 꺼두면 물리적으로 불가능한 파악 자세가 허용되고 그 자세가 2단계 목표로 넘어갑니다.
-                # TJ 도 True 입니다. 이 값을 켜면 에셋의 physics:filteredPairs 목록이 실제로
-                # 쓰이므로, 빌드 스크립트가 잘려나간 wrist 를 가리키던 끊긴 대상 17건/손 을
-                # 제거하도록 함께 고쳤습니다 (안 그러면 제외돼야 할 인접 링크 쌍이 충돌합니다).
-                enabled_self_collisions=True,
-                fix_root_link=False,          # ← 6-DOF 자유 손목
-                solver_position_iteration_count=8,
-                solver_velocity_iteration_count=4,
-            ),
-            # [hand-tendon] J1<->J0 루프백 텐던. 자산 쪽 전제(J0 드라이브 제거)가 추출 USD 에
-            # 상속돼 있음을 build 스크립트가 검증합니다. 값은 G1 빌드와 동일한 정준값입니다.
-            fixed_tendons_props=sim_utils.FixedTendonPropertiesCfg(limit_stiffness=30.0, damping=0.2),
-        ),
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 1.0),              # 실제 초기 자세는 env 가 리타게팅 손목으로 덮어씁니다
-            rot=(1.0, 0.0, 0.0, 0.0),
-            joint_pos={".*": 0.0},
-        ),
-        actuators={
-            "fingers": ImplicitActuatorCfg(
-                joint_names_expr=[e.format(s=side) for e in _FINGER_EXPR],
-                # G1 빌드의 shadow_fingers 와 동일 — 두 단계의 손 동역학을 같게 유지합니다.
-                velocity_limit_sim=15.0,
-                effort_limit_sim=3.09,
-                stiffness=1.0,
-                damping=0.2,
-            ),
-        },
-        soft_joint_pos_limit_factor=1.0,
-    )
-
-
-SHADOW_FLOAT_L_CFG = shadow_float_cfg("l", "/World/envs/env_.*/HandL")
-SHADOW_FLOAT_R_CFG = shadow_float_cfg("r", "/World/envs/env_.*/HandR")
 
 # ══ [wrist6] 6-DoF 관절 손목 ═══════════════════════════════════════════════════════════════
-# 자유 베이스 + 외력(위) 대신, palm 앞에 관절 6개를 직렬로 붙이고 anchor 를 월드에 고정한다.
+# palm 앞에 관절 6개를 직렬로 붙이고 anchor 를 월드에 고정한다.
 # 에셋: build_shadow_floating_usd.py --wrist6 (shadow_float6_{l,r}.usd, 링크 30 / 관절 29)
 # 체인: anchor → tx(X) → ty(Y) → tz(Z) → rot1(Y) → rot2(Z) → rot3(X) → (fixed) → palm
 #
@@ -141,7 +50,7 @@ SHADOW_FLOAT_R_CFG = shadow_float_cfg("r", "/World/envs/env_.*/HandR")
 #
 # 게인은 물체 없이 knife 클립으로 쓸어서 정한 값이다 (2026-09-08). 측정치:
 #   양손 최대 13.55 / 12.40 mm, 2.61° / 3.86°, 손목 힘 최대 10.9 N / 3.7 N·m, effort 포화 0%
-#   → 외력 방식의 학습 중 실측(Error/wrist_kpts 중앙 26 mm, Error/wrist_rot 중앙 24.4°) 대비
+#   → (이미 제거된) 외력 방식의 학습 중 실측(Error/wrist_kpts 중앙 26 mm, Error/wrist_rot 중앙 24.4°) 대비
 #     위치 2배 / 회전 6배 정확하고, 종료 게이트(150 mm / 43°) 에 12배 / 11배 여유
 # damping 은 임계값 2√(kp·I) 의 0.54배(과소감쇠)다. 임계나 그 이상으로 올리면 나빠진다 —
 # 실측: kd_t 를 임계의 1.4배로 두면 최대 오차가 6.09 → 8.86 mm.
@@ -218,10 +127,8 @@ def shadow_float6_cfg(side: str, prim_path: str) -> ArticulationCfg:
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 retain_accelerations=False,
-                # [wrist6] linear/angular_damping 을 **주지 않는다**. 위 자유 베이스 값은 외력
-                # 임피던스 법칙의 D 항이었고(제어기에 미분 항이 없었다), 관절 PD 는 자체 damping
-                # 을 갖는다. 그대로 두면 모든 링크에 속도 비례 항력이 더 걸려 관절 제어기가
-                # 그것과 싸우게 된다.
+                # [wrist6] linear/angular_damping 을 주지 않는다. 관절 PD 가 자체 damping 을 갖고,
+                # 링크 감쇠를 더하면 모든 링크에 속도 비례 항력이 걸려 관절 제어기가 그것과 싸운다.
                 max_depenetration_velocity=1.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(

@@ -16,20 +16,13 @@
 # HOW THIS DIFFERS FROM train_sequences_sonic_residual.sh
 #   - NO SONIC prep. cfg.use_sonic=False, so sonic_smpl_50fps.npz is never read
 #     (the assert that requires it lives inside the SONIC-guarded block).
-#   - NEEDS wrist_ref.npz. The floating hands are ROOTED at robot0_{l,r}_palm and
-#     the RSI reset writes that root pose directly (it was robot0_{l,r}_wrist until
-#     2026-09-07, when that zero-DOF link was dropped from the asset). The retarget npz stores only
-#     g1_joint_pos + g1_root_pose (pelvis), so the wrist pose is implied by FK but
-#     never written out — export_wrist_ref.py runs pinocchio FK to produce it.
-#     The env RAISES FileNotFoundError without it, so this step is HARD-REQUIRED.
-#   - EXPORTS a stage-2 target. After training, export_hand_rl.py runs one
-#     deterministic rollout per clip → hand_rl.npz. That file IS the deliverable;
-#     a trained checkpoint with no export gives stage 2 nothing to track.
-#   - AUDITS reachability. audit_wrist_reachability.py checks whether a G1 arm can
-#     actually reach the wrist trajectory stage 1 invented. Stage 1 lets the wrist
-#     float with no anchor (user's decision), so this is the post-hoc gate that
-#     replaces anchoring. The retargeted baseline measures 0.0% unreachable across
-#     all 16 clips, so any excess here was produced by stage 1.
+#   - NEEDS wrist_ref.npz + wrist_dof6.npz. The retarget npz stores only g1_joint_pos +
+#     g1_root_pose (pelvis), so the palm pose is implied by FK but never written out —
+#     export_wrist_ref.py runs pinocchio FK to produce it, and export_wrist_dof6.py splits it into
+#     the six wrist joint values (YZX) the joint6 hand tracks. The env RAISES FileNotFoundError
+#     without either, so both steps are HARD-REQUIRED.
+#   - The stage-2 target is NOT made here: evaluate_sequences_hand_pretrain.sh runs rollout.py
+#     --dump_hand_traj and writes <clip>/0/hand_traj_best.npz (+ hand_contact_stage1.npz).
 #
 # Per clip:
 #   1. Verify the processed SMPL-X clip exists (smplx/<class>/<clip>/0/trajectory.npz).
@@ -39,9 +32,9 @@
 #      *** HARD-REQUIRED *** — seeds the RSI reference pose and is step 4's input.
 #   4. Wrist FK sidecar (env_isaaclab, pinocchio) → g1_shadow/<class>/<clip>/0/wrist_ref.npz
 #      *** HARD-REQUIRED *** — the floating-hand root pose. Runs AFTER step 3.
-#   5. Train → agent.pt
-#   6. Deterministic rollout export → g1_shadow/<class>/<clip>/0/hand_rl.npz  (stage-2 target)
-#   7. Reachability audit of the exported wrist trajectory (report only, never fails the clip).
+#   5. Wrist joint sidecar (env_isaaclab) → g1_shadow/<class>/<clip>/0/wrist_dof6.npz
+#      *** HARD-REQUIRED *** — the joint6 wrist target. Runs AFTER step 4.
+#   6. Train → agent.pt
 #
 # Checkpoints/metrics tree (evaluate.bash-compatible; clip_name at path parts[1]):
 #   data/processed/parahome/g1_shadow_hand_pretrain/<clip_class>/<clip_name>/0/
@@ -49,11 +42,11 @@
 # ONE-TIME PREREQS (not per-clip):
 #   - composite PyRoki URDF:  source/robotis_sh5/data/robots/G1/urdf_pyroki/g1_shadow_nomimic.urdf
 #     built by: <env_isaaclab python> scripts/process_dataset/assets/export_g1_shadow_urdf.py
-#   - floating-hand USDs:     source/robotis_sh5/data/robots/G1/shadow_float_{l,r}.usd
-#     built by: <env_isaaclab python> scripts/process_dataset/assets/build_shadow_floating_usd.py
+#   - floating-hand USDs:     source/robotis_sh5/data/robots/G1/shadow_float6_{l,r}.usd
+#     built by: <env_isaaclab python> scripts/process_dataset/assets/build_shadow_floating_usd.py --side both --wrist6
 #
 # Which clips run: edit CLIPS=(...) or CLIPS_OVERRIDE="a b c".
-# Env vars: FORCE=1 (re-run all), SKIP_RETARGET=1, SKIP_EXPORT=1, SKIP_AUDIT=1,
+# Env vars: FORCE=1 (re-run all), SKIP_RETARGET=1,
 #   CLIP_CLASS=..., CLIPS_OVERRIDE="a b c", NUM_ENVS / TIMESTEPS, VIDEO=1,
 #   PY=<env_isaaclab python>, PY_PYROKI=<env_pyroki python>.
 # =============================================================================
@@ -67,8 +60,6 @@ TIMESTEPS="${TIMESTEPS:-41000}"
 PY="${PY:-/home/peunsu/anaconda3/envs/env_isaaclab/bin/python}"
 PY_PYROKI="${PY_PYROKI:-/home/peunsu/anaconda3/envs/env_pyroki/bin/python}"
 SKIP_RETARGET="${SKIP_RETARGET:-0}"   # 1 → skip steps 2-3 (env then fails at step 4: no wrist_ref input)
-SKIP_EXPORT="${SKIP_EXPORT:-0}"       # 1 → train only, no stage-2 target
-SKIP_AUDIT="${SKIP_AUDIT:-0}"         # 1 → no reachability report
 
 # Set VIDEO=1 to record a training mp4 every VIDEO_INTERVAL steps.
 VIDEO="${VIDEO:-1}"
@@ -178,11 +169,11 @@ for clip in "${CLIPS[@]}"; do
     #   Without it those rewards go inert — the clip still trains, but on tracking alone.
     HANDC_NPZ="${DATA_BASE}/smplx/${CLIP_CLASS}/${clip}/0/hand_contact.npz"
     if [[ "${SKIP_RETARGET}" -eq 1 ]]; then
-        echo "[hand] Step 2/7 — hand contact SKIPPED (SKIP_RETARGET=1)."
+        echo "[hand] Step 2/6 — hand contact SKIPPED (SKIP_RETARGET=1)."
     elif [[ -f "${HANDC_NPZ}" && "${FORCE}" -eq 0 ]]; then
-        echo "[hand] Step 2/7 — hand contact exists — skipping.  ${HANDC_NPZ}"
+        echo "[hand] Step 2/6 — hand contact exists — skipping.  ${HANDC_NPZ}"
     else
-        echo "[hand] Step 2/7 — hand-mesh contact map (env_isaaclab): ${clip}"
+        echo "[hand] Step 2/6 — hand-mesh contact map (env_isaaclab): ${clip}"
         "${PY}" scripts/process_dataset/dataset/parahome_hand_contact.py \
             --class "${CLIP_CLASS}" --clip "${clip}" || \
             echo "[hand] WARN: hand contact failed — contact/CWS rewards will be inert for this clip."
@@ -192,11 +183,11 @@ for clip in "${CLIPS[@]}"; do
     #   HARD-REQUIRED: supplies the RSI reference joint pose (_ref_joints) and is step 4's input.
     RETARGET_NPZ="${G1_DIR}/trajectory_pyroki.npz"
     if [[ "${SKIP_RETARGET}" -eq 1 ]]; then
-        echo "[hand] Step 3/7 — retarget SKIPPED (SKIP_RETARGET=1)."
+        echo "[hand] Step 3/6 — retarget SKIPPED (SKIP_RETARGET=1)."
     elif [[ -f "${RETARGET_NPZ}" && "${FORCE}" -eq 0 ]]; then
-        echo "[hand] Step 3/7 — PyRoki retarget exists — skipping.  ${RETARGET_NPZ}"
+        echo "[hand] Step 3/6 — PyRoki retarget exists — skipping.  ${RETARGET_NPZ}"
     else
-        echo "[hand] Step 3/7 — PyRoki retarget (env_pyroki): ${clip}"
+        echo "[hand] Step 3/6 — PyRoki retarget (env_pyroki): ${clip}"
         "${PY_PYROKI}" scripts/process_dataset/retarget/retarget_g1_pyroki.py \
             --class "${CLIP_CLASS}" --clip "${clip}" || \
             echo "[hand] WARN: PyRoki retarget failed."
@@ -207,13 +198,13 @@ for clip in "${CLIPS[@]}"; do
     fi
 
     # ── Step 4: wrist FK sidecar (env_isaaclab, pinocchio) → wrist_ref.npz ───
-    #   HARD-REQUIRED: the env raises FileNotFoundError without it (the floating hands are rooted
-    #   at robot0_{l,r}_wrist and the reset writes that pose). CPU-only. Runs AFTER step 3.
+    #   HARD-REQUIRED: the env raises FileNotFoundError without it (step 5's input, and the env keeps
+    #   the palm reference pose from it). CPU-only. Runs AFTER step 3.
     WRIST_NPZ="${G1_DIR}/wrist_ref.npz"
     if [[ -f "${WRIST_NPZ}" && "${FORCE}" -eq 0 ]]; then
-        echo "[hand] Step 4/7 — wrist_ref exists — skipping.  ${WRIST_NPZ}"
+        echo "[hand] Step 4/6 — wrist_ref exists — skipping.  ${WRIST_NPZ}"
     else
-        echo "[hand] Step 4/7 — wrist FK sidecar (env_isaaclab): ${clip}"
+        echo "[hand] Step 4/6 — wrist FK sidecar (env_isaaclab): ${clip}"
         "${PY}" scripts/process_dataset/retarget/export_wrist_ref.py \
             --class "${CLIP_CLASS}" --clip "${clip}" --overwrite
     fi
@@ -222,16 +213,31 @@ for clip in "${CLIPS[@]}"; do
         continue
     fi
 
+    # ── Step 5: wrist joint sidecar (env_isaaclab) → wrist_dof6.npz ─────────
+    #   HARD-REQUIRED: the joint6 hand tracks these six wrist joint values (YZX). Runs AFTER step 4.
+    WRIST6_NPZ="${G1_DIR}/wrist_dof6.npz"
+    if [[ -f "${WRIST6_NPZ}" && "${FORCE}" -eq 0 ]]; then
+        echo "[hand] Step 5/6 — wrist_dof6 exists — skipping.  ${WRIST6_NPZ}"
+    else
+        echo "[hand] Step 5/6 — wrist joint sidecar (env_isaaclab): ${clip}"
+        "${PY}" scripts/process_dataset/retarget/export_wrist_dof6.py \
+            --class "${CLIP_CLASS}" --clip "${clip}" --overwrite
+    fi
+    if [[ ! -f "${WRIST6_NPZ}" ]]; then
+        echo "[hand] ERROR: wrist_dof6.npz missing after export — the env requires it; skipping clip."
+        continue
+    fi
+
     VIDEO_ARGS=()
     if [[ "${VIDEO}" -eq 1 ]]; then
         VIDEO_ARGS=(--video --video_length "${VIDEO_LENGTH}" --video_interval "${VIDEO_INTERVAL}")
     fi
 
-    # ── Step 5: Train ────────────────────────────────────────────────────────
+    # ── Step 6: Train ────────────────────────────────────────────────────────
     #   From scratch (no --checkpoint). RSI start frames span the whole clip from step 0 (every frame
-    #   is restorable from the retarget reference) and the 176-D hand state cache fills as training
+    #   is restorable from the retarget reference) and the 174-D hand state cache fills as training
     #   runs — watch Curriculum/cache_coverage rising and Diag/cache_reject_frac staying at 0.
-    echo "[hand] Step 5/7 — Training (${TIMESTEPS} steps, from scratch) ..."
+    echo "[hand] Step 6/6 — Training (${TIMESTEPS} steps, from scratch) ..."
     touch "${CKPT_DIR}/.sentinel"
     "${PY}" scripts/skrl/train.py \
         --task "${TASK}" --num_envs "${NUM_ENVS}" \
@@ -243,48 +249,18 @@ for clip in "${CLIPS[@]}"; do
         echo "[hand] ERROR: train checkpoint not found in ${LOG_BASE}."
         echo "        skrl writes checkpoints every agent yaml 'checkpoint_interval' steps"
         echo "        (currently 2000), so a run shorter than that produces none — raise"
-        echo "        TIMESTEPS or lower checkpoint_interval. Steps 6-7 need a checkpoint."
+        echo "        TIMESTEPS or lower checkpoint_interval."
         continue
     fi
     cp "${LATEST_CKPT}" "${CKPT_FILE}"
     echo "[hand] Checkpoint → ${CKPT_FILE}"
 
-    # ── Step 6: deterministic rollout export → hand_rl.npz (stage-2 target) ──
-    #   THE deliverable of stage 1. One deterministic rollout (policy mean, not a sample) so the
-    #   stage-2 target does not depend on the RNG. Writes wrist pose + finger joints WITH their
-    #   joint names, so stage 2 matches by name rather than by column position.
-    HANDRL_NPZ="${G1_DIR}/hand_rl.npz"
-    if [[ "${SKIP_EXPORT}" -eq 1 ]]; then
-        echo "[hand] Step 6/7 — rollout export SKIPPED (SKIP_EXPORT=1; stage 2 gets no target)."
-    else
-        echo "[hand] Step 6/7 — deterministic rollout export: ${clip}"
-        "${PY}" scripts/process_dataset/retarget/export_hand_rl.py \
-            --checkpoint "${CKPT_FILE}" --class "${CLIP_CLASS}" --clip "${clip}" --overwrite || \
-            echo "[hand] WARN: rollout export failed — stage 2 has no target for this clip."
-        [[ -f "${HANDRL_NPZ}" ]] && echo "[hand] Stage-2 target → ${HANDRL_NPZ}"
-    fi
-
-    # ── Step 7: reachability audit (report only) ─────────────────────────────
-    #   Can a G1 arm reach the wrist trajectory stage 1 produced? The wrist floated with no anchor,
-    #   so this is the gate that replaces anchoring. Retargeted baseline = 0.0% unreachable on all
-    #   16 clips, so anything above that came from stage 1. Never fails the clip — it is a report.
-    if [[ "${SKIP_AUDIT}" -eq 1 ]]; then
-        echo "[hand] Step 7/7 — reachability audit SKIPPED (SKIP_AUDIT=1)."
-    elif [[ ! -f "${HANDRL_NPZ}" ]]; then
-        echo "[hand] Step 7/7 — reachability audit skipped: no hand_rl.npz."
-    else
-        echo "[hand] Step 7/7 — reachability audit (env_isaaclab, CPU): ${clip}"
-        "${PY}" scripts/process_dataset/retarget/audit_wrist_reachability.py \
-            --class "${CLIP_CLASS}" --clip "${clip}" --source rl \
-            | tee "${CKPT_DIR}/reach_audit_rl.txt" || \
-            echo "[hand] WARN: reachability audit failed."
-    fi
 done
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[hand] All ${TOTAL} clips processed."
 echo "  checkpoints : ${CHECKPOINT_BASE}/"
-echo "  stage-2 targets : ${DATA_BASE}/g1_shadow/${CLIP_CLASS}/<clip>/0/hand_rl.npz"
+echo "  stage-2 targets : run evaluate_sequences_hand_pretrain.sh → <clip>/0/hand_traj_best.npz"
 echo "  tensorboard : ${LOG_BASE}/"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

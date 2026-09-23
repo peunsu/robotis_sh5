@@ -47,7 +47,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg  # no
 from isaaclab.utils.math import quat_apply  # noqa: E402
 from robotis_sh5.tasks.direct.g1_shadow_locomanip.g1_shadow_locomanip_env_cfg import G1_SHADOW_CFG  # noqa: E402
 from robotis_sh5.tasks.direct.g1_shadow_sonic_residual.g1_shadow_sonic_residual_env_cfg import (  # noqa: E402
-    BODY_KPTS, HAND_CHAIN, BODY_KPT_OFFSETS)
+    BODY_KPTS, HAND_CHAIN)
 
 _PROC = "/home/peunsu/workspace/robotis_sh5/source/robotis_sh5/data/processed/parahome"
 

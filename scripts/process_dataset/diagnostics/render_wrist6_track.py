@@ -72,7 +72,7 @@ parser.add_argument("--res_t", type=float, default=0.0,
 parser.add_argument("--res_r", type=float, default=0.0,
                     help="손목 회전 잔차 스케일 [rad]. DexMachina 는 0.5 rad (28.6도)")
 parser.add_argument("--res_ema", type=float, default=0.2,
-                    help="잔차의 EMA 계수 (새 값 가중). 1.0 이면 백색잡음, 작을수록 시간 상관이 커져\n                         정책 출력에 가까워진다. env 의 wrist_force_ema 와 같은 0.2 가 기본")
+                    help="잔차의 EMA 계수 (새 값 가중). 1.0 이면 백색잡음, 작을수록 시간 상관이 커져\n                         정책 출력에 가까워진다. env 의 wrist6_target_ema 와 같은 0.2 가 기본")
 parser.add_argument("--res_seed", type=int, default=0)
 parser.add_argument("--dump_err", default="", help="프레임별 오차 곡선을 npz 로 저장")
 parser.add_argument("--onset_mm", type=float, default=50.0,
@@ -344,7 +344,7 @@ def main():
         hands[h].write_joint_state_to_sim(q, torch.zeros_like(q))
         q0.append(q)
 
-    # ── 카메라: render_hand_cache.py 와 같은 방식 (수직 범위에 맞춰 뒤로 빼기) ──────────────
+    # ── 카메라: 수직 범위에 맞춰 뒤로 빼기 ──────────────────────────────────────────────
     allp = np.concatenate([r[:, :3] for r in ref], axis=0)
     z_top = float(allp[:, 2].max()) + 0.25
     z_bot = max(0.0, float(allp[:, 2].min()) - 0.25)

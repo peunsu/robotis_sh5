@@ -47,10 +47,6 @@ parser.add_argument("--trajectory_task", type=str, default=None, help="Trajector
 parser.add_argument("--trajectory_data_id", type=int, default=None, help="Trajectory data sub-index; overrides env_cfg.trajectory_data_id.")
 parser.add_argument("--clip_class", type=str, default=None, help="ParaHome clip class (g1 loco-manip); overrides env_cfg.clip_class.")
 parser.add_argument("--clip_name", type=str, default=None, help="ParaHome clip name (g1 loco-manip); overrides env_cfg.clip_name.")
-parser.add_argument("--wrist_mode", type=str, default=None, choices=("wrench", "joint6"),
-                    help="[wrist6] hand-pretrain 손목 구동 방식. 'wrench'=자유 베이스 외력(기존), "
-                         "'joint6'=palm 앞 6-DoF 관절 PD. 차원이 바뀌므로(action 54/48, obs 559/553) "
-                         "적용 후 env_cfg.__post_init__() 를 다시 호출한다.")
 parser.add_argument(
     "--ml_framework",
     type=str,
@@ -1135,13 +1131,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.clip_class = args_cli.clip_class
     if args_cli.clip_name is not None and hasattr(env_cfg, "clip_name"):
         env_cfg.clip_name = args_cli.clip_name
-    # [wrist6] 손목 구동 방식. action/obs 차원과 에셋이 __post_init__ 에서 유도되므로 적용 후
-    # 다시 호출한다 (그 함수는 멱등하게 작성돼 있다).
-    if args_cli.wrist_mode is not None and hasattr(env_cfg, "wrist_mode"):
-        env_cfg.wrist_mode = args_cli.wrist_mode
-        env_cfg.__post_init__()
-        print(f"[train] wrist_mode={env_cfg.wrist_mode} → action={env_cfg.action_space} "
-              f"obs={env_cfg.observation_space}")
 
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
@@ -1477,8 +1466,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # 유실됐습니다. 위 블록의 조건(_is_grasp_pretrain and "Rsi") / _is_g1_pretrain 중 어느
     # 쪽에도 HandPretrain 이 걸리지 않기 때문입니다.
     #
-    # 176 레이아웃을 그대로 씁니다(리맵 없음). 소비자가 다른 env 의 RSI 가 아니라 레퍼런스
-    # 생성이므로 손목 pose/속도·손가락·J0·물체·손목 힘EMA 를 전부 보존하는 것이 목적입니다.
+    # 174 레이아웃을 그대로 씁니다(리맵 없음). 소비자가 다른 env 의 RSI 가 아니라 레퍼런스
+    # 생성이므로 손목 관절·손가락·J0·물체·손목 목표 EMA 를 전부 보존하는 것이 목적입니다.
     if _is_hand_pretrain and hasattr(env.unwrapped, "_state_cache"):
         import numpy as _np
 
@@ -1486,7 +1475,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _sc = _ue._state_cache.detach().cpu().numpy()
         _iflg = _ue._init_flg.detach().cpu().numpy()
         _payload = dict(
-            state_cache=_sc,                     # (F,176)
+            state_cache=_sc,                     # (F,174)
             # 주의: init_flg 는 True = "캐시 없음(레퍼런스)" 입니다. 기존 규약과 맞추려 그대로
             # 두고, 반전 실수를 막기 위해 valid 를 함께 저장합니다.
             init_flg=_iflg,
@@ -1501,11 +1490,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             layout=_np.array([
                 "state_cache[f] = 프레임 f 에서 보상이 가장 높았던 물리적 방문 상태.",
                 "위치는 env-LOCAL (scene.env_origins 를 뺀 값). 쿼터니언은 wxyz.",
-                "속도는 항상 정방향 규약으로 저장 (역방향 에피소드는 쓰기 시 부호 반전).",
-                "[0]reward(순위키) [1:8]손목L_pose [8:14]손목L_vel [14:21]손목R_pose",
-                "[21:27]손목R_vel [27:34]obj_pose [34:40]obj_vel [40:76]jpos(36)",
-                "[76:112]jvel(36) [112:120]J0pos(8) [120:128]J0vel(8) [128:164]smoothed(36)",
-                "[164:170]손목힘EMA(2x3) [170:176]손목토크EMA(2x3)",
+                "[0]reward(순위키) [1:7]손목L 관절 pos6 [7:13]손목L 관절 vel6 [13:25]손목R (같은 순서)",
+                "  손목 관절 = tx,ty,tz[m], rot1,rot2,rot3[rad] (YZX), anchor 는 env 원점",
+                "[25:32]obj_pose [32:38]obj_vel [38:74]jpos(36) [74:110]jvel(36)",
+                "[110:118]J0pos(8) [118:126]J0vel(8) [126:162]smoothed(36) [162:174]손목 목표 EMA(2x6)",
                 "관절 36열 순서 = 왼손 18 -> 오른손 18.",
                 "valid=False 프레임의 행은 미기록이며 reward 열이 -inf 입니다 — 읽지 마세요.",
                 "연속성 주의: 프레임 f 와 f+1 은 서로 다른 에피소드에서 왔을 수 있습니다.",
@@ -1513,7 +1501,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             ]),
         )
         _dsts = []
-        # (1) 리타게팅 사이드카 옆 — stage 2 소비자가 wrist_ref.npz / hand_rl.npz 를 찾는 곳.
+        # (1) 리타게팅 사이드카(wrist_ref.npz) 옆.
         #     env 가 보관한 실제 경로를 씁니다 (cfg 로 재구성하면 clip_name="" 일 때 어긋납니다).
         _rd = getattr(_ue, "_retarget_dir", None)
         if _rd and os.path.isdir(_rd):
