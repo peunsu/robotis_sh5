@@ -175,7 +175,7 @@ def load_clip(clip, cls):
     d = {k: torch.tensor(sm[k], device=device) for k in ("smpl_joints_local", "root_q_zb", "wrist_ref")}
     d["g1_root_quat0"] = tuple(float(x) for x in sm["g1_root_quat0"])
     # retarget reference frame-0 (for --ref_reset RSI): g1_joint_pos + root z.
-    # [ROLLBACK MARKER: njoint-65] npz 가 65 → 73 열로 늘어났다 (뒤 8개 = 텐던 종속 J0,
+    # npz 가 65 → 73 열로 늘어났다 (뒤 8개 = 텐던 종속 J0,
     # robot0_{l,r}_{FF,MF,RF,LF}J0). 액션 순서는 앞 65 열이 그대로라 거기까지만 쓴다.
     # 확인: npz["joint_names"][:65] == g1_shadow_joint_order.json["action_joint_names"] (불일치 0/65).
     _NA = len(_AJN_REF())
@@ -239,7 +239,7 @@ def load_clip(clip, cls):
             if k in d and torch.is_tensor(d[k]):
                 d[k] = torch.flip(d[k], dims=[0]).contiguous()
         d["g1_v_act"] = -d["g1_v_act"]              # reversing time negates the velocity channel
-        d["ref_q"] = torch.tensor(rt["g1_joint_pos"][-1, :_NA], device=device)      # [njoint-65]
+        d["ref_q"] = torch.tensor(rt["g1_joint_pos"][-1, :_NA], device=device)
         if "g1_root_pose" in rt.files:
             d["ref_root_z"] = float(rt["g1_root_pose"][-1, 2])
             d["g1_root_quat0"] = tuple(float(x) for x in rt["g1_root_pose"][-1, 3:7])

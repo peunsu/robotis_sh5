@@ -58,7 +58,7 @@ _FINGER_EXPR = [
 # (DexMachina 도 안 쓴다), 빼면 정책이 위치 목표 하나만 다루면 된다.
 _WRIST6_TRANS_EXPR = "robot0_{s}_wrist_t[xyz]"
 _WRIST6_ROT_EXPR = "robot0_{s}_wrist_rot[123]"
-# [ROLLBACK MARKER: w6gain] 탐험(exploration)을 고려한 재튜닝 (2026-09-08). 이전 값은
+# 탐험(exploration)을 고려한 재튜닝 (2026-09-08). 이전 값은
 # 1400/33, 80/1.37, effort 200/50 (.pre_w6gain.bak). 근거 — 1-DoF 모델(질량 0.681 kg, 관성
 # 0.02 kg·m², 16 클립 레퍼런스 50 Hz, PPO 초기 std 0.37 의 가우시안 잔차, EMA 0.2, 200 Hz PD):
 #   * 잔차 잡음이 만드는 손목 흔들림(std ≈ 4.7 mm / 3.4°)은 게인과 무관하다 — 관절이 EMA 보다
@@ -107,7 +107,6 @@ WRIST6_KP_TRANS, WRIST6_KD_TRANS = 1400.0, 33.0     # N/m, N·s/m   (임계 2√
 WRIST6_KP_ROT, WRIST6_KD_ROT = 40.0, 1.0            # N·m/rad, N·m·s/rad (임계 2√(kp·0.02)=1.79 의 0.56배)
 WRIST6_EFFORT_TRANS, WRIST6_EFFORT_ROT = 100.0, 100.0     # 접촉력 상한 겸 안전벽. 200/50 이던 때
 # 백색잡음 잔차에서 178 N / 71.6 N·m (포화 11.2%), EMA 0.2 에서 28 N / 9.1 N·m 를 실측했다.
-# [/ROLLBACK MARKER: w6gain]
 
 
 def shadow_float6_cfg(side: str, prim_path: str) -> ArticulationCfg:

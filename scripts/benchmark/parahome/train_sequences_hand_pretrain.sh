@@ -14,8 +14,7 @@
 # hand reference in stage 2.
 #
 # HOW THIS DIFFERS FROM train_sequences_sonic_residual.sh
-#   - NO SONIC prep. cfg.use_sonic=False, so sonic_smpl_50fps.npz is never read
-#     (the assert that requires it lives inside the SONIC-guarded block).
+#   - NO SONIC prep. The hand env has no SONIC, so sonic_smpl_50fps.npz is never read.
 #   - NEEDS wrist_ref.npz + wrist_dof6.npz. The retarget npz stores only g1_joint_pos +
 #     g1_root_pose (pelvis), so the palm pose is implied by FK but never written out —
 #     export_wrist_ref.py runs pinocchio FK to produce it, and export_wrist_dof6.py splits it into

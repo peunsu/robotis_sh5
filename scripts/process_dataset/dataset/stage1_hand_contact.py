@@ -6,7 +6,7 @@
 롤아웃에 기록된 시뮬레이션 링크 자세(link_pos/link_quat; rollout.py --dump_hand_traj)로 월드에 놓는다.
 FK 를 하지 않으므로 시뮬레이션과 링크 자세가 정확히 같다. 물체 자세는 손이 실제로 닿은 1단계 물체(obj_pos/obj_quat).
 
-출력(기본: 입력과 같은 폴더의 hand_contact_stage1.npz; 스테이지 2 env 의 stage1_contact_map 이 읽는 스키마):
+출력(기본: 입력과 같은 폴더의 hand_contact_stage1.npz; 스테이지 2 env 의 hand_pretrain_contact_map 이 읽는 스키마):
   link_names (L,), mask (T,L), normal (T,L,3) 물체 로컬 바깥 표면 법선, target (T,L,3) 물체 로컬 (coord="object"),
   target_world (T,L,3) 참고용, frame (T,) 롤아웃 프레임, control_fps, normal_source, obj_pose_source="stage1",
   gamma, num_contacts, source_hand_traj, urdf.

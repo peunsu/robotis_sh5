@@ -27,12 +27,12 @@ _PROC = _ROOT / "data" / "processed" / "parahome"
 _URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow.urdf"
 
 _ANKLE_SOLE_OFF = 0.036                       # 발목 링크 원점에서 발바닥까지 (원본 스크립트와 동일)
-# ── [ROLLBACK MARKER: smplx-kpts] ParaHome joint_positions → SMPL-X (2026-09-04) ────────────
+# ParaHome joint_positions → SMPL-X (2026-09-04)
 # 리타게팅(retarget_g1_pyroki.py)이 SMPL-X 로 넘어갔는데 이 스크립트만 ParaHome 스트림에 남아
 # 있어서, 같은 판정식을 써도 발 접지 기준선이 달랐습니다 (ParaHome 발끝 z 중앙 1.4 cm vs
 # SMPL-X 2.4~3.5 cm). 인덱스는 리타게팅의 _BODY/_HAND_CHAIN/_PALM/_PAD_BASE 와 같은 규약입니다.
 _BALL_L, _BALL_R = 10, 11                     # SMPL-X left_foot / right_foot (발 앞꿈치)
-# [foot-plant-3d] height 0.05, vel 1.00 (3D 노름) — 리타게팅의 _FOOT_PLANT_H/_V 와 같아야 합니다.
+# height 0.05, vel 1.00 (3D 노름) — 리타게팅의 _FOOT_PLANT_H/_V 와 같아야 합니다.
 _FOOT_PLANT_H, _FOOT_PLANT_V, _FPS = 0.05, 1.00, 30.0
 # 사람 손끝(TIP)과 로봇 distal 링크 + 패드 오프셋. 대응표가 바뀌어도 이 짝은 고정입니다.
 # 손끝은 smplx_joints(55) 뒤에 fingertip_pad_pos(10) 를 이어붙인 자리에서 읽습니다 — 순서는
@@ -93,7 +93,7 @@ def main() -> None:
     def plant(idx):
         p = jp[:, idx]
         v = np.zeros(len(p))
-        v[1:] = np.linalg.norm(p[1:] - p[:-1], axis=-1) * _FPS   # [foot-plant-3d] 3D 노름
+        v[1:] = np.linalg.norm(p[1:] - p[:-1], axis=-1) * _FPS  # 3D 노름
         return (p[:, 2] < _FOOT_PLANT_H) & (v < _FOOT_PLANT_V)
     c_l, c_r = plant(_BALL_L), plant(_BALL_R)
 
@@ -148,7 +148,7 @@ def main() -> None:
         # --- 손목 회전: 사람/로봇 각각 랜드마크 프레임을 만들어 각도 차 ---
         wr = []
         for side, sd in _SIDES.items():
-            # [smplx-kpts] wrist / index MCP / middle MCP
+            # wrist / index MCP / middle MCP
             Rh = landmark_R(jp[:, sd["wrist"]], jp[:, sd["hand"] + 0], jp[:, sd["hand"] + 3])
             Rr = landmark_R(world(f"robot0_{side}_palm"),
                             world(f"robot0_{side}_ffknuckle"), world(f"robot0_{side}_mfknuckle"))

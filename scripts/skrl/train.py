@@ -396,7 +396,7 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
         cumulative_policy_loss = 0
         _rm = []          # 첫 에포크의 PPO 비율 중앙값 (Diag / ppo_ratio_med)
-        _nf_skipped = 0   # [nan-guard] 비유한이라 건너뛴 옵티마이저 스텝 수
+        _nf_skipped = 0  # 비유한이라 건너뛴 옵티마이저 스텝 수
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         # [DUAL-CLIP] diagnostics, accumulated over every mini-batch of the update. Kept as DEVICE
@@ -489,7 +489,7 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
                     acc_lr_min = torch.minimum(acc_lr_min, _lr.min())
 
                 # optimization step
-                # ── [ROLLBACK MARKER: nan-guard] (L4) 비유한 업데이트 건너뛰기 ──────────────
+                # (L4) 비유한 업데이트 건너뛰기
                 # skrl 의 GradScaler 는 mixed_precision=False 에서 비활성이라 scaler.step() 이
                 # 비유한 그래디언트를 걸러내지 않고 그대로 optimizer.step() 을 부른다. 그리고
                 # clip_grad_norm_ 은 NaN 을 지우지 못한다 — 전체 노름이 NaN 이면 클리핑 계수도
@@ -501,7 +501,6 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
                     a.optimizer.zero_grad(set_to_none=True)
                     _nf_skipped += 1
                     continue
-                # ── [/ROLLBACK MARKER: nan-guard] ──
                 a.optimizer.zero_grad()
                 a.scaler.scale(_tot_loss).backward()
 
@@ -510,7 +509,7 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
                     if a.policy is not a.value:
                         a.value.reduce_parameters()
 
-                # [ROLLBACK MARKER: nan-guard] 그래디언트 유한성 — 클리핑 이전에 본다. 하나라도
+                # 그래디언트 유한성 — 클리핑 이전에 본다. 하나라도
                 # 비유한이면 스텝 전체를 버린다 (클리핑은 NaN 을 퍼뜨릴 뿐 지우지 못한다).
                 _gp = [q for q in itertools.chain(a.policy.parameters(), a.value.parameters())
                        if q.grad is not None] if a.policy is not a.value else \
@@ -550,7 +549,7 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
         # record data
         _n = a.cfg.learning_epochs * a.cfg.mini_batches
-        a.track_data("Diag / nonfinite_updates_skipped", float(_nf_skipped))   # [nan-guard]
+        a.track_data("Diag / nonfinite_updates_skipped", float(_nf_skipped))
         if _nf_skipped:
             print(f"[nan-guard] 비유한 업데이트 {_nf_skipped}개 건너뜀 (가중치 보호)")
         if _rm:
@@ -1245,7 +1244,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _patch_mass_policy(runner.agent, agent_cfg["models"]["policy"], agent_cfg["agent"]["learning_rate"])
         _patch_entropy_flip(runner.agent, env, agent_cfg["agent"]["entropy_loss_scale"])
 
-    # ── [ROLLBACK MARKER: joint-residual] zero-actor ──────────────────────────────────────────
+    # zero-actor
     # 정책 마지막 층의 출력 행을 0 으로 만든다. video_to_data 의 scripts/rsl_rl/train.py
     # --zero-actor 와 같은 목적: 잔차 평균이 정확히 0 에서 출발해 SONIC 사전값에서 깨끗하게
     # 갈라져 나간다. skrl 기본 초기화는 마지막 층 출력이 차원당 표준편차 0.3~0.6 이라, 그냥
@@ -1278,7 +1277,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                   + (f"; z_res 0:{_zfrom} 행은 유지" if _zfrom > 0 else ""))
         else:
             print(f"[zero-actor] 건너뜀 (from={_zfrom}, linear={'있음' if _zlin else '없음'})")
-    # ── [/ROLLBACK MARKER: joint-residual] ──
 
     # Manual env-info → Tensorboard (applies to BOTH train and pretrain — trainer's
     # auto-prefix "Info / " is disabled in main(), so this is the sole logging path

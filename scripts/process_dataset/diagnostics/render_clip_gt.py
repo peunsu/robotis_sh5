@@ -222,7 +222,7 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
         eye = np.asarray(eye_override, float)
     if lookat_override is not None:
         centre = np.asarray(lookat_override, float)
-    # [ROLLBACK MARKER: follow-obj] --follow_obj 면 매 프레임 물체+손끝 중점을 주시하며 cam_dist
+    # follow_obj 면 매 프레임 물체+손끝 중점을 주시하며 cam_dist
     # 거리에서 따라갑니다. 물체가 크게 이동하는 클립(예: s207_seg06_kettle 2.05 m)에서 고정 시점으로
     # 확대하면 프레임을 벗어나므로, 확대 관찰에는 추종이 필요합니다. 방향(yaw/elev)은 고정입니다.
     _fw_tg = None
@@ -263,7 +263,7 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
                     baseColorFactor=C_BODY, metallicFactor=0.0, roughnessFactor=0.9), smooth=True)
             for k, node in act_nodes:
                 scene.set_pose(node, pose_to_T(np.asarray(d[k][f], float)))
-            if _fw_tg is not None:                                  # [follow-obj]
+            if _fw_tg is not None:
                 _T = look_at(_fw_tg[f] + cam_dist * _cam_dir, _fw_tg[f])
                 scene.set_pose(_cam_node, _T)
                 scene.set_pose(_key_node, _T)

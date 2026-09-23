@@ -105,7 +105,7 @@ def _get_smplx_model(gender: str):
     return _smplx_model_cache[gender]
 
 
-# ── [ROLLBACK MARKER: smplx-joints] SMPL-X 관절도 함께 내보냅니다 (2026-09-04) ────────────
+# SMPL-X 관절도 함께 내보냅니다 (2026-09-04)
 # 이 파일 상단 서술대로 SMPL-X 가 "리타게팅 표준 입력"인데, 실제 리타게팅과 env 보상은
 # ParaHome 자체 스트림(joint_positions, Xsens 계열 23+25+25=73)을 쓰고 있었습니다. 사용자 의도가
 # SMPL-X 였으므로 전환합니다. joint_positions 는 대조/롤백용으로 계속 저장합니다.
@@ -261,7 +261,7 @@ def process_sequence(seq: str, joint_info: dict, overwrite: bool = False) -> lis
     hand_pose = _to_np(smplx_pose["hand_pose"])        # (F,90)
     betas = _to_np(smplx_params["beta"]).reshape(-1).astype(np.float32)  # (20,)
     gender = str(smplx_params["gender"])
-    # [smplx-joints] FK 한 번으로 손끝 pad 와 관절 55개를 함께 받습니다.
+    # FK 한 번으로 손끝 pad 와 관절 55개를 함께 받습니다.
     fingertip_pad_seq, smplx_joint_seq = _seq_smplx_fk(smplx_pose, betas, gender)
 
     # Frame alignment: object_transformations keys are contiguous ints from 0 and
@@ -302,7 +302,7 @@ def process_sequence(seq: str, joint_info: dict, overwrite: bool = False) -> lis
             root_transl=body_gt[fidx, :3, 3].astype(np.float32),       # (F,3) pelvis world
             frame_indices=fidx,                                        # (F,)
         )
-        if smplx_joint_seq is not None:                      # [smplx-joints]
+        if smplx_joint_seq is not None:
             arrays["smplx_joints"] = smplx_joint_seq[fidx].astype(np.float32)   # (F,55,3)
         if fingertip_pad_seq is not None:
             # (F,10,3) SMPL-X fingertip pad vertices — LEFT[th,ff,mf,rf,lf] then RIGHT.

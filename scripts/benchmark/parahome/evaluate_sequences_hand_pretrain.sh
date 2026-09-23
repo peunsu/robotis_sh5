@@ -55,7 +55,7 @@
 # Which clips run: keep in sync with train_sequences_hand_pretrain.sh.
 # Env vars: FORCE=1 (re-run rollouts), CLIP_CLASS=..., CLIPS_OVERRIDE="a b c",
 #   HAND_TRAJ=0 (skip the hand_traj_best.npz dump, see below),
-#   CONTACT_MAP=0 (skip the hand_contact_stage1.npz contact map built from the dump),  [stage1-contact-map]
+#   CONTACT_MAP=0 (skip the hand_contact_stage1.npz contact map built from the dump),
 #   N_ROLLOUTS, TIMESTEPS (dir tag only), VIDEO=1, SEED=42,
 #   PY=<env_isaaclab python>, VIDEO_RESOLUTION=WxH.
 # =============================================================================
@@ -71,8 +71,8 @@ VIDEO="${VIDEO:-1}"
 VIDEO_LENGTH="${VIDEO_LENGTH:-0}"  # 0 → rollout.py fits the full sequence
 SEED="${SEED:-42}"                 # explicit: the determinism contract of the run
 RES_ARGS=(); [[ -n "${VIDEO_RESOLUTION:-}" ]] && RES_ARGS=(--video_resolution "${VIDEO_RESOLUTION}")
-# ── [ROLLBACK MARKER: stage1-hand] 손 궤적 덤프 (2026-09-09) ──
-# 2단계(sonic residual) env 는 hand_kpt_from_stage1 / sonic_hand_residual 이 켜져 있으면
+# 손 궤적 덤프 (2026-09-09)
+# 2단계(sonic residual) env 는 hand_kpt_from_hand_pretrain / sonic_hand_residual_base 가 켜져 있으면
 #   <clip>/0/hand_traj_best.npz   (보상 합이 가장 큰 rollout 의 손가락 관절·손바닥 자세·지문·접촉력)
 # 를 읽어 손·손목 보상 목표와 잔차 손 액션의 기준점으로 쓴다. 이 평가에서 그 파일을 함께 만든다:
 # rollout.py 에 --dump_hand_traj 를 붙여 OUT_DIR 에 hand_traj.npz / hand_traj_best.npz 를 쓰고, best 를
@@ -80,7 +80,6 @@ RES_ARGS=(); [[ -n "${VIDEO_RESOLUTION:-}" ]] && RES_ARGS=(--video_resolution "$
 # 있으면 rollout 을 다시 돌린다 — 두 파일은 같은 rollout 묶음에서 나와야 스프레드 판단과 손 궤적이 일치).
 HAND_TRAJ="${HAND_TRAJ:-1}"        # 0 → previous behaviour: no dump, skip on metrics.csv alone
 CONTACT_MAP="${CONTACT_MAP:-1}"    # [stage1-contact-map] 1 → hand_traj_best.npz 옆에 hand_contact_stage1.npz 생성 (CPU 전용)
-# ── [/ROLLBACK MARKER: stage1-hand] ──
 
 # Must match train_sequences_hand_pretrain.sh (stage 1's output feeds stage 2, so the two stages
 # have to cover the same clip set). Selection criteria are documented in the train script.
@@ -134,7 +133,7 @@ for clip in "${CLIPS[@]}"; do
         N_SKIP=$(( N_SKIP + 1 ))
         continue
     fi
-    # ── [ROLLBACK MARKER: stage1-hand] adopt an earlier dump (same OUT_DIR, or the legacy *_handtraj dir)
+    # adopt an earlier dump (same OUT_DIR, or the legacy *_handtraj dir)
     HAND_BEST="${CHECKPOINT_BASE}/${clip}/0/hand_traj_best.npz"
     if [[ "${HAND_TRAJ}" -eq 1 && ! -f "${HAND_BEST}" && "${FORCE}" -eq 0 ]]; then
         for _src in "${OUT_DIR}/hand_traj_best.npz" "${OUT_DIR}_handtraj/hand_traj_best.npz"; do
@@ -145,17 +144,15 @@ for clip in "${CLIPS[@]}"; do
             fi
         done
     fi
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
     if [[ -f "${OUT_DIR}/metrics.csv" && "${FORCE}" -eq 0 ]]; then
         if [[ "${HAND_TRAJ}" -eq 0 || -f "${HAND_BEST}" ]]; then                       # [stage1-hand]
             echo "[eval-hand] metrics.csv exists — skipping.  (FORCE=1 to override)"
-            # ── [ROLLBACK MARKER: stage1-contact-map] 덤프는 있는데 접촉 맵만 없으면 맵만 만든다 (CPU 전용, GPU 불필요)
+            # 덤프는 있는데 접촉 맵만 없으면 맵만 만든다 (CPU 전용, GPU 불필요)
             if [[ "${CONTACT_MAP}" -eq 1 && -f "${HAND_BEST}" && ! -f "$(dirname "${HAND_BEST}")/hand_contact_stage1.npz" ]]; then
                 echo "[eval-hand] hand_contact_stage1.npz missing — generating from the existing dump."
                 "${PY}" "${PROJECT_DIR}/scripts/process_dataset/dataset/stage1_hand_contact.py" --hand_traj "${HAND_BEST}" \
                     || echo "[eval-hand] WARNING: contact map generation failed for ${clip}."
             fi
-            # ── [/ROLLBACK MARKER: stage1-contact-map] ──
             N_SKIP=$(( N_SKIP + 1 ))
             continue
         fi
@@ -180,23 +177,21 @@ for clip in "${CLIPS[@]}"; do
     if [[ -f "${OUT_DIR}/metrics.csv" ]]; then
         echo "[eval-hand] → ${OUT_DIR}/metrics.csv"
         N_OK=$(( N_OK + 1 ))
-        # ── [ROLLBACK MARKER: stage1-hand] best rollout → <clip>/0/hand_traj_best.npz (what stage 2 reads)
+        # best rollout → <clip>/0/hand_traj_best.npz (what stage 2 reads)
         if [[ "${HAND_TRAJ}" -eq 1 ]]; then
             if [[ -f "${OUT_DIR}/hand_traj_best.npz" ]]; then
                 cp -f "${OUT_DIR}/hand_traj_best.npz" "${HAND_BEST}"
                 echo "[eval-hand] → ${HAND_BEST}"
-                # ── [ROLLBACK MARKER: stage1-contact-map] 1단계 롤아웃 → 32링크 접촉 맵 (스테이지 2 stage1_contact_map 의 입력).
+                # 1단계 롤아웃 → 32링크 접촉 맵 (스테이지 2 hand_pretrain_contact_map 의 입력).
                 #    사람 맵(parahome_hand_contact.py)과 같은 코어(frame_contacts)로 만들어 같은 폴더에 hand_contact_stage1.npz 로 둔다.
                 if [[ "${CONTACT_MAP}" -eq 1 ]]; then
                     "${PY}" "${PROJECT_DIR}/scripts/process_dataset/dataset/stage1_hand_contact.py" --hand_traj "${HAND_BEST}" \
                         || echo "[eval-hand] WARNING: contact map generation failed for ${clip}."
                 fi
-                # ── [/ROLLBACK MARKER: stage1-contact-map] ──
             else
                 echo "[eval-hand] WARNING: rollout produced no hand_traj_best.npz for ${clip}."
             fi
         fi
-        # ── [/ROLLBACK MARKER: stage1-hand] ──
     else
         echo "[eval-hand] ERROR: rollout produced no metrics.csv for ${clip}."
         N_SKIP=$(( N_SKIP + 1 ))

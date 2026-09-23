@@ -79,7 +79,7 @@ def _quat2R(wxyz):
                      [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]], np.float64)
 
 
-# ── [ROLLBACK MARKER: stage1-contact-map] 프레임 단위 접촉 코어 (2026-09-09). main() 의 루프 본문을 그대로 옮긴 것으로
+# 프레임 단위 접촉 코어 (2026-09-09). main 의 루프 본문을 그대로 옮긴 것으로
 #    동작은 같다. 사람(SMPL-X 정점) 맵과 1단계(Shadow 링크 메시 정점, stage1_hand_contact.py) 맵이 같은 함수를
 #    통과하도록 하기 위한 분리다. 손 표면 점의 출처만 다르고 gamma·FPS·링크 집계·법선 정의는 여기서 한 번만 정해진다.
 def frame_contacts(hand_w, hand_link, V, VN, R, op, L, gamma, num_contacts, normal_source):
@@ -117,7 +117,6 @@ def frame_contacts(hand_w, hand_link, V, VN, R, op, L, gamma, num_contacts, norm
             nl = nrm_l[sel].mean(0)
             normal[li] = nl / max(float(np.linalg.norm(nl)), 1e-9)
     return mask, target, normal, len(cw)
-# ── [/ROLLBACK MARKER: stage1-contact-map] ──
 
 
 def main():
@@ -192,7 +191,7 @@ def main():
         if args.use_velocity_gate and not vel[t]:
             continue
         R = _quat2R(oq[t])                                         # object local→world rotation
-        # [stage1-contact-map] 프레임 코어는 frame_contacts() (아래) — 1단계 맵 스크립트와 공유
+        # 프레임 코어는 frame_contacts (아래) — 1단계 맵 스크립트와 공유
         fc = frame_contacts(verts[t], hand_v_link, V, VN, R, op[t], L,
                             args.gamma, args.num_contacts, args.normal_source)
         if fc is None:

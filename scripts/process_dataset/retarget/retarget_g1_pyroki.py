@@ -69,7 +69,7 @@ _PROC = _ROOT / "data" / "processed" / "parahome"
 # 0.913 이 역수 r2/r1 = 0.87578 에 가까워 multiplier 가 뒤집혔을 가능성이 높습니다.
 # 등식 mimic 으로 되돌리려면 W_URDF=<...>/g1_shadow.urdf (그때는 W_TENDONINEQ 가 무효).
 _URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow_nomimic.urdf"
-# ── [ROLLBACK MARKER: tendon-ineq] J0 를 mimic 등식이 아니라 부등식으로 (2026-09-02) ──────────
+# J0 를 mimic 등식이 아니라 부등식으로 (2026-09-02)
 # Shadow 공식 문서(md_finger, Loopback tendons and J0 coupling)는 이 결합이 비례 기어가 아니라
 # 부등식이라고 명시한다:  joint1 angle ≤ joint2 angle  (Shadow 명명).
 # 이름 대응: Shadow J1(distal) = our FFJ0,  Shadow J2(middle) = our FFJ1  →  our J0 ≤ our J1.
@@ -81,7 +81,7 @@ _URDF = _ROOT / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow_nomimic.ur
 _URDF = Path(os.environ.get("W_URDF", str(_URDF)))
 _ORDER = json.load(open(_ROOT / "data" / "robots" / "G1" / "g1_shadow_joint_order.json"))
 
-# ── [ROLLBACK MARKER: smplx-kpts] 키포인트 소스를 ParaHome → SMPL-X 로 전환 (2026-09-04) ──
+# 키포인트 소스를 ParaHome → SMPL-X 로 전환 (2026-09-04)
 # 이 파일은 원래 ParaHome 자체 스트림(joint_positions, Xsens 계열 23 몸통 + 25+25 손 = 73)을
 # 썼습니다. parahome.py 상단 서술이 SMPL-X 를 "리타게팅 표준 입력"으로 규정하는데 구현이 반대로
 # 되어 있었고, 사용자 의도가 SMPL-X 였으므로 전환합니다. 소스는 npz 의 smplx_joints (F,55,3).
@@ -121,7 +121,7 @@ _BODY = [
 #
 # 사람 손끝(TIP: 21/17/13/9)은 대응에서 빠집니다 — 로봇에는 대응하는 링크 원점이 없고, 손끝은
 # _FT_PADS + _FT_OFF_R 로 접촉 비용에서 따로 다룹니다.
-# [smplx-kpts] SMPL-X 손 블록 로컬 인덱스 (왼손 base 25 / 오른손 base 40).
+# SMPL-X 손 블록 로컬 인덱스 (왼손 base 25 / 오른손 base 40).
 # 블록 순서: index1,2,3  middle1,2,3  pinky1,2,3  ring1,2,3  thumb1,2,3  (각 MCP/PIP/DIP)
 # 손목은 SMPL-X 손 블록에 없고 몸통 20/21 이라 아래 _PALM 으로 따로 붙입니다.
 #
@@ -134,7 +134,7 @@ _HAND_CHAIN = {
     "middle": ([3, 4, 5], ["mfknuckle", "mfmiddle", "mfdistal"]),
     "pinky":  ([6, 7, 8], ["lfknuckle", "lfmiddle", "lfdistal"]),
     "ring":   ([9, 10, 11], ["rfknuckle", "rfmiddle", "rfdistal"]),
-    # ── [ROLLBACK MARKER: hand-kpt-align] 엄지 대응 정정 (2026-08-15) ────────────────────────
+    # 엄지 대응 정정 (2026-08-15)
     # 사람 엄지는 22, 23, 24 세 점이고 24 는 손끝입니다(fingertip_pad_pos[0] 과 0.33 cm 일치로 확인).
     # 옛 대응 [22,23,24] -> [thproximal, thmiddle, thdistal] 은 한 칸씩 밀려 있었습니다. 여기서는
     # 오프셋을 쓸 수 없으므로(대응이 링크 원점 기준) 손끝은 빼고 두 관절만 씁니다 — 손끝은
@@ -151,7 +151,7 @@ _HAND_CHAIN = {
 }
 
 
-# ── [ROLLBACK MARKER: fingertip-align] 손끝을 대응에 통합 ─────────────────────────────────────
+# 손끝을 대응에 통합
 # 손끝은 링크 원점이 아니라 말단 링크에서 pad 오프셋만큼 떨어진 점이라 _HAND_CHAIN 으로는 표현할
 # 수 없었습니다. 처음에는 별도 비용(fingertip_align)으로 넣었는데, 그러면 jaxls 가 그 비용을 위해
 # 순기구학을 따로 미분해서 프레임당 FK 야코비안이 한 벌 더 생깁니다 — 이 파일의 다른 주석이 같은
@@ -161,8 +161,8 @@ _HAND_CHAIN = {
 #
 # 목표는 사람 fingertip_pad_pos (F,10,3) 인데 smplx_joints (F,55,3) 와 다른 배열이라,
 # main 에서 두 배열을 이어붙여 (F,65,3) 로 만들고 손끝은 뒤쪽 인덱스 55.. 를 가리킵니다.
-_PAD_BASE = 55                                   # [smplx-kpts] smplx_joints(55) 뒤에 손끝 10개
-# [smplx-kpts] SMPL-X 손 블록에는 손목이 없습니다(몸통 20/21). 옛 _HAND_CHAIN 의 ("wrist",[0]→palm)
+_PAD_BASE = 55  # smplx_joints(55) 뒤에 손끝 10개
+# SMPL-X 손 블록에는 손목이 없습니다(몸통 20/21). 옛 _HAND_CHAIN 의 ("wrist",[0]→palm)
 # 을 대체합니다 — 같은 사람 관절이 wrist_yaw_link(_BODY)와 palm 두 링크에 대응하는데, 옛 ParaHome
 # 대응도 jWrist 를 몸통 10/14 와 손 로컬 0 두 곳에 쓰고 있었으므로 구조가 동일합니다.
 _PALM = [(20, "robot0_l_palm"), (21, "robot0_r_palm")]
@@ -175,8 +175,8 @@ def _build_correspondence():
     오프셋이 0 이 아닌 것은 손끝 10개뿐입니다(말단 링크 -> pad). 나머지는 링크 원점입니다.
     """
     pairs = [(p, l, [0.0, 0.0, 0.0]) for p, l in _BODY]
-    pairs += [(p, l, [0.0, 0.0, 0.0]) for p, l in _PALM]     # [smplx-kpts] 손목 → palm
-    for side, off in (("l", 25), ("r", 40)):                 # [smplx-kpts] SMPL-X 손 블록 base
+    pairs += [(p, l, [0.0, 0.0, 0.0]) for p, l in _PALM]  # 손목 → palm
+    for side, off in (("l", 25), ("r", 40)):  # SMPL-X 손 블록 base
         for local, shadow in _HAND_CHAIN.values():
             for pl, sh in zip(local, shadow):
                 pairs.append((off + pl, f"robot0_{side}_{sh}", [0.0, 0.0, 0.0]))
@@ -189,7 +189,7 @@ def _build_correspondence():
     return pairs
 
 
-# ── [ROLLBACK MARKER: foot-plant-3d] 접지 판정을 SONIC 기준으로 (2026-09-04) ────────────────
+# 접지 판정을 SONIC 기준으로 (2026-09-04)
 # SONIC/motionbricks 의 foot_detect_from_pos_and_vel(positions, velocity, skeleton, 0.15, 0.10)
 # (motionlib/core/motion_reps/tools/feet.py) 과 동일한 기준: 높이 임계 0.10 m, 속도 임계 0.15 m/s
 # 이며 속도는 수직 성분이 아니라 3D 노름입니다. 이전 값은 0.06 + |vz| 였는데, 수직 성분만 보면
@@ -201,7 +201,7 @@ def _build_correspondence():
 # 실질적으로 높이 단독 판정에 가깝고, 낮게 미끄러지는 체중 이동을 접지로 유지하면서 실제로
 # 발을 5 cm 이상 드는 구간만 스윙으로 잡습니다. 속도는 여전히 3D 노름입니다.
 _FOOT_PLANT_H, _FOOT_PLANT_V, _FPS = 0.05, 1.00, 30.0
-# [smplx-kpts] 발 접지 판정에 쓰는 "볼(ball) 발" 키포인트. ParaHome 은 jLeftBallFoot(22)/
+# 발 접지 판정에 쓰는 "볼(ball) 발" 키포인트. ParaHome 은 jLeftBallFoot(22)/
 # jRightBallFoot(18) 이었고 SMPL-X 는 left_foot(10)/right_foot(11) 이 같은 역할(발가락 볼)입니다.
 _PARA_BALL_L, _PARA_BALL_R = 10, 11
 # G1 ankle_roll_link origin sits this far ABOVE the foot sole (URDF foot-corner contact spheres at
@@ -213,7 +213,7 @@ _PARA_BALL_L, _PARA_BALL_R = 10, 11
 # 위해 환경변수로 뺐습니다: W_ANKLESOLE=0 이면 예제와 동일.
 _ANKLE_SOLE_OFF = float(os.environ.get("W_ANKLESOLE", 0.036))
 _MOVE_LESS = ["left_hip_yaw_joint", "right_hip_yaw_joint", "waist_yaw_joint"]
-# ── [ROLLBACK MARKER: tendon-couple] 텐던 결합 J1<->J0 (2026-08-15) ──────────────────────────
+# 텐던 결합 J1<->J0 (2026-08-15)
 # 이 8개는 액추에이터가 없는 텐던 축 관절입니다. 예전에는 시뮬레이터에서 J0가 자체 USD 드라이브에
 # 0으로 붙들려 있었으므로 리타게팅도 0으로 푸는 것이 옳았습니다(_HOLD_ZERO + rest 가중치 5.0).
 # 자산에서 그 드라이브를 제거하고 cfg에 fixed_tendons_props를 넣으면서 J0는 이제 텐던을 따라
@@ -254,7 +254,7 @@ _WRAP_PALMAR_R = {"palm": [0.0, -1.0, 0.0],
                   **{f"th{sg}": [-1.0, 0.0, 0.0] for sg in ("proximal", "middle")}}
 
 
-# ── [ROLLBACK MARKER: wrap-centroid] wrap 접촉점을 링크 원점 -> 메시 중심으로 ──────────────────
+# wrap 접촉점을 링크 원점 -> 메시 중심으로
 # 접촉 비용은 wrap 링크(palm/proximal/middle)를 물체 표면의 접촉 목표로 당기는데, 오프셋 0 이면
 # 당겨지는 점이 링크 ORIGIN, 즉 **관절 위치**입니다. 실제 접촉면은 마디 중앙이라 그만큼 어긋납니다.
 # 링크별 실측(원점 -> 시각 메시 중심, 링크 로컬):
@@ -342,7 +342,7 @@ def _contact_signal(ftpad, obj_base, obj_name):
 
 
 def _foot_contact(jp, ball_idx):
-    # [ROLLBACK MARKER: foot-plant-3d] 속도는 3D 노름 (SONIC 기준). |Δz| 로 바꾸면 이전 동작.
+    # 속도는 3D 노름 (SONIC 기준). |Δz| 로 바꾸면 이전 동작.
     p = jp[:, ball_idx, :]
     v = onp.zeros(len(p), dtype=onp.float32)
     v[1:] = onp.linalg.norm(p[1:] - p[:-1], axis=-1) * _FPS
@@ -353,8 +353,8 @@ def _pelvis_target_R(jp):
     """Per-frame target pelvis orientation (world) from ParaHome body keypoints, in the G1 pelvis-link
     convention X=forward, Y=left, Z=up.  up = midshoulder→ (spine), left = right→left hip, forward = left×up.
     Constraining the free root to this removes the spurious roll that saturates hip_roll/waist_roll."""
-    p_rs, p_ls = jp[:, 17], jp[:, 16]     # [smplx-kpts] right / left shoulder
-    p_rh, p_lh = jp[:, 2], jp[:, 1]       # [smplx-kpts] right / left hip
+    p_rs, p_ls = jp[:, 17], jp[:, 16]  # right / left shoulder
+    p_rh, p_lh = jp[:, 2], jp[:, 1]  # right / left hip
     z = 0.5 * (p_ls + p_rs) - 0.5 * (p_lh + p_rh)          # up (hips → shoulders)
     z /= onp.linalg.norm(z, axis=1, keepdims=True) + 1e-9
     y = p_lh - p_rh                                        # left (right hip → left hip)
@@ -384,7 +384,7 @@ def _hand_sets(robot):
     손가락이 안쪽으로 눌립니다 — 크기 차이를 흡수할 통로가 없었습니다. pyroki 11번 손 예제는
     바로 이 스케일 행렬로 그 차이를 흡수합니다.
     """
-    # [smplx-kpts] 오프셋을 SMPL-X 손 블록(왼 25 / 오른 40)으로. 그리고 palm 을 리스트 0번에
+    # 오프셋을 SMPL-X 손 블록(왼 25 / 오른 40)으로. 그리고 palm 을 리스트 0번에
     # 명시적으로 넣습니다 — 옛 _HAND_CHAIN 은 ("wrist",[0]->palm) 로 시작해 palm 이 0번이었고,
     # wrist_orient 의 _t=[0,1,4](palm, ffknuckle, mfknuckle) 가 그 순서를 전제합니다. palm 을
     # _PALM 으로 빼내면서 이 전제가 깨져 손목 프레임이 검지 한 줄에서 만들어졌습니다(방향 붕괴).
@@ -429,7 +429,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     var_joints = robot.joint_var_cls(jnp.arange(T))
     var_root = jaxls.SE3Var(jnp.arange(T))
     var_scale = ScaleVar(jnp.zeros(T))
-    # ── [ROLLBACK MARKER: offset-shared] 오프셋을 클립 상수로 (2026-09-04) ────────────────────
+    # 오프셋을 클립 상수로 (2026-09-04)
     # pyroki 예제 12 와 동일: OffsetVar(jnp.zeros(T)) — 모든 프레임이 같은 변수 id 라서 클립 전체가
     # 3차원 오프셋 하나를 공유합니다. 예전에는 jnp.arange(T) 로 프레임마다 독립 오프셋을 뒀는데,
     # 그러면 T 개의 자유도가 생기고 이를 묶는 항은 offset_reg(제거됨) 뿐이었습니다. floor_contact/
@@ -441,7 +441,6 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     _floor_sq = int(os.environ.get("W_FLOORSQ", 0))    # [floor-sq-test] 1 = 예제 12 의 제곱 잔차
     _off_ids = onp.zeros(T, onp.int32)
     var_offset = OffsetVar(jnp.asarray(_off_ids))
-    # ── [/ROLLBACK MARKER: offset-shared] ────────────────────────────────────────────────────
 
     # per-node local weight `lw` (nb,) → pairwise lw[i]*lw[j]: weakening the ARM nodes frees the arm's
     # relative structure so the contact cost can bend it UP to reach the (absolute) object once the body
@@ -474,14 +473,14 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     # ground and the arms bend to reach the object (pyroki's joint-relationship philosophy + our grasp).
     @jaxls.Cost.factory
     def global_align(vv, v_root: jaxls.SE3Var, v_cfg, kp):
-        # [ROLLBACK MARKER: fingertip-align] 링크 원점이 아니라 (원점 + 회전 x 로컬 오프셋) 을 씁니다.
+        # 링크 원점이 아니라 (원점 + 회전 x 로컬 오프셋) 을 씁니다.
         # 손끝 10개만 오프셋이 0 이 아니고 나머지는 0 이라 기존 동작과 같습니다. 손끝을 별도 비용으로
         # 두지 않는 이유는 FK 야코비안이 한 벌 더 생기기 때문입니다(이 파일의 다른 주석 참고).
         T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
         pos = T_wl.translation()[a_link] + jnp.einsum("nij,nj->ni", T_wl.rotation().as_matrix()[a_link], a_off)
         return ((pos - kp[a_para]) * gw).flatten()
 
-    # ── [ROLLBACK MARKER: root-xy] 오프셋을 포함한 골반 xy 를 SMPL-X 골반에 맞춤 (2026-09-04) ──
+    # 오프셋을 포함한 골반 xy 를 SMPL-X 골반에 맞춤 (2026-09-04)
     # global_align 에 이미 (0,"pelvis") 대응이 있지만 그 비용은 var_offset 을 보지 않으므로
     # var_root 좌표계에서만 만족됩니다. 최종 루트는 SE3.from_translation(offset) @ var_root 이라
     # 오프셋 xy 만큼 실제 골반이 밀려도 아무 항이 관측하지 못합니다. offset_reg/offset_xy(제거됨)가
@@ -495,7 +494,6 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
         T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
         pos = T_wl.translation()[_pelvis_link_idx] + vv[v_off]      # 오프셋 포함 = 실제 골반
         return ((pos[:2] - kp[0, :2]) * weights["root_xy"]).flatten()
-    # ── [/ROLLBACK MARKER: root-xy] ──────────────────────────────────────────────────────────
 
     @jaxls.Cost.factory
     def floor_contact(vv, v_root: jaxls.SE3Var, v_cfg, v_off: OffsetVar, lc, rc, lkp, rkp):
@@ -560,7 +558,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
         d = jnp.linalg.norm(T_wl.translation()[left_knee_idx] - T_wl.translation()[right_knee_idx] + 1e-6)
         return jnp.maximum(weights["knee_min"] - d, 0.0).reshape(1) * weights["knee_separation"]
 
-    # [ROLLBACK MARKER: tendon-ineq] 루프백 텐던 부등식.  q_J0 ≤ gear · q_J1 (Shadow 문서).
+    # 루프백 텐던 부등식. q_J0 ≤ gear · q_J1 (Shadow 문서).
     # knee_separation 과 같은 hinge 형태 — 위반분만 벌하므로 J0 는 그 아래에서 자유롭고,
     # 손 키포인트 비용이 사람의 distal 굴곡을 따라 J0 를 정한다. 접촉으로 distal 이 멈추고
     # 근위만 더 감기는 감싸쥐기(J0 < J1)가 표현 가능해진다 — 등식 mimic 으로는 불가능했다.
@@ -601,7 +599,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
 
     # [/OBJECT-COLLISION]
 
-    # ── [ROLLBACK MARKER: stage1-hand] 3단계(팔만 자유)에서는 접지·루트·접촉 비용이 전부 고정 변수만
+    # 3단계(팔만 자유)에서는 접지·루트·접촉 비용이 전부 고정 변수만
     # 보는 상수라서 만들지 않습니다 — 비용마다 FK 야코비안이 한 벌씩 생기므로 시간·RAM 절약.
     if stage3:
         costs = [
@@ -635,7 +633,6 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
             # blows up to ~42 GB / int32-overflow. Re-add with a restricted pair set (hand↔body only) later.
             pk.costs.limit_constraint(jax.tree.map(lambda x: x[None], robot), var_joints),
         ]
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
     # world_collision + var_offset (feet-on-floor) are ON by default. Naively grounding a single-stage solve
     # drops the whole robot ~10 cm to plant feet and corrupts body+hand keypoint tracking 2–3× (8→19 cm) for
     # our tall-human→short-G1 embodiment — but STAGE 2 resolves this: stage 1 grounds the lower body, then the
@@ -643,8 +640,8 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     # var_offset 은 정규화 없이 자유입니다 (pyroki 예제 12 와 동일 — offset_reg/offset_xy 는 2026-09-04
     # 제거). 접지는 floor_contact + skating + world_collision 이 잡습니다. W_WORLDCOLL=0 →
     # faithful-tracking baseline (no grounding). To disable grounding entirely: W_WORLDCOLL=0.0.
-    # [ROLLBACK MARKER: tendon-ineq] J0 가 구동 목록에 있을 때만 (pre_mimic URDF) 의미가 있다.
-    if weights["tendon_ineq"] > 0 and not stage3:    # [stage1-hand] 3단계는 손이 고정 → 불필요
+    # J0 가 구동 목록에 있을 때만 (pre_mimic URDF) 의미가 있다.
+    if weights["tendon_ineq"] > 0 and not stage3:  # 3단계는 손이 고정 → 불필요
         _an = robot.joints.actuated_names
         _pairs = [(_an.index(f"robot0_{sd}_{fg}J0"), _an.index(f"robot0_{sd}_{fg}J1"))
                   for sd in "lr" for fg in ("FF", "MF", "RF", "LF")
@@ -685,7 +682,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
         # up-weighted hand global_align (gw hands) then drives the free UPPER body to the hand keypoints.
         _pin_j = jnp.asarray(s2_joints)                       # (T, nJ)
         _pin_root = jnp.asarray(s2_root)                      # (T, 7) wxyz_xyz (stage-1 baked root)
-        # [offset-shared] 오프셋 변수가 1개이므로 프레임 0 값만 씁니다.
+        # 오프셋 변수가 1개이므로 프레임 0 값만 씁니다.
         _pin_off = jnp.asarray(s2_offset[:1])                 # (1,3)
         _lmask = jnp.asarray(s2_lower_mask)                   # (nJ,) 1=freeze, 0=free
 
@@ -711,7 +708,7 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
     return root, sol[var_joints]
 
 
-# ── [ROLLBACK MARKER: stage1-hand] STAGE 3 — 1단계(떠 있는 양손 정책) 롤아웃의 손을 이식 (2026-09-09) ──
+# STAGE 3 — 1단계(떠 있는 양손 정책) 롤아웃의 손을 이식 (2026-09-09)
 # 입력: rollout.py --dump_hand_traj 가 쓴 hand_traj_best.npz (50 Hz, ParaHome 월드 좌표).
 # 하는 일: (1) 손 관절 44개(구동 36 + J0 8)를 롤아웃 값으로 덮어쓰고 하반신·허리와 함께 고정,
 #          (2) 롤아웃 손바닥 자세(palm_pos/palm_quat)에 URDF-FK 로 재고정한 손 링크 위치 42개를
@@ -921,14 +918,13 @@ def _stage3_run(args, robot, robot_coll, heightmap, an, joints, root, F, pairs, 
                 hand_target_names=onp.array([str(n) for n in hd["joint_names"]], dtype=object),
                 stage1_palm_pos=palm_pos.astype(onp.float32), stage1_palm_quat=palm_quat.astype(onp.float32),
                 stage1_valid=valid, stage1_contact=c30, stage1_source=onp.array(str(args.stage1_hand)))
-# ── [/ROLLBACK MARKER: stage1-hand] ──
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", default="s100_seg00_pan")
     ap.add_argument("--class", dest="cls", default="single_rigid")
-    # [stage1-hand] 1단계(떠 있는 양손) 롤아웃 hand_traj_best.npz 를 주면 3단계를 추가로 풉니다(아래 STAGE 3).
+    # 1단계(떠 있는 양손) 롤아웃 hand_traj_best.npz 를 주면 3단계를 추가로 풉니다(아래 STAGE 3).
     ap.add_argument("--stage1_hand", default="", help="[stage1-hand] hand_traj_best.npz 경로 (없으면 기존 동작)")
     ap.add_argument("--stage1_reuse", type=int, default=1,
                     help="[stage1-hand] 1 = 기존 trajectory_pyroki.npz 를 1·2단계 결과로 재사용(재계산 생략)")
@@ -939,7 +935,7 @@ def main():
     robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
     sm = onp.load(_PROC / "smplx" / args.cls / args.clip / "0" / "trajectory.npz", allow_pickle=True)
-    # [smplx-kpts] SMPL-X 관절(55)을 씁니다. 없으면 parahome.py 를 --overwrite 로 다시 돌려야
+    # SMPL-X 관절(55)을 씁니다. 없으면 parahome.py 를 --overwrite 로 다시 돌려야
     # 합니다(smplx_joints 키 추가). 옛 ParaHome 스트림으로 되돌리려면 joint_positions 로.
     if "smplx_joints" not in sm.files:
         raise KeyError(f"[smplx-kpts] {args.clip}: smplx_joints 없음 — parahome.py --overwrite 필요")
@@ -975,8 +971,8 @@ def main():
     ft_off = [(_FT_OFF_R[f] if not (s == "l" and f != "th")
                else [_FT_OFF_R[f][0], -_FT_OFF_R[f][1], _FT_OFF_R[f][2]]) for _, s, f in _FT_PADS]
     ft_pad = sm["fingertip_pad_pos"].astype(onp.float32)                 # (F,10,3) human pads (fallback target)
-    # [ROLLBACK MARKER: fingertip-align] 아래에서 ft_pad 는 접촉 목표(물체 표면)로 덮어써지므로
-    # [ROLLBACK MARKER: fingertip-align] 대응이 손끝을 인덱스 73.. 로 가리키므로 사람 키포인트
+    # 아래에서 ft_pad 는 접촉 목표(물체 표면)로 덮어써지므로
+    # 대응이 손끝을 인덱스 73.. 로 가리키므로 사람 키포인트
     # 배열 뒤에 fingertip_pad_pos 10개를 이어붙입니다. jp 는 (F,73,3) -> jp_ext 는 (F,83,3).
     # ft_pad 는 아래에서 접촉 목표(물체 표면)로 덮어써지므로 여기서 복사해 둡니다.
     jp_ext = onp.concatenate([jp, ft_pad.copy()], axis=1).astype(onp.float32)
@@ -1011,7 +1007,7 @@ def main():
         wrap = [n for n in hc_names if not n.endswith("distal")]        # palm + proximal + middle (tips above)
         _woff = float(os.environ.get("W_WRAP_OFFSET", "0.0"))           # [EXPERIMENT] palmar surface offset (m)
         _wmarg = float(os.environ.get("W_WRAP_MARGIN", "0.012"))        # [EXPERIMENT] wrap contact margin (m)
-        # [ROLLBACK MARKER: wrap-centroid] 기준점 = 메시 중심(축 오차 제거) + 선택적 palmar 밀기.
+        # 기준점 = 메시 중심(축 오차 제거) + 선택적 palmar 밀기.
         _use_ctr = os.environ.get("W_WRAP_CENTROID", "1") == "1"
         for n in wrap:
             j = hc_names.index(n)
@@ -1036,7 +1032,7 @@ def main():
 
     # rest weights: default 0.2, move-less joints 2.0, coupled-J0 5.0 (hold ~0 → solve≈output)
     an = robot.joints.actuated_names
-    # ── [ROLLBACK MARKER: rest-hand] rest 가중치를 손만 따로 조절 (2026-08-17 진단) ──────────
+    # rest 가중치를 손만 따로 조절 (2026-08-17 진단)
     # pyroki 의 rest 목표는 관절 한계의 중간값((lower+upper)/2)이고, rest_cost 와 smoothness_cost
     # 는 65개 관절 전체에 같은 절대 가중치로 걸립니다. 팔은 진폭이 1.6~2.3 rad 라 꿈쩍 않지만
     # 손은 사람 기준 0.46~0.89 rad 라 이 벌점이 지배합니다. 실측: 리타게팅된 오른손 18관절이
@@ -1052,11 +1048,10 @@ def main():
             if _nm.startswith("robot0_"):
                 rest_w[_i] = _rh; _nh += 1
         print(f"[rest-hand] 손 관절 {_nh}개의 rest 가중치 → {_rh} (나머지는 {os.environ.get('W_REST', 0.2)})")
-    # ── [/ROLLBACK MARKER: rest-hand] ──────────────────────────────────────────────────────
-    # [ROLLBACK MARKER: tendon-couple] 등식 mimic URDF 에서는 J0 가 구동 목록에서 빠지므로 이 루프가
+    # 등식 mimic URDF 에서는 J0 가 구동 목록에서 빠지므로 이 루프가
     # 아무 관절도 못 찾아 무효입니다. mimic 이전 URDF(= 부등식 모드, W_URDF)에서만 의미가 있습니다.
     #
-    # ── [ROLLBACK MARKER: rest-j0] 0 을 실제로 넣을 수 있게 (2026-09-02) ──────────────────────
+    # 0 을 실제로 넣을 수 있게 (2026-09-02)
     # 예전 가드가 `> 0.0` 이라 W_RESTJ0=0 을 줘도 아무 일이 없었고(기본 W_REST=0.2 유지), 올리는
     # 방향만 가능했습니다. 부등식 모드에서는 J0 가 구동 목록에 들어와 기본 0.2 가 그대로 걸리는데,
     # pyroki 의 rest 목표는 관절 한계 중간값 (0+1.571)/2 = 0.785 입니다. 실측 결과 J0 중앙값이
@@ -1112,7 +1107,7 @@ def main():
                    # 시간축으로 평균해 더 나은 해를 찾습니다. 대가는 루트 회전 튐 3.18->4.04도.
                    # 2.0 은 발바닥 표준편차가 0.57->0.66 cm 로 나빠져 채택하지 않았습니다.
                    joint_smoothness=_w("W_SMOOTH", 1.0),
-                   # [root-xy] 오프셋 포함 골반 xy ↔ SMPL-X 골반 xy. 스윕(0~100, knife/pot) 결과 5.0.
+                   # 오프셋 포함 골반 xy ↔ SMPL-X 골반 xy. 스윕(0~100, knife/pot) 결과 5.0.
                    # 0 에서는 골반이 사람 골반에서 6.8~7.6 cm 어긋나 있었습니다 — global_align 의
                    # (0,"pelvis") 대응이 var_offset 을 보지 못해 var_root 좌표계에서만 만족되기 때문.
                    # 5.0: 골반 오차 1.7 cm(-77%), knife 손목 회전오차 p90 14.8->9.8도(-34%),
@@ -1145,7 +1140,7 @@ def main():
     # 골반 z 목표가 오프셋에 그대로 흡수됩니다. 즉 축별 구분 자체가 의미가 없었습니다.
     w_pelvis = _w("W_PELVIS", 1.0)
     w_trunk, w_arm, w_leg = _w("W_TRUNK", 1.0), _w("W_ARM", 1.0), _w("W_LEG", 1.0)
-    # ── [ROLLBACK MARKER: smplx-kpts] 부위 판별을 위치 인덱스 -> 링크 이름으로 ───────────────
+    # 부위 판별을 위치 인덱스 -> 링크 이름으로
     # 옛 코드는 gw[1]=torso, gw[2:8]=arms, gw[8:14]=legs, gw[14:]=hands 처럼 _BODY 의 고정 순서를
     # 전제했습니다. SMPL-X 전환에서 torso 대응을 빼고 순서를 바꾸자 어깨에 몸통 가중치가, 고관절에
     # 팔 가중치가, palm 에 다리 가중치가 걸렸습니다(조용히 통과 — 길이가 우연히 맞았습니다).
@@ -1183,12 +1178,12 @@ def main():
             if _part(_ln) == "hand":
                 gw[_i] = 0.0; _nh_off += 1
         print(f"[s1-nohand] STAGE 1 에서 손 대응 {_nh_off}개 비활성 (몸통 {len(_a_names)-_nh_off}개만)")
-    # [ROLLBACK MARKER: fingertip-align] 손끝 10개/손은 각 손 블록의 뒤쪽에 붙어 있습니다.
+    # 손끝 10개/손은 각 손 블록의 뒤쪽에 붙어 있습니다.
     # 기본값은 다른 손 키포인트와 동일(균일)입니다. 참고로 env 보상은 손끝을 더 중시합니다
     # (rew_fingertip -6.0 vs rew_hand_kpts -1.5, 둘 다 그룹 평균이라 점당 4:1). 최소제곱에서
     # 중요도는 가중치의 제곱이므로 그 비율을 재현하려면 W_HANDTIP = 2.0 x W_HAND 입니다.
     # 올리면 손끝이 다른 손 키포인트를 밀어낼 수 있으니 스윕으로 확인하고 쓰십시오.
-    # [smplx-kpts] 손끝은 위치가 아니라 "링크-로컬 오프셋이 0 이 아닌 대응"으로 식별합니다
+    # 손끝은 위치가 아니라 "링크-로컬 오프셋이 0 이 아닌 대응"으로 식별합니다
     # (_build_correspondence 에서 손끝만 pad 오프셋을 갖습니다) — 블록 경계에 의존하지 않습니다.
     _wtip = _w("W_HANDTIP", 0.0) or weights["hand_alignment"]
     _tip_rows = onp.abs(a_off).sum(axis=1) > 1e-9
@@ -1198,14 +1193,14 @@ def main():
     # cost (reach the object from the grounded-lower body); pelvis/torso/legs keep full local.
     w_armlocal = _w("W_ARMLOCAL", 1.0)                   # default full; lower (env) frees the arm for grounding
     lw = onp.ones(len(b_para), onp.float32)
-    for _i, (_, _ln) in enumerate(_BODY):                # [smplx-kpts] 이름으로 팔 판별
+    for _i, (_, _ln) in enumerate(_BODY):  # 이름으로 팔 판별
         if _part(_ln) == "arm":
             lw[_i] = w_armlocal
 
     root_R_target = _pelvis_target_R(jp)     # (F,3,3) keypoint-derived pelvis orientation target
     heightmap = _flat_heightmap(jp)          # flat z=0 floor spanning the clip
 
-    # [stage1-hand] 기존 결과 재사용이면 1·2단계 solve 를 건너뜁니다.
+    # 기존 결과 재사용이면 1·2단계 solve 를 건너뜁니다.
     _s3_base = _stage3_load_base(_PROC / "g1_shadow" / args.cls / args.clip / "0" / "trajectory_pyroki.npz", an, F) \
         if (args.stage1_hand and args.stage1_reuse) else None
     t0 = time.time()
@@ -1232,7 +1227,7 @@ def main():
     if w_stage2 > 0.0 and _s3_base is None:
         lower_mask = onp.array([1.0 if any(k in nm for k in ("hip", "knee", "ankle")) else 0.0
                                 for nm in an], onp.float32)      # freeze legs; waist+arms+fingers stay free
-        # [smplx-kpts] 여기도 위치 인덱스 -> 이름 기반. 옛 gw2[8:14]/gw2[14:] 는 _BODY 순서 전제였습니다.
+        # 여기도 위치 인덱스 -> 이름 기반. 옛 gw2[8:14]/gw2[14:] 는 _BODY 순서 전제였습니다.
         gw2 = gw.copy()
         _s2arm, _s2hand = _w("W_STAGE2ARM", 1.0), _w("W_STAGE2HAND", 5.0)
         for _i, _ln in enumerate(_a_names):
@@ -1258,7 +1253,7 @@ def main():
         joints = onp.array(joints2); root = onp.array(Ts_root.wxyz_xyz)
         print(f"[pyroki-retarget] STAGE 2 (freeze lower + reach hands) solved in {time.time()-t1:.1f}s")
 
-    # ── [ROLLBACK MARKER: stage1-hand] STAGE 3: 1단계 롤아웃의 손을 이식하고 팔만 다시 풀기 ──
+    # STAGE 3: 1단계 롤아웃의 손을 이식하고 팔만 다시 풀기
     _s3_extra = {}
     if args.stage1_hand:
         _s3_extra = _stage3_run(args, robot, robot_coll, heightmap, an, joints, root, F, pairs, a_para, a_link,
@@ -1267,10 +1262,9 @@ def main():
                                 ft_idx, ft_off, ft_margin, ft_pad, ft_mask, rest_w, weights, h_sets, _w)
         joints = _s3_extra.pop("_joints"); root = _s3_extra.pop("_root")
         os.environ.setdefault("W_OUTSUFFIX", "_stage1")
-    # ── [/ROLLBACK MARKER: stage1-hand] ──
     solved = {name: joints[:, i] for i, name in enumerate(an)}
     act = list(_ORDER["action_joint_names"])
-    # [ROLLBACK MARKER: tendon-ineq] 부등식 모드에서는 J0 8개가 자유 변수로 풀립니다. 65열 액션
+    # 부등식 모드에서는 J0 8개가 자유 변수로 풀립니다. 65열 액션
     # 레이아웃에는 J0 가 없어 그대로 두면 풀린 값이 버려집니다 — 뒤에 덧붙여 저장합니다.
     # (등식 mimic 모드에서는 solved 에 J0 가 없으므로 이 블록이 자동으로 no-op 입니다.)
     _extra = [n for n in (f"robot0_{sd}_{fg}J0" for sd in "lr" for fg in ("FF", "MF", "RF", "LF"))
@@ -1318,7 +1312,7 @@ def main():
     # middle finger driven by the thumb). With the names alongside, the env matches by name.
     onp.savez(out, g1_joint_pos=g1_joint_pos.astype(onp.float32),
               g1_root_pose=g1_root_pose.astype(onp.float32),
-              joint_names=onp.array(act, dtype=object), **_s3_extra)   # [stage1-hand] 추가 키
+              joint_names=onp.array(act, dtype=object), **_s3_extra)  # 추가 키
     print(f"[pyroki-retarget] wrote {out}  ({nmap}/{len(act)} action joints solved)")
 
 

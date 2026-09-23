@@ -340,8 +340,6 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
 
     # ---- 종료 조건 (레퍼런스 이탈) ----
     term_body_kpt_err: float = 0.50  # m, 몸 키포인트 평균 오차 (낙상 포함)
-    term_root_pos_err: float = 0.40  # m, 루트 위치 이탈 (지금은 실패 덤프 원인 기록에만 쓴다)
-    term_root_rot_err: float = 1.0  # rad, 루트 회전 이탈 (위와 같음)
     term_obj_pos_err: float = 0.15  # m, 물체 위치 오차
     term_obj_rot_err: float = 0.75  # rad, 물체 회전 오차
     term_ft_err: float = 0.15  # m, 손끝 평균 오차
@@ -424,7 +422,6 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     vel_obs_scale: float = 0.2  # 관측의 각속도·관절 속도 배율
 
     # ---- SONIC 프라이어 ----
-    use_sonic: bool = True  # 이 env 는 SONIC 전용 (False 면 오류). hand_pretrain cfg 가 False 로 덮어쓴다
     sonic_config_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/config.yaml"
     sonic_ckpt_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/last.pt"
     sonic_encoder: str = "g1"  # "g1" | "smpl": SONIC 에 줄 명령 인코더

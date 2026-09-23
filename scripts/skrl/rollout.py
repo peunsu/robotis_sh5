@@ -69,13 +69,11 @@ parser.add_argument("--zero_action", action="store_true",
 parser.add_argument("--dump_joints", action="store_true",
                     help="[joint-dump] env 0 의 PD 타겟/실측 관절 궤적을 joint_trace.npz 로 저장 "
                          "(bang-bang 진단용). _apply_action 이 쓰는 _residual_target 을 그대로 기록.")
-# [ROLLBACK MARKER: hand-traj]
 parser.add_argument("--dump_hand_traj", action="store_true",
                     help="[hand-traj] (HandPretrain 전용) 모든 rollout 의 손 궤적(손가락 관절 실측/PD 타겟, "
                          "손목 dof6, 손바닥·손끝 위치, 물체 자세·속도, 링크 접촉력, 보상)을 첫 에피소드 동안 "
                          "기록하고, reward_sum 이 가장 큰 rollout 을 골라 <output_dir>/hand_traj_best.npz 로, "
                          "전체를 hand_traj.npz 로 저장합니다. 위치는 env 원점을 뺀 값(= ParaHome 월드 좌표).")
-# [/ROLLBACK MARKER: hand-traj]
 parser.add_argument("--debug_vis", action="store_true", help="Draw reference-keypoint markers (needs a viewer / not --headless).")
 # ── Recorded-video CAMERA ANGLE (video-only — never touches physics) ─────────────────────────
 # The g1 sonic/locomanip env recomputes cfg.viewer.eye/lookat from cfg.viewer_{yaw,elev,look_obj,
@@ -101,7 +99,7 @@ parser.add_argument("--viewer_elev", type=float, default=None,
 parser.add_argument("--viewer_look_obj", type=int, default=None, choices=(0, 1),
                     help="Override cfg.viewer_look_obj: 1 = aim at the object centroid, 0 = the root centroid.")
 parser.add_argument("--viewer_zoom", type=float, default=None, help="Override cfg.viewer_zoom.")
-# [ROLLBACK MARKER: viewer-env-index] 녹화 대상 env 를 고릅니다. cfg.viewer.origin_type=="env" 일 때
+# 녹화 대상 env 를 고릅니다. cfg.viewer.origin_type=="env" 일 때
 # 카메라는 이 인덱스의 env 원점 기준으로 놓이고, 그 env 만 화면에 담깁니다. env 코드는 손대지
 # 않아도 됩니다 — 카메라 위치 계산(g1_shadow_sonic_residual_env.py:556-)이 레퍼런스 궤적에서
 # env-로컬 좌표를 만들기 때문에 인덱스와 무관합니다. 주의: env 마다 리셋/탐색 난수가 달라서
@@ -280,7 +278,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             setattr(env_cfg, _f, float(_v))
     if args_cli.viewer_look_obj is not None and hasattr(env_cfg, "viewer_look_obj"):
         env_cfg.viewer_look_obj = bool(args_cli.viewer_look_obj)
-    # [ROLLBACK MARKER: viewer-env-index] cfg.viewer.env_index 는 cfg.viewer_* 와 달리 env 가 읽는
+    # cfg.viewer.env_index 는 cfg.viewer_* 와 달리 env 가 읽는
     # 값이 아니라 Isaac Lab ViewportCameraController 가 직접 쓰는 값이라 여기서 바로 꽂습니다.
     if args_cli.viewer_env_index is not None and getattr(env_cfg, "viewer", None) is not None:
         _vei = int(args_cli.viewer_env_index)
@@ -471,7 +469,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                                  "obj_pos", "obj_quat", "qpos_all", "root_all", "obj_all")}
         print(f"[joint-dump] env 0 기록 시작: {len(actual_env._action_joint_names)}관절")
 
-    # ── [ROLLBACK MARKER: hand-traj] 모든 env 의 손 궤적 기록 ────────────────────────────
+    # 모든 env 의 손 궤적 기록
     # 스텝마다 (E,…) 텐서를 통째로 쌓고, 각 env 의 첫 에피소드 길이(ep_len)로 마지막에 잘라 씁니다.
     # 상태는 스텝 **전**(= 그 프레임의 상태), PD 타겟·보상은 스텝 **후**(= 그 스텝에 적용된 값)에 기록.
     # done 이 난 env 는 step() 안에서 이미 리셋되어 타겟이 리셋 씨딩 값으로 덮이므로, 그 스텝의 타겟은
@@ -485,7 +483,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                                      "palm_pos", "palm_quat", "palm_linvel", "palm_angvel",
                                      "ft_pos", "ft_pad_inward", "obj_pos", "obj_quat", "obj_linvel", "obj_angvel",
                                      "contact_force_w", "finger_target", "wrist6_target", "reward", "done",
-                                     "link_pos", "link_quat")}   # [stage1-contact-map] 32 접촉 링크 바디 자세
+                                     "link_pos", "link_quat")}  # 32 접촉 링크 바디 자세
             _hrec_ep_len = torch.zeros(n, dtype=torch.long)
             _h_env = actual_env
             _h_hands = (_h_env.hand_l, _h_env.hand_r)
@@ -508,12 +506,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _hrec["palm_quat"].append(_cpu(_h_env._gather_body(_h_env._palm_sides, _h_env._palm_body_ids, "body_quat_w")))
         _hrec["palm_linvel"].append(_cpu(_h_env._gather_body(_h_env._palm_sides, _h_env._palm_body_ids, "body_lin_vel_w")))
         _hrec["palm_angvel"].append(_cpu(_h_env._gather_body(_h_env._palm_sides, _h_env._palm_body_ids, "body_ang_vel_w")))
-        # ── [ROLLBACK MARKER: stage1-contact-map] LINK_CONTACT_NAMES 순서의 32 접촉 링크 바디 자세(env-local 위치, wxyz).
+        # LINK_CONTACT_NAMES 순서의 32 접촉 링크 바디 자세(env-local 위치, wxyz).
         #    stage1_hand_contact.py 가 이 자세로 Shadow 링크 메시를 놓아 접촉 맵을 만든다 (URDF FK 불필요 = 시뮬레이션과 동일).
         if hasattr(_h_env, "_link_contact_body_ids"):
             _hrec["link_pos"].append(_cpu(_h_env._gather_body(_h_env._lc_sides, _h_env._link_contact_body_ids, "body_pos_w") - _org[:, None]))
             _hrec["link_quat"].append(_cpu(_h_env._gather_body(_h_env._lc_sides, _h_env._link_contact_body_ids, "body_quat_w")))
-        # ── [/ROLLBACK MARKER: stage1-contact-map] ──
         _tip, _inw = _h_env._robot_ft_w()
         _hrec["ft_pos"].append(_cpu(_tip - _org[:, None]))
         _hrec["ft_pad_inward"].append(_cpu(_inw))
@@ -543,13 +540,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         _r = rewards_t if rewards_t.ndim == 1 else rewards_t[:, 0]
         _hrec["reward"].append(_cpu(_r))
         _hrec["done"].append(done_t.clone())
-    # [/ROLLBACK MARKER: hand-traj]
 
     for _step in range(args_cli.max_steps):
-        # [ROLLBACK MARKER: hand-traj] 스텝 전 상태 기록
+        # 스텝 전 상태 기록
         if _hrec is not None:
             _hand_traj_state()
-        # [/ROLLBACK MARKER: hand-traj]
         with torch.no_grad():
             obs_norm = observation_preprocessor(obs)   # apply training-time normalization stats
             actions, outputs = policy.act({"observations": obs_norm}, role="policy")
@@ -638,11 +633,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if _is_grasp:
             policy.update_mass_terminated(done)
 
-        # [ROLLBACK MARKER: hand-traj]
         if _hrec is not None:
             _hand_traj_post(rewards, done_cpu)
             _hrec_ep_len += (~episode_done).long()          # 이 스텝을 첫 에피소드로 산 env 만 +1
-        # [/ROLLBACK MARKER: hand-traj]
 
         # Mark envs whose first episode just ended.
         episode_done |= done_cpu
@@ -668,7 +661,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
               kpts=_pad(kpts_bufs), ft=_pad(ft_bufs))
     print(f"[rollout] per-frame traces -> per_frame.npz  ({len(obj_pos_bufs)} x {_L})")
 
-    # ── [ROLLBACK MARKER: hand-traj] 손 궤적 저장: 전체(hand_traj.npz) + 최고 보상 rollout(hand_traj_best.npz)
+    # 손 궤적 저장: 전체(hand_traj.npz) + 최고 보상 rollout(hand_traj_best.npz)
     if _hrec is not None and _hrec["frame"]:
         import sys as _sys
         _hm = _sys.modules.get(type(actual_env).__module__)
@@ -715,7 +708,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[hand-traj] -> hand_traj.npz ({n} x {_T} 스텝), hand_traj_best.npz = rollout {_best} "
               f"(reward_sum {_rs[_best]:.2f}, 길이 {_L}/{n_frames} 프레임, 마지막 프레임 {int(_sv['frame'][_best, _L - 1])})")
         print("[hand-traj] reward_sum 상위 5: " + ", ".join(f"#{i}:{_rs[i]:.1f}(len {int(_hrec_ep_len[i])})" for i in _order[:5]))
-    # [/ROLLBACK MARKER: hand-traj]
 
     # ── [joint-dump] 관절 궤적 저장 ────────────────────────────────────────────────────────
     if _jrec is not None and _jrec["qpos"]:

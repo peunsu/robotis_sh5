@@ -131,7 +131,7 @@ def cws_reward(sigma_h, sigma_r, beta: float, v: float, active_eps: float = 1e-3
     return (both * torch.exp(-loss / v)).sum(-1) / cmd_num
 
 
-# ── [ROLLBACK MARKER: cws-diag] 보정이 필요 없는 진단 지표 (2026-08-18) ─────────────────────
+# 보정이 필요 없는 진단 지표 (2026-08-18)
 # cws_reward 가 합산 후 단일 exp 였던 시절에는 점수가 구조적으로 항상 0이었습니다(실측: 96%가
 # 정확히 0.000). 그래서 v 와 무관한 진단 지표가 필요했습니다. 지금은 cws_reward 가 논문의
 # 방향별 평균 형태라 그 자체로 실패들을 구분하지만, 아래 둘은 여전히 v 와 무관하고 방향 수에도

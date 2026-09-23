@@ -163,7 +163,7 @@ def main():
 
     # action-joint name → articulation joint index
     jn = robot.joint_names
-    # [ROLLBACK MARKER: tendon-ineq] npz 가 자기 joint_names 를 들고 있으면 그걸 따릅니다.
+    # npz 가 자기 joint_names 를 들고 있으면 그걸 따릅니다.
     # 부등식 리타게팅은 J0 8개를 자유 변수로 풀어 65 → 73 열로 저장하므로, 고정 65 목록으로
     # 매핑하면 폭이 안 맞고 풀린 J0 도 버려집니다. 이름 기반이면 두 경우 모두 처리됩니다.
     try:

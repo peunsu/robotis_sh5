@@ -40,7 +40,7 @@ ACTOR_OBS_DIM = PROPRIO_HIST * PROPRIO_PER_FRAME  # 930
 # NOTE: smpl 이 아닌 항들은 런타임에 0으로 채워지므로, 폭은 인코더 입력 Linear 형상과
 # 자기일관적이기만 하면 됩니다(strict 로드가 그것만 검사합니다).
 #
-# ── [ROLLBACK MARKER: sonic-v11] 이름 표 -> config 순서 기반 (2026-09-04) ──────────────
+# 이름 표 -> config 순서 기반 (2026-09-04)
 # SONIC 은 정상 경로에서 Isaac Lab ObservationManager 가 각 항의 차원을 런타임에 계산하므로
 # 저장된 config 의 obs.group_obs_dims 가 {} 입니다. 우리는 Isaac 없이 프리어만 떼어 쓰기
 # 때문에 그 표를 여기서 대신 공급합니다.
@@ -224,7 +224,7 @@ def build_sonic(config_path: str = DEFAULT_CONFIG, ckpt_path: str = DEFAULT_CKPT
     cfg.algo.config.actor.backbone.reencode_smpl_g1_recon = False
 
     # (d) instantiate exactly like eval_agent_trl.py:401.
-    # [sonic-v11] 항 이름/순서는 이 체크포인트의 config 에서 읽습니다.
+    # 항 이름/순서는 이 체크포인트의 config 에서 읽습니다.
     _tok = _tok_names_from_cfg(cfg)
     actor = trl_common.custom_instantiate(
         cfg.algo.config.actor,
