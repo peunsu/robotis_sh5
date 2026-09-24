@@ -5,7 +5,7 @@ pure-torch module usable inside env_isaaclab (imports `gear_sonic`, no Isaac Sim
 to build). SONIC drives the 29 G1 BODY DOF only (no hands, no root).
 
 Pure-torch, so it can be smoke-tested without Isaac Sim:
-    /home/peunsu/anaconda3/envs/env_isaaclab/bin/python scripts/process_dataset/sonic/sonic_prior.py --smoke
+    python scripts/process_dataset/sonic/sonic_prior.py --smoke        # env_isaaclab
 
 Verified facts baked in (see MEMORY sonic-residual-integration):
   * build = trl OnlineTrainerState shim + groot->gear_sonic string-replace + strip aux
@@ -21,15 +21,24 @@ from __future__ import annotations
 
 import io
 import os
+import sys
+from pathlib import Path
 
 import torch
 
 # gear_sonic is pip-installed (editable) in env_isaaclab.
 from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER  # 29 body joint names, SONIC order
 
-_SONIC_ROOT = "/home/peunsu/workspace/GR00T-WholeBodyControl"
-DEFAULT_CONFIG = os.path.join(_SONIC_ROOT, "sonic_release", "config.yaml")
-DEFAULT_CKPT = os.path.join(_SONIC_ROOT, "sonic_release", "last.pt")
+sys.path.append(str(Path(__file__).resolve().parents[2]))   # scripts/ (local_paths.py)
+import local_paths  # noqa: E402
+
+# 상대 경로는 GR00T-WholeBodyControl 저장소(local_paths.env 의 GR00T_ROOT) 기준이다.
+DEFAULT_CONFIG = os.path.join("sonic_release", "config.yaml")
+DEFAULT_CKPT = os.path.join("sonic_release", "last.pt")
+
+
+def _gr00t_path(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(local_paths.get("GR00T_ROOT"), path)
 
 # ---- proprioception layout (verified Phase-2): term-major, 10-frame oldest-first ----
 PROPRIO_HIST = 10
@@ -189,6 +198,9 @@ def build_sonic(config_path: str = DEFAULT_CONFIG, ckpt_path: str = DEFAULT_CKPT
     """Build + load the frozen SONIC Actor. Returns the Actor (eval, requires_grad_(False))."""
     from omegaconf import OmegaConf
     from gear_sonic.trl.utils import common as trl_common
+
+    config_path, ckpt_path = _gr00t_path(config_path), _gr00t_path(ckpt_path)
+    print(f"[sonic] config={config_path}  ckpt={ckpt_path}", flush=True)
 
     # (a) shim the moved trl pickle path so torch.load(last.pt) can unpickle its "state".
     try:

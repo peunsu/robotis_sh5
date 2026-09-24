@@ -47,8 +47,9 @@ CLIP_CLASS="${CLIP_CLASS:-single_rigid}"
 NUM_ENVS="${NUM_ENVS:-2048}"
 TIMESTEPS="${TIMESTEPS:-41000}"
 # Two conda envs: SONIC train/smpl-prep run in env_isaaclab; PyRoki retarget in env_pyroki.
-PY="${PY:-/home/peunsu/anaconda3/envs/env_isaaclab/bin/python}"
-PY_PYROKI="${PY_PYROKI:-/home/peunsu/anaconda3/envs/env_pyroki/bin/python}"
+# PY / PY_PYROKI: 환경변수 → 저장소 루트 local_paths.env (git 제외) 순으로 읽는다.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/local_paths.sh"
+require_local_path PY PY_PYROKI
 SKIP_RETARGET="${SKIP_RETARGET:-0}"      # 1 → skip PyRoki retarget (degrades SONIC wrist_ref + RSI reset pose)
 
 # Set VIDEO=1 to record a training mp4 every VIDEO_INTERVAL steps.

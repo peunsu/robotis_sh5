@@ -66,7 +66,9 @@ TASK="Robotis-G1-Shadow-HandPretrain-Direct-v0"
 CLIP_CLASS="${CLIP_CLASS:-single_rigid}"
 N_ROLLOUTS="${N_ROLLOUTS:-32}"
 TIMESTEPS="${TIMESTEPS:-41000}"    # directory-naming tag only (evaluation_ep_le_<TIMESTEPS>)
-PY="${PY:-/home/peunsu/anaconda3/envs/env_isaaclab/bin/python}"
+# PY: 환경변수 → 저장소 루트 local_paths.env (git 제외) 순으로 읽는다.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/local_paths.sh"
+require_local_path PY
 VIDEO="${VIDEO:-1}"
 VIDEO_LENGTH="${VIDEO_LENGTH:-0}"  # 0 → rollout.py fits the full sequence
 SEED="${SEED:-42}"                 # explicit: the determinism contract of the run

@@ -11,17 +11,18 @@ Outputs -> <g1_shadow>/<class>/<clip>/0/sonic_smpl_50fps.npz:
   smpl_joints_local (N,72) f32  | root_q_zb (N,4) wxyz f32  | wrist_ref (N,6) f32 (retarget L/R wrist roll/pitch/yaw) | fps=50
 
 Run:
-  /home/peunsu/anaconda3/envs/env_isaaclab/bin/python scripts/process_dataset/dataset/parahome_smpl_for_sonic.py --clip s100_seg00_pan
+  python scripts/process_dataset/dataset/parahome_smpl_for_sonic.py --clip s100_seg00_pan     # env_isaaclab
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 
+import gear_sonic
 import numpy as np
 import torch
-
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
     compute_human_joints,
@@ -31,8 +32,9 @@ from gear_sonic.trl.utils.torch_transform import (
 )
 from gear_sonic.isaac_utils.rotations import remove_smpl_base_rot, smpl_root_ytoz_up
 
-_PROC = "/home/peunsu/workspace/robotis_sh5/source/robotis_sh5/data/processed/parahome"
-_HJINFO = "/home/peunsu/workspace/GR00T-WholeBodyControl/gear_sonic/data/human/human_joints_info.pkl"
+_PROC = str(Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data" / "processed" / "parahome")
+# 설치된 gear_sonic 패키지(GR00T-WholeBodyControl checkout) 안의 데이터 — 코드와 같은 checkout 에서 읽는다.
+_HJINFO = os.path.join(os.path.dirname(gear_sonic.__file__), "data", "human", "human_joints_info.pkl")
 SRC_FPS = 30.0
 TGT_FPS = 50.0
 # ParaHome SMPL-X global_orient is ALREADY Z-up (verified: remove_base(raw) gives upright

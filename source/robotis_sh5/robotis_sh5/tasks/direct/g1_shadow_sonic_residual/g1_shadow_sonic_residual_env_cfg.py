@@ -433,8 +433,9 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     vel_obs_scale: float = 0.2  # 관측의 각속도·관절 속도 배율
 
     # ---- SONIC 프라이어 ----
-    sonic_config_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/config.yaml"
-    sonic_ckpt_path: str = "/home/peunsu/workspace/GR00T-WholeBodyControl/sonic_v1_1/last.pt"
+    # 상대 경로는 local_paths.env 의 GR00T_ROOT 기준으로 푼다 (sonic_prior.build_sonic). 절대 경로는 그대로 쓴다.
+    sonic_config_path: str = "sonic_v1_1/config.yaml"
+    sonic_ckpt_path: str = "sonic_v1_1/last.pt"
     sonic_encoder: str = "g1"  # "g1" | "smpl": SONIC 에 줄 명령 인코더
     sonic_token_frame_skip: int = 5  # g1 토큰의 미래 프레임 간격 (5 → 1초 창)
     residual_scale_latent: float = 0.10  # z_res 에 곱하는 λ (GRAIL)

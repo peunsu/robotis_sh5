@@ -18,7 +18,7 @@ MandiZhao/dexmachina retargeting/map_contacts.py), adapted to be INDEPENDENT of 
      the robot link should touch). The retarget pulls each in-contact robot link there.
 
 Runs in env_isaaclab (needs smplx + torch + trimesh):
-    /home/peunsu/anaconda3/envs/env_isaaclab/bin/python scripts/process_dataset/dataset/parahome_hand_contact.py \
+    python scripts/process_dataset/dataset/parahome_hand_contact.py \
         --clip s100_seg00_pan [--class single_rigid] [--gamma 0.015] [--num-contacts 50]
 → writes .../smplx/<class>/<clip>/0/hand_contact.npz  (link_names, mask, target)
 """

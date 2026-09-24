@@ -81,3 +81,6 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+
+# 기계마다 다른 절대 경로 (local_paths.env.example 을 복사해 만든다)
+local_paths.env

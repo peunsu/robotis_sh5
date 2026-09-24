@@ -1399,8 +1399,6 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # scripts/process_dataset/sonic/sonic_prior.py 를 불러온다. 이 파일 기준 repo 루트 = parents[6].
         from pathlib import Path as _Path
         _sp_dir = str(_Path(__file__).resolve().parents[6] / "scripts" / "process_dataset" / "sonic")
-        if not os.path.isdir(_sp_dir):
-            _sp_dir = "/home/peunsu/workspace/robotis_sh5/scripts/process_dataset/sonic"
         if _sp_dir not in _sys.path:
             _sys.path.insert(0, _sp_dir)
         import sonic_prior as _SP

@@ -36,7 +36,7 @@ hand had lost its mirrored joint axes, so left fingers curled the wrong way. Bot
 baseline read the repaired URDF, so both benefit.
 
 Runs in env_pyroki (numpy>=2 + jax + pyroki), NOT env_isaaclab:
-    /home/peunsu/anaconda3/envs/env_pyroki/bin/python scripts/process_dataset/retarget/retarget_g1_pyroki.py \
+    python scripts/process_dataset/retarget/retarget_g1_pyroki.py \
         --clip s100_seg00_pan
 → data/processed/parahome/g1_shadow/<class>/<clip>/0/trajectory_pyroki.npz
 Render in env_isaaclab:  render_retarget.py --clip <clip> --variant pyroki
@@ -59,10 +59,14 @@ import trimesh
 import yourdfpy
 from pyroki.collision import collide, colldist_from_sdf
 
-sys.path.insert(0, str(Path("/home/peunsu/workspace/pyroki/examples")))
+sys.path.append(str(Path(__file__).resolve().parents[2]))   # scripts/ (local_paths.py)
+import local_paths  # noqa: E402
+
+# pyroki 저장소의 examples/ (pip 패키지에 없는 retarget_helpers). 위치는 local_paths.env 의 PYROKI_ROOT.
+sys.path.insert(0, str(Path(local_paths.get("PYROKI_ROOT")) / "examples"))
 from retarget_helpers._utils import create_conn_tree  # noqa: E402
 
-_ROOT = Path("/home/peunsu/workspace/robotis_sh5/source/robotis_sh5")
+_ROOT = Path(__file__).resolve().parents[3] / "source" / "robotis_sh5"
 _PROC = _ROOT / "data" / "processed" / "parahome"
 # [cost-cleanup 2026-09-04] 기본 URDF 를 부등식 모드(nomimic)로 전환했습니다. 등식 mimic
 # (J0 = 1.14184 x J1) 은 Shadow 문서의 J0 <= J1 부등식을 J1>0 에서 위반하고, 실측 기울기

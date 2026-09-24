@@ -56,8 +56,9 @@ TASK="Robotis-G1-Shadow-HandPretrain-Direct-v0"
 CLIP_CLASS="${CLIP_CLASS:-single_rigid}"
 NUM_ENVS="${NUM_ENVS:-2048}"
 TIMESTEPS="${TIMESTEPS:-41000}"
-PY="${PY:-/home/peunsu/anaconda3/envs/env_isaaclab/bin/python}"
-PY_PYROKI="${PY_PYROKI:-/home/peunsu/anaconda3/envs/env_pyroki/bin/python}"
+# PY / PY_PYROKI: 환경변수 → 저장소 루트 local_paths.env (git 제외) 순으로 읽는다.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/local_paths.sh"
+require_local_path PY PY_PYROKI
 SKIP_RETARGET="${SKIP_RETARGET:-0}"   # 1 → skip steps 2-3 (env then fails at step 4: no wrist_ref input)
 
 # Set VIDEO=1 to record a training mp4 every VIDEO_INTERVAL steps.
