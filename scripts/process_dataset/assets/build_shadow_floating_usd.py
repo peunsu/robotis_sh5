@@ -68,6 +68,8 @@ from pathlib import Path
 
 from pxr import Gf, Sdf, Usd, UsdPhysics
 
+from instance_link_geometry import check_equivalent, instanced_path, make_instanced
+
 _ROOT = Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data" / "robots" / "G1"
 _SRC = _ROOT / "G1_shadow.usd"
 
@@ -456,6 +458,10 @@ def main() -> int:
         nl, nj = build(s, out, Path(a.src), wrist6=a.wrist6)
         print(f"[build-shadow-float] {s}: 링크 {nl} / 관절 {nj} → {out}")
         verify(out, s, wrist6=a.wrist6)
+        if a.wrist6:   # env 는 링크 형상을 instanceable 로 바꾼 사본을 쓴다
+            n = make_instanced(out, instanced_path(out))
+            check_equivalent(out, instanced_path(out))
+            print(f"[build-shadow-float] {s}: 형상 그룹 {n}개 instanced → {instanced_path(out)}")
     return 0
 
 

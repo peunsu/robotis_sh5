@@ -3,8 +3,9 @@
 Each hand hangs from a fixed anchor at the env origin through six wrist joints
 (tx, ty, tz, rot1, rot2, rot3 — YZX) and is driven by joint PD, like DexMachina.
 Assets: `scripts/process_dataset/assets/build_shadow_floating_usd.py --side both --wrist6`
-→ `shadow_float6_{l,r}.usd`. The G1 `robot0_{s}_wrist` link (zero-DOF, 0.3 kg) is not part of
-the hand; the wrist joints attach directly to `robot0_{s}_palm`.
+→ `shadow_float6_{l,r}.usd`, simulated through the instanced copy from `instance_link_geometry.py`.
+The G1 `robot0_{s}_wrist` link (zero-DOF, 0.3 kg) is not part of the hand; the wrist joints attach
+directly to `robot0_{s}_palm`.
 
 Tendon prerequisite (do not change one without the other)
 ---------------------------------------------------------
@@ -24,6 +25,8 @@ from pathlib import Path
 import isaaclab.sim as sim_utils
 from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
+
+from ..g1_shadow_sonic_residual.g1_shadow_sonic_residual_env_cfg import instanced_usd
 
 _ROBOTS = Path(__file__).resolve().parents[4] / "data" / "robots" / "G1"
 
@@ -121,7 +124,7 @@ def shadow_float6_cfg(side: str, prim_path: str) -> ArticulationCfg:
     return ArticulationCfg(
         prim_path=prim_path,
         spawn=sim_utils.UsdFileCfg(
-            usd_path=str(usd),
+            usd_path=str(instanced_usd(usd)),
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,

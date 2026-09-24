@@ -17,7 +17,18 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data"
-_ROBOT_USD = str(_DATA_DIR / "robots" / "G1" / "G1_shadow.usd")
+
+
+def instanced_usd(src: Path) -> Path:
+    """링크 형상을 instanceable 로 바꾼 시뮬레이션용 사본 `<이름>_inst.usd` (원본은 오프라인 도구용)."""
+    inst = src.with_name(f"{src.stem}_inst{src.suffix}")
+    if not inst.exists() or (src.exists() and inst.stat().st_mtime < src.stat().st_mtime):
+        raise FileNotFoundError(f"{inst} 이 없거나 {src.name} 보다 오래됐습니다 — "
+                                f"scripts/process_dataset/assets/instance_link_geometry.py 를 실행하세요")
+    return inst
+
+
+_ROBOT_USD = str(instanced_usd(_DATA_DIR / "robots" / "G1" / "G1_shadow.usd"))
 
 
 # 추적 몸 키포인트: ParaHome 관절 인덱스 → G1 링크

@@ -409,6 +409,9 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
         acc_bind = torch.zeros((), dtype=torch.long, device=_dev)
         acc_lr_max = torch.full((), -math.inf, device=_dev)
         acc_lr_min = torch.full((), math.inf, device=_dev)
+        # 그래디언트 유한성 판정 버퍼 (아래 L4). 텐서마다 CPU 로 묻는 대신 한 커널로 모두 본다.
+        _found_inf = torch.zeros(1, device=_dev)
+        _one = torch.ones((), device=_dev)
 
         for epoch in range(a.cfg.learning_epochs):
             kl_divergences = []
@@ -511,10 +514,15 @@ def _patch_dual_clip(agent, c: float = 3.0) -> None:
 
                 # 그래디언트 유한성 — 클리핑 이전에 본다. 하나라도
                 # 비유한이면 스텝 전체를 버린다 (클리핑은 NaN 을 퍼뜨릴 뿐 지우지 못한다).
+                # GradScaler 가 쓰는 foreach 커널 한 번으로 텐서 21개를 보고 CPU 동기화는 한 번만 한다
+                # (텐서별 isfinite().all() 이면 미니배치마다 21번). 그래디언트에 1.0 을 곱하므로 값은 비트 그대로다.
                 _gp = [q for q in itertools.chain(a.policy.parameters(), a.value.parameters())
                        if q.grad is not None] if a.policy is not a.value else \
                       [q for q in a.policy.parameters() if q.grad is not None]
-                if _gp and not all(torch.isfinite(q.grad).all() for q in _gp):
+                if _gp:
+                    _found_inf.zero_()
+                    torch._amp_foreach_non_finite_check_and_unscale_([q.grad for q in _gp], _found_inf, _one)
+                if _gp and _found_inf.item():
                     a.optimizer.zero_grad(set_to_none=True)
                     _nf_skipped += 1
                     continue
