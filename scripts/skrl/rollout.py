@@ -384,8 +384,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _is_g1 = "Locomanip" in (args_cli.task or "")
     # 떠 있는 손 사전학습(stage 1)도 같은 계보라 _errs 를 같은 키로 노출합니다. 다만 SONIC 관련
     # 코드(--zero_zres, joint-dump 의 a_sonic/골반)에는 걸리지 않아야 하므로 별 플래그로 둡니다.
-    #   e_j(키포인트) = _errs["body"] 인데, 손 env 에서는 몸통이 없어 그 항이 palm 2개의
-    #   추종 오차로 재정의돼 있습니다 — 즉 손 평가에서 e_j_cm 은 "손목 위치 오차"입니다.
+    #   e_j(키포인트) = g1 은 _errs["body"], 손 env 는 몸통이 없어 _errs["wrist_pos"](palm 2개의 추종 오차)
+    #   입니다 — 즉 손 평가에서 e_j_cm 은 "손목 위치 오차"입니다.
     _is_hand = "HandPretrain" in (args_cli.task or "")
     _has_errs = _is_g1 or _is_hand
     if _is_grasp:
@@ -576,7 +576,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # them as _last_*_err buffers. e_j (keypoint) uses g1's whole-body error.
         if _has_errs:
             _e = actual_env._errs
-            _ope, _ore, _kpe, _fte = _e["obj_pos"], _e["obj_rot"], _e["body"], _e["ft"]
+            _ope, _ore, _fte = _e["obj_pos"], _e["obj_rot"], _e["ft"]
+            _kpe = _e["wrist_pos"] if _is_hand else _e["body"]
         else:
             _ope, _ore = actual_env._last_obj_pos_err, actual_env._last_obj_rot_err
             _kpe, _fte = actual_env._last_kpts_err_raw, actual_env._last_ft_raw_err

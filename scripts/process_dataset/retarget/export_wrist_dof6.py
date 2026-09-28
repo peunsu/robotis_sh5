@@ -64,13 +64,16 @@ Usage
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
-_PROC = (Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data"
-         / "processed" / "parahome")
+sys.path.append(str(Path(__file__).resolve().parents[1] / "dataset"))   # dataset_paths.py
+import dataset_paths  # noqa: E402
+
+_PROC = dataset_paths.processed_root("parahome")   # main 이 --dataset 으로 바꾼다
 # build_shadow_floating_usd.py 의 _W6_ROT_SEQ 와 반드시 일치해야 합니다. 불일치하면 pose 가
 # 조용히 틀어지므로, 아래 _verify_against_asset() 이 에셋에서 읽어 대조합니다.
 _ROT_SEQ = "YZX"
@@ -167,10 +170,13 @@ def convert(clip: str, cls: str = "single_rigid", overwrite: bool = False) -> st
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
     ap.add_argument("--clip", default="", help="비우면 모든 클립")
     ap.add_argument("--class", dest="cls", default="", help="비우면 모든 클래스")
     ap.add_argument("--overwrite", action="store_true")
     a = ap.parse_args()
+    global _PROC
+    _PROC = dataset_paths.processed_root(a.dataset)
 
     print(f"[export-wrist-dof6] 회전 규약 {_ROT_SEQ}, {_verify_against_asset()}")
     if a.clip:

@@ -66,8 +66,10 @@ import local_paths  # noqa: E402
 sys.path.insert(0, str(Path(local_paths.get("PYROKI_ROOT")) / "examples"))
 from retarget_helpers._utils import create_conn_tree  # noqa: E402
 
+sys.path.append(str(Path(__file__).resolve().parents[1] / "dataset"))   # dataset_paths.py
+import dataset_paths  # noqa: E402
+
 _ROOT = Path(__file__).resolve().parents[3] / "source" / "robotis_sh5"
-_PROC = _ROOT / "data" / "processed" / "parahome"
 # [cost-cleanup 2026-09-04] 기본 URDF 를 부등식 모드(nomimic)로 전환했습니다. 등식 mimic
 # (J0 = 1.14184 x J1) 은 Shadow 문서의 J0 <= J1 부등식을 J1>0 에서 위반하고, 실측 기울기
 # 0.913 이 역수 r2/r1 = 0.87578 에 가까워 multiplier 가 뒤집혔을 가능성이 높습니다.
@@ -238,7 +240,6 @@ _TENDON_GEAR = 0.00805 / 0.00705            # = 1.14184, USD physxTendon gearing
 _HOLD_ZERO = [f"robot0_{s}_{f}J0" for s in "lr" for f in ("FF", "MF", "RF", "LF")]
 
 # ---- Phase 2b object-contact grasp: fingertip PAD (distal body + offset) ↔ object surface ----------
-_RAW_SCAN = _ROOT / "data" / "raw" / "parahome" / "data" / "scan"
 # fingertip_pad_pos order (CLAUDE.md): LEFT[th,ff,mf,rf,lf] then RIGHT[th,ff,mf,rf,lf].
 # each entry = (human_pad_idx, side, distal-finger)
 _FT_PADS = [(base + j, side, fg) for side, base in (("l", 0), ("r", 5))
@@ -313,10 +314,11 @@ def _quat2R(wxyz):
                       [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]], onp.float64)
 
 
-def _contact_signal(ftpad, obj_base, obj_name):
+def _contact_signal(ftpad, obj_base, mesh_path):
     """Per-frame/fingertip grasp-contact mask (F,10), matching the RL env: (object being manipulated:
     linvel/angvel over threshold) AND (fingertip pad near the object surface). Uses the ParaHome scan
-    mesh nearest-vertex relative gate; falls back to object-centroid distance if the mesh is absent."""
+    mesh nearest-vertex relative gate; falls back to object-centroid distance if the mesh is absent.
+    mesh_path = 물체 좌표계 메시 (dataset_paths.object_mesh)."""
     F = len(ftpad)
     op = obj_base[:, :3]; oq = obj_base[:, 3:7]
     lv = onp.zeros_like(op); lv[:-1] = (op[1:] - op[:-1]) * _FPS
@@ -324,7 +326,7 @@ def _contact_signal(ftpad, obj_base, obj_name):
     dotq = onp.abs((oq[:-1] * oq[1:]).sum(-1)).clip(0, 1)
     ang = onp.zeros(F); ang[:-1] = 2 * onp.arccos(dotq) * _FPS
     vel = (spd > _OBJ_LINVEL_TH) | (ang > _OBJ_ANGVEL_TH)
-    src = _RAW_SCAN / obj_name / "simplified" / "base.obj"
+    src = Path(mesh_path)
     if src.exists():
         m = trimesh.load(str(src), process=False, force="mesh")
         V = onp.asarray(m.vertices, onp.float64)
@@ -504,8 +506,12 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
         T_wl = vv[v_root] @ jaxlie.SE3(robot.forward_kinematics(cfg=vv[v_cfg]))
         off = vv[v_off]
         lpos = T_wl.translation()[left_foot_idx] + off; rpos = T_wl.translation()[right_foot_idx] + off
-        lz = T_wl.rotation().as_matrix()[left_foot_idx][2, 2]
-        rz = T_wl.rotation().as_matrix()[right_foot_idx][2, 2]
+        # 발 두 개의 쿼터니언만 골라 회전행렬로 바꾼다 (값은 78 링크 전체를 바꾼 뒤 고르는 것과 같다).
+        # 전체를 as_matrix 하면 XLA(jax 0.10.2) priority-fusion 이 그 정규화와 [2,2] 슬라이스·concat 을 Triton
+        # fusion 하나로 묶는데, 일부 프레임 수(F=232, 233)에서 Triton 코드 생성이 scf.if 분기 모양 불일치로 실패한다.
+        _R = T_wl.rotation()
+        lz = jaxlie.SO3(_R.wxyz[left_foot_idx]).as_matrix()[2, 2]
+        rz = jaxlie.SO3(_R.wxyz[right_foot_idx]).as_matrix()[2, 2]
         # [floor-sq-test 2026-09-04] 예제 12 는 위치 잔차에 제곱을 넣습니다: is_contact*(pos-kp)**2.
         # 최소제곱이 다시 제곱하므로 실질 4제곱이라 작은 오차는 거의 방치하고 큰 이탈만 강하게
         # 당깁니다(오차 1 cm 에서 선형의 1/100, 10 cm 에서 10배). W_FLOORSQ=1 로 그 형태를 씁니다.
@@ -703,6 +709,18 @@ def solve(robot, robot_coll, heightmap, keypoints, b_para, b_link, b_mask, a_par
             var_root.with_value(jaxlie.SE3(_pin_root)),
             var_scale.with_value(jnp.ones((T, nb, nb))),
             var_offset.with_value(_pin_off),
+        ])
+
+    if init_vals is None:
+        # 루트를 사람 골반 자세(root_R_target, 골반 관절)에서 출발시킨다. 기본값(원점·단위 회전)에서 출발하면 결과가
+        # 사람이 서 있는 방향(월드 요)에 따라 달라진다 — GRAB 을 요 −45° 돌리자 8클립 중 7개에서 오른손 palm 이 한
+        # 프레임에 100~173° 뒤집혔고, 이 초기화로 회전 전과 같은 해로 돌아왔다(2026-09-25). 나머지 변수는 기본값이다.
+        init_vals = jaxls.VarValues.make([
+            var_joints.with_value(jnp.tile(var_joints.default_factory()[None], (T, 1))),
+            var_root.with_value(jaxlie.SE3.from_rotation_and_translation(
+                jaxlie.SO3.from_matrix(jnp.asarray(root_R_target)), jnp.asarray(keypoints[:, 0, :]))),
+            var_scale.with_value(jnp.ones((T, nb, nb))),
+            var_offset.with_value(jnp.zeros((1, 3))),
         ])
 
     prob = jaxls.LeastSquaresProblem(
@@ -926,6 +944,7 @@ def _stage3_run(args, robot, robot_coll, heightmap, an, joints, root, F, pairs, 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
     ap.add_argument("--clip", default="s100_seg00_pan")
     ap.add_argument("--class", dest="cls", default="single_rigid")
     # 1단계(떠 있는 양손) 롤아웃 hand_traj_best.npz 를 주면 3단계를 추가로 풉니다(아래 STAGE 3).
@@ -933,12 +952,13 @@ def main():
     ap.add_argument("--stage1_reuse", type=int, default=1,
                     help="[stage1-hand] 1 = 기존 trajectory_pyroki.npz 를 1·2단계 결과로 재사용(재계산 생략)")
     args = ap.parse_args()
+    proc = dataset_paths.processed_root(args.dataset)
 
     urdf = yourdfpy.URDF.load(str(_URDF))
     robot = pk.Robot.from_urdf(urdf)
     robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
-    sm = onp.load(_PROC / "smplx" / args.cls / args.clip / "0" / "trajectory.npz", allow_pickle=True)
+    sm = onp.load(proc / "smplx" / args.cls / args.clip / "0" / "trajectory.npz", allow_pickle=True)
     # SMPL-X 관절(55)을 씁니다. 없으면 parahome.py 를 --overwrite 로 다시 돌려야
     # 합니다(smplx_joints 키 추가). 옛 ParaHome 스트림으로 되돌리려면 joint_positions 로.
     if "smplx_joints" not in sm.files:
@@ -987,7 +1007,7 @@ def main():
 
     # Load the Option-A per-link contact map ONCE — used for BOTH the fingertips (distal) and the wrap
     # links, so the retarget's contact source matches the RL env exactly (single hand_contact.npz).
-    hc_path = _PROC / "smplx" / args.cls / args.clip / "0" / "hand_contact.npz"
+    hc_path = proc / "smplx" / args.cls / args.clip / "0" / "hand_contact.npz"
     hc = onp.load(hc_path, allow_pickle=True) if hc_path.exists() else None
     hc_names = [str(n) for n in hc["link_names"]] if hc is not None else []
 
@@ -1001,7 +1021,8 @@ def main():
         ft_mask = hc["mask"][:, _di].astype(onp.float32)                 # (F,10) Option-A distal mask
     else:
         ft_target = ft_pad                                               # fallback: human pad
-        ft_mask = (_contact_signal(ft_pad.astype(onp.float64), sm[bk[0]].astype(onp.float64), obj_name)
+        ft_mask = (_contact_signal(ft_pad.astype(onp.float64), sm[bk[0]].astype(onp.float64),
+                                   dataset_paths.object_mesh(args.dataset, obj_name))
                    if obj_name else onp.zeros((F, 10), onp.float32))
     c_idx, c_off, c_margin = list(ft_idx), list(ft_off), list(ft_margin)
     c_target = [ft_target]; c_mask = [ft_mask]                           # lists of (F,·) blocks, concat later
@@ -1205,7 +1226,7 @@ def main():
     heightmap = _flat_heightmap(jp)          # flat z=0 floor spanning the clip
 
     # 기존 결과 재사용이면 1·2단계 solve 를 건너뜁니다.
-    _s3_base = _stage3_load_base(_PROC / "g1_shadow" / args.cls / args.clip / "0" / "trajectory_pyroki.npz", an, F) \
+    _s3_base = _stage3_load_base(proc / "g1_shadow" / args.cls / args.clip / "0" / "trajectory_pyroki.npz", an, F) \
         if (args.stage1_hand and args.stage1_reuse) else None
     t0 = time.time()
     if _s3_base is not None:
@@ -1307,7 +1328,7 @@ def main():
     except Exception as _e:
         print(f"[metric] skipped ({type(_e).__name__}: {_e})")
 
-    out = _PROC / "g1_shadow" / args.cls / args.clip / "0" / f"trajectory_pyroki{os.environ.get('W_OUTSUFFIX', '')}.npz"
+    out = proc / "g1_shadow" / args.cls / args.clip / "0" / f"trajectory_pyroki{os.environ.get('W_OUTSUFFIX', '')}.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
     # Record the column layout with the data. g1_joint_pos is written in `act` order, and the env
     # reads column k into its OWN k-th action joint — an agreement nothing enforced, since `act`

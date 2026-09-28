@@ -35,8 +35,9 @@ import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from parahome_hand_contact import (  # noqa: E402  같은 코어·같은 상수
-    _OBJ_ANGVEL_TH, _OBJ_LINVEL_TH, _PROC, _RAW_SCAN, _quat2R, frame_contacts,
+    _OBJ_ANGVEL_TH, _OBJ_LINVEL_TH, _quat2R, frame_contacts,
 )
+import dataset_paths  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[3]
 _URDF = _ROOT / "source" / "robotis_sh5" / "data" / "robots" / "G1" / "urdf_pyroki" / "g1_shadow_nomimic.urdf"
@@ -86,6 +87,7 @@ def load_link_meshes(urdf_path: str, link_names: list[str]) -> dict[str, np.ndar
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
     ap.add_argument("--hand_traj", required=True, help="1단계 롤아웃 hand_traj_best.npz (link_pos/link_quat 포함)")
     ap.add_argument("--out", default=None, help="출력 경로 (기본: 입력 폴더/hand_contact_stage1.npz)")
     ap.add_argument("--urdf", default=str(_URDF))
@@ -121,7 +123,7 @@ def main() -> None:
     hand_local = [meshes[n] for n in link_names]
     hand_link = np.concatenate([np.full(len(v), i, np.int64) for i, v in enumerate(hand_local)])
     H = int(hand_link.shape[0])
-    obj_mesh = trimesh.load(str(_RAW_SCAN / obj / "simplified" / "base.obj"), process=False, force="mesh")
+    obj_mesh = trimesh.load(str(dataset_paths.object_mesh(args.dataset, obj)), process=False, force="mesh")
     V = np.asarray(obj_mesh.vertices, np.float64)
     VN = np.asarray(obj_mesh.vertex_normals, np.float64)           # object-LOCAL outward normals (사람 맵과 동일)
     print(f"[stage1-contact] {args.hand_traj}\n    롤아웃 {T} 행 @ {fps:.0f} Hz, 물체 {obj} ({len(V)} 정점), "
@@ -212,7 +214,7 @@ def main() -> None:
     # (3) 사람 맵 대비 (손끝 링크)
     clip = str(hd["clip"]) if "clip" in hd.files else ""
     cls = str(hd["clip_class"]) if "clip_class" in hd.files else ""
-    hp = _PROC / "smplx" / cls / clip / "0" / "hand_contact.npz"
+    hp = dataset_paths.processed_root(args.dataset) / "smplx" / cls / clip / "0" / "hand_contact.npz"
     if clip and hp.exists():
         hc = np.load(hp, allow_pickle=True)
         hn = [str(n) for n in hc["link_names"]]

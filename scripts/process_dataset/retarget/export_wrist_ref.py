@@ -29,13 +29,17 @@ Usage
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pinocchio as pin
 
+sys.path.append(str(Path(__file__).resolve().parents[1] / "dataset"))   # dataset_paths.py
+import dataset_paths  # noqa: E402
+
 _ROOT = Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data"
-_PROC = _ROOT / "processed" / "parahome"
+_PROC = dataset_paths.processed_root("parahome")   # main 이 --dataset 으로 바꾼다
 # The inequality-tendon (nomimic) URDF is the current default in retarget_g1_pyroki.py, and it is the
 # one whose joint set matches the 73-column npz. The mimic URDF would drop the 8 J0 columns.
 _URDF = _ROOT / "robots" / "G1" / "urdf_pyroki" / "g1_shadow_nomimic.urdf"
@@ -94,10 +98,13 @@ def export(clip: str, cls: str = "single_rigid", overwrite: bool = False) -> str
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
     ap.add_argument("--clip", default="all")
     ap.add_argument("--class", dest="cls", default="single_rigid")
     ap.add_argument("--overwrite", action="store_true")
     a = ap.parse_args()
+    global _PROC
+    _PROC = dataset_paths.processed_root(a.dataset)
     clips = ([p.name for p in sorted((_PROC / "g1_shadow" / a.cls).iterdir()) if p.is_dir()]
              if a.clip == "all" else [a.clip])
     for c in clips:

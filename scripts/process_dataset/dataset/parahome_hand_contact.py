@@ -25,7 +25,6 @@ Runs in env_isaaclab (needs smplx + torch + trimesh):
 
 import argparse
 import json
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -33,11 +32,9 @@ import trimesh
 
 import smplx
 
-_SCRIPT_DIR = Path(__file__).resolve().parents[3]
-_DATA = _SCRIPT_DIR / "source" / "robotis_sh5" / "data"
-_PROC = _DATA / "processed" / "parahome"
-_RAW_SCAN = _DATA / "raw" / "parahome" / "data" / "scan"
-_SMPLX_MODEL_DIR = _SCRIPT_DIR / "models_smplx_v1_1" / "models"
+import dataset_paths  # 같은 폴더 (--dataset 별 전처리 루트·물체 메시)
+
+_SMPLX_MODEL_DIR = dataset_paths.SMPLX_MODEL_DIR
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 _FPS = 30.0
@@ -121,6 +118,7 @@ def frame_contacts(hand_w, hand_link, V, VN, R, op, L, gamma, num_contacts, norm
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
     ap.add_argument("--clip", default="s100_seg00_pan")
     ap.add_argument("--class", dest="cls", default="single_rigid")
     ap.add_argument("--gamma", type=float, default=0.015, help="object-vertex→nearest-hand-vertex contact dist (m)")
@@ -132,15 +130,19 @@ def main():
                     help="also require the object to be moving (old behavior); default OFF (DexMachina geometric-only)")
     args = ap.parse_args()
 
-    clip_dir = _PROC / "smplx" / args.cls / args.clip
+    clip_dir = dataset_paths.processed_root(args.dataset) / "smplx" / args.cls / args.clip
     ti = json.load(open(clip_dir / "task_info.json"))
     gender = str(ti.get("gender", "neutral"))
     sm = np.load(clip_dir / "0" / "trajectory.npz", allow_pickle=True)
     F = sm["smplx_body_pose"].shape[0]
 
+    # 체형: GRAB 은 피험자 템플릿 메시(smplx_v_template)를 주고 betas 가 없다 → 템플릿 + betas 0.
+    # ParaHome 은 betas 20개 (템플릿 없음).
+    vtemp = sm["smplx_v_template"].astype(np.float32) if "smplx_v_template" in sm.files else None
+    shape_kw = {"v_template": vtemp} if vtemp is not None else {}
     model = smplx.create(str(_SMPLX_MODEL_DIR), model_type="smplx", gender=gender, use_pca=False,
                          flat_hand_mean=True, num_betas=20, num_expression_coeffs=10, ext="npz",
-                         batch_size=1).to(_DEV)
+                         batch_size=1, **shape_kw).to(_DEV)
 
     # static vertex → robot-link assignment via lbs skinning argmax
     arg = model.lbs_weights.detach().cpu().numpy().argmax(1)      # (V,)
@@ -158,7 +160,8 @@ def main():
     # SMPL-X FK → full vertices (world frame == joint_positions/fingertip_pad_pos)
     T = lambda a: torch.as_tensor(a, dtype=torch.float32, device=_DEV)  # noqa: E731
     go = T(sm["smplx_global_orient"]); bp = T(sm["smplx_body_pose"]); hp = T(sm["smplx_hand_pose"])
-    tr = T(sm["smplx_transl"]); betas = T(sm["smplx_betas"]).reshape(1, -1)
+    tr = T(sm["smplx_transl"])
+    betas = torch.zeros(1, 20, device=_DEV) if vtemp is not None else T(sm["smplx_betas"]).reshape(1, -1)
     verts = np.empty((F, len(hand_v), 3), np.float32)
     z = lambda n, d: torch.zeros(n, d, device=_DEV)  # noqa: E731
     with torch.no_grad():
@@ -178,7 +181,7 @@ def main():
     dotq = np.abs((oq[:-1] * oq[1:]).sum(-1)).clip(0, 1)
     ang = np.zeros(F); ang[:-1] = 2 * np.arccos(dotq) * _FPS
     vel = (spd > _OBJ_LINVEL_TH) | (ang > _OBJ_ANGVEL_TH)
-    mesh = trimesh.load(str(_RAW_SCAN / obj_name / "simplified" / "base.obj"), process=False, force="mesh")
+    mesh = trimesh.load(str(dataset_paths.object_mesh(args.dataset, obj_name)), process=False, force="mesh")
     V = np.asarray(mesh.vertices, np.float64)
     VN = np.asarray(mesh.vertex_normals, np.float64)                # (n_objv,3) object-LOCAL outward normals
 

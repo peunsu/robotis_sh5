@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 
+import dataset_paths  # 같은 폴더
 import gear_sonic
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ from gear_sonic.trl.utils.torch_transform import (
 )
 from gear_sonic.isaac_utils.rotations import remove_smpl_base_rot, smpl_root_ytoz_up
 
-_PROC = str(Path(__file__).resolve().parents[3] / "source" / "robotis_sh5" / "data" / "processed" / "parahome")
+_PROC = str(dataset_paths.processed_root("parahome"))   # __main__ 이 --dataset 으로 바꾼다
 # 설치된 gear_sonic 패키지(GR00T-WholeBodyControl checkout) 안의 데이터 — 코드와 같은 checkout 에서 읽는다.
 _HJINFO = os.path.join(os.path.dirname(gear_sonic.__file__), "data", "human", "human_joints_info.pkl")
 SRC_FPS = 30.0
@@ -133,8 +133,10 @@ def process_clip(clip: str, cls: str, overwrite: bool = False):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
     p.add_argument("--clip", default="s100_seg00_pan")
     p.add_argument("--class", dest="cls", default="single_rigid")
     p.add_argument("--overwrite", action="store_true")
     a = p.parse_args()
+    _PROC = str(dataset_paths.processed_root(a.dataset))
     process_clip(a.clip, a.cls, a.overwrite)
