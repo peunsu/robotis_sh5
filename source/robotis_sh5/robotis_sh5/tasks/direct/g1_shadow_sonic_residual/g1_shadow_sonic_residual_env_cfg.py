@@ -282,6 +282,10 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
 
     # ---- hand_pretrain(1단계) 결과 사용 ----
     # ablation 은 sonic_hand_residual_base 와 아래 세 플래그를 함께 바꾼다.
+    # 1단계 손 궤적의 출처 (2026-09-29). "hand_pretrain": RL 떠 있는 손 롤아웃(rollout.py --dump_hand_traj).
+    # "mppi": robotis_sh5_monodex 의 MuJoCo MPPI refine (export_mppi_hand_traj.py). 파일에 기록된 source 와
+    # 다르면 로드를 거부한다 — 두 출처는 같은 파일 이름·스키마를 쓰므로 트리를 잘못 가리켜도 조용히 읽힌다.
+    stage1_hand_source: str = "hand_pretrain"  # "hand_pretrain" | "mppi"
     hand_kpt_from_hand_pretrain: bool = True  # 손·손목 목표를 hand_pretrain 롤아웃 키포인트로
     hand_pretrain_subdir: str = "g1_shadow_hand_pretrain"  # data/processed/parahome/ 아래 hand_pretrain 결과 트리
     hand_pretrain_traj_file: str = "hand_traj_best.npz"
@@ -363,6 +367,11 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     context_radius: float = 1.0  # m, 물체 궤적 주변에서 맥락 물체를 고르는 XY 반경
     context_support_radius: float = 1.5  # m, 물체 아래 지지물을 찾는 XY 반경
     context_z_auto: bool = True  # 스폰 뒤 측정한 만큼 맥락 물체를 내려 물체가 레퍼런스 높이에 놓이게 한다
+    # 조작 물체의 질량 출처 (2026-09-29). "usd": 변환기가 USD 에 구운 질량(기본 0.5 kg)을 그대로.
+    # "density": USD 질량을 0 으로 지우고 object_density 를 준다 — PhysX 가 충돌체 부피 × 밀도로 질량을 낸다
+    # (USD MassAPI 는 mass > 0 이면 density 보다 우선하므로 mass 를 0 으로 지워야 density 가 쓰인다).
+    object_mass_source: str = "usd"  # "usd" | "density"
+    object_density: float = 1000.0  # kg/m^3, object_mass_source="density" 일 때 (monodex MuJoCo 기본값과 같음)
 
     # ---- RSI / 시작 프레임 샘플링 ----
     use_rsi: bool = True  # False 면 항상 frame 0 레퍼런스 자세에서 시작
@@ -417,7 +426,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
 
     # ---- CWS 접촉 렌치 보상 ----
     contact_reward_mode: str = "cws"  # "cws" | "force" | "both"
-    rew_cws: float = 0.50  # CWS 보상 가중치
+    rew_cws: float = 1.00 # 0.50  # CWS 보상 가중치
     cws_beta: float = 0.1  # 로봇 렌치가 사람의 (1±beta)배 안이면 만점
     cws_v: float = 0.1  # 부족/과잉 벌점 세기
     cws_n_dir: int = 512  # 비교 방향 수 (논문 값)
@@ -451,3 +460,24 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     retarget_file: str = "trajectory_pyroki.npz"
     clip_class: str = "single_rigid"  # single_rigid | single_articulated | ...
     clip_name: str = ""  # "" 이면 clip_class 의 첫 클립
+
+
+@configclass
+class G1ShadowSonicResidualMppiEnvCfg(G1ShadowSonicResidualEnvCfg):
+    """1단계를 RL hand pretrain 대신 MPPI hand refine 으로 (Robotis-G1-Shadow-Locomanip-SonicResidual-Mppi-Direct-v0).
+
+    MPPI (robotis_sh5_monodex, MuJoCo Warp) 가 떠 있는 Shadow 양손으로 물체를 실제로 옮긴 궤적을
+    scripts/process_dataset/retarget/export_mppi_hand_traj.py 가 hand_traj_best.npz 로 내보낸다
+    (scripts/benchmark/parahome/train_sequences_sonic_residual_mppi.sh). 기본 cfg 와 다른 점:
+      hand_pretrain_subdir     MPPI 결과 트리 g1_shadow_hand_mppi
+      sonic_hand_residual_base 실제 관절각(finger_qpos). MPPI 의 finger_target 은 MuJoCo 위치 액추에이터
+                               (강성 300) 목표라, 이 env 의 손가락 PD(강성 1.0) 목표와 뜻이 다르다.
+      object_mass_source       밀도 1000 kg/m^3 — MPPI 가 물체 질량을 이 밀도로 낸다 (USD 의 0.5 kg 이 아니다).
+    """
+
+    stage1_hand_source: str = "mppi"
+    hand_pretrain_subdir: str = "g1_shadow_hand_mppi"
+    sonic_hand_residual_base: str = "hand_pretrain_qpos"
+    object_mass_source: str = "density"
+    object_density: float = 1000.0
+

@@ -25,3 +25,13 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_pretrain_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Robotis-G1-Shadow-Locomanip-SonicResidual-Mppi-Direct-v0",
+    entry_point=f"{__name__}.g1_shadow_sonic_residual_env:G1ShadowSonicResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_shadow_sonic_residual_env_cfg:G1ShadowSonicResidualMppiEnvCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)

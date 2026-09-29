@@ -72,7 +72,7 @@ VIDEO_INTERVAL="${VIDEO_INTERVAL:-2000}"
 
 # Same clips as train_sequences_sonic_residual.sh, deliberately: stage 1's output feeds stage 2,
 # so the two stages must cover the same set or the comparison is between different data.
-# 8 objects x 1 clip, picked by measurement (scripts/benchmark/grab/select_clips.py) from the 1335 GRAB
+# 20 objects x 1 clip, picked by measurement (scripts/benchmark/grab/select_clips.py) from the 1335 GRAB
 # clips — the ParaHome criteria plus a G1 reach limit (G1 is ~1.3 m tall; GRAB tables are set for
 # 1.6-1.8 m people, table tops 0.72-1.16 m):
 #   single-hand intent - no pass (handing to someone) / offhand (hand-to-hand transfer)
@@ -81,10 +81,16 @@ VIDEO_INTERVAL="${VIDEO_INTERVAL:-2000}"
 #   manipulated        - the object travels > 0.10 m;  in place - the pelvis travels < 0.5 m
 #   trainable length   - 120-320 frames at 30 fps (grab.py keeps every 4th frame of the 120 FPS capture)
 #   G1 reach           - table top <= 0.95 m at frame 0 and the object centre never above 1.35 m
-# 67 clips pass. One per object in a fixed everyday-object order, unused subjects first, longest grasp.
-# The list is FIXED: it was measured on the untrimmed captures, and after grab.py's contact trim (first hand
-# contact - 0.5 s .. last + 0.5 s) these 8 are 154-213 frames. Re-running select_clips.py now measures the
-# trimmed clips and may pick a different set.
+#   retarget           - not in select_clips.py RETARGET_REJECTED: a picked clip is dropped if its retarget
+#                        turns the palm > 45 deg in one frame or leaves a hand at det(J) < 0.2 on > 15% of
+#                        frames (the OMOMO rule); none of the 12 added clips was
+# One per object in select_clips.py PREFERRED order (everyday objects, then handheld tools, then toys and
+# figurines, then geometric primitives), unused subjects first, longest grasp.
+# The first 8 are FIXED (select_clips.py FIXED): they were measured on the untrimmed captures, and after
+# grab.py's contact trim (first hand contact - 0.5 s .. last + 0.5 s) they are 154-213 frames. The other 12
+# (added 2026-09-28) were measured on the trimmed clips, where 121 clips pass: 124-318 frames.
+# (Re-measured on the trimmed clips, FIXED s9_teapot_pour_2 reads 0.849 m on "standing", 0.8 mm under the
+# 0.85 m bar: the trim starts the every-4th-frame sampling at a different 120 FPS frame. Kept.)
 CLIPS=(
     "s1_cup_pour_1"
     "s1_hammer_use_1"
@@ -94,6 +100,18 @@ CLIPS=(
     "s1_fryingpan_cook_2"
     "s9_teapot_pour_2"
     "s10_stapler_staple_2"
+    "s6_bowl_drink_1"
+    "s2_flashlight_on_1"
+    "s3_apple_lift"
+    "s1_camera_browse_1"
+    "s1_toothpaste_squeeze_1"
+    "s10_scissors_use_1"
+    "s8_mouse_lift"
+    "s9_watch_set_2"
+    "s5_gamecontroller_play_1"
+    "s3_stamp_lift"
+    "s7_eyeglasses_clean_1"
+    "s10_headphones_lift"
 )
 [[ -n "${CLIPS_OVERRIDE:-}" ]] && read -ra CLIPS <<< "${CLIPS_OVERRIDE}"
 

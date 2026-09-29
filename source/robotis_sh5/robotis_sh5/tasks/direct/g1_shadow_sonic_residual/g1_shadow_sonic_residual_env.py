@@ -465,10 +465,15 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         if not os.path.exists(usd):
             return   # converted USD not built yet → object stays inert (robot-only kinematic path)
         p0 = self._np_obj_base[0]
+        # cfg.object_mass_source: "usd" 는 USD 에 구운 질량 그대로, "density" 는 USD 질량을 지우고 밀도로 (cfg 주석)
+        if cfg.object_mass_source not in ("usd", "density"):
+            raise ValueError(f"object_mass_source must be 'usd' or 'density', got {cfg.object_mass_source!r}")
+        mass_props = (sim_utils.MassPropertiesCfg(mass=0.0, density=float(cfg.object_density))
+                      if cfg.object_mass_source == "density" else None)
         self._object_cfg = RigidObjectCfg(
             prim_path="/World/envs/env_.*/Object",
             spawn=sim_utils.UsdFileCfg(
-                usd_path=usd, activate_contact_sensors=True,
+                usd_path=usd, activate_contact_sensors=True, mass_props=mass_props,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     solver_position_iteration_count=8, solver_velocity_iteration_count=4,
                     # 겹침 해소 속도 상한. 0.1 로 낮췄다가(2026-08-14)
@@ -554,11 +559,18 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         cands += sorted(glob.glob(os.path.join(base_dir, "evaluation_*", cfg.hand_pretrain_traj_file)),
                         key=os.path.getmtime, reverse=True)
         path = next((p for p in cands if os.path.exists(p)), None)
+        want_src = str(getattr(cfg, "stage1_hand_source", "hand_pretrain"))
         if path is None:
-            print(f"[stage1-hand] 1단계 롤아웃 파일이 없습니다 ({base_dir}/[evaluation_*/]{cfg.hand_pretrain_traj_file}) "
+            print(f"[stage1-hand] 1단계({want_src}) 파일이 없습니다 ({base_dir}/[evaluation_*/]{cfg.hand_pretrain_traj_file}) "
                   f"— 손 목표는 SMPL-X 그대로, 잔차 기준은 레퍼런스로 둡니다.")
             return
         hd = np.load(path, allow_pickle=True)
+        # 출처 확인 (cfg.stage1_hand_source 주석). RL 덤프에는 source 키가 없다.
+        src = str(hd["source"]) if "source" in hd.files else "hand_pretrain"
+        if src != want_src:
+            raise ValueError(f"[stage1-hand] {path} 의 출처가 {src!r} 인데 cfg.stage1_hand_source={want_src!r} 입니다 "
+                             f"— hand_pretrain_subdir 가 다른 트리를 가리키고 있습니다.")
+        print(f"[stage1-hand] 1단계 손 궤적: {path} (출처 {src})")
         N = int(self._ref_len)
         fps_env = 1.0 / float(cfg.ref_dt)
         s1_fps = float(hd["control_fps"])
@@ -815,6 +827,18 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         origin = "npz joint_names" if self._ref_joint_names is not None else "g1_shadow_joint_order.json"
         print(f"[ref-joints] retarget columns remapped by name from {origin}: "
               f"{n_moved}/{len(perm)} slots moved")
+
+    def _log_object_mass(self) -> None:
+        """PhysX 가 실제로 쓰는 조작 물체 질량·관성을 한 줄로 (cfg.object_mass_source 확인용)."""
+        if not self._has_object:
+            return
+        view = self._object.root_physx_view
+        m = float(view.get_masses()[0].reshape(-1)[0])
+        inert = view.get_inertias()[0].reshape(-1)[[0, 4, 8]].tolist()
+        src = (f"density {self.cfg.object_density:g} kg/m^3" if self.cfg.object_mass_source == "density"
+               else "USD mass")
+        print(f"[object-mass] {self._obj_name}: {m:.4f} kg from {src}; "
+              f"inertia diag {[round(x, 6) for x in inert]} kg m^2")
 
     def _solve_spawn_declear(self) -> None:
         """Per-frame spawn lift that clears the object out of whatever it is resting inside.
@@ -1314,6 +1338,7 @@ class G1ShadowSonicResidualEnv(DirectRLEnv):
         # ---- state cache + RSI (222) ----
         # [0]reward [1:14]root(pos,quat,linvel,angvel) [14:27]obj(같은 순서) [27:92]jpos [92:157]jvel [157:222]smoothed
         self._STATE_DIM = 222
+        self._log_object_mass()
         # steps physics; everything it touches (reference arrays,
         # object, robot, scene) already exists by here.
         self._solve_spawn_declear()

@@ -98,6 +98,18 @@ CLIPS=(
     "s1_fryingpan_cook_2"
     "s9_teapot_pour_2"
     "s10_stapler_staple_2"
+    "s6_bowl_drink_1"
+    "s2_flashlight_on_1"
+    "s3_apple_lift"
+    "s1_camera_browse_1"
+    "s1_toothpaste_squeeze_1"
+    "s10_scissors_use_1"
+    "s8_mouse_lift"
+    "s9_watch_set_2"
+    "s5_gamecontroller_play_1"
+    "s3_stamp_lift"
+    "s7_eyeglasses_clean_1"
+    "s10_headphones_lift"
 )
 [[ -n "${CLIPS_OVERRIDE:-}" ]] && read -ra CLIPS <<< "${CLIPS_OVERRIDE}"
 

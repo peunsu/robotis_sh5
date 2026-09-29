@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# evaluate_sequences_sonic_residual.sh — Roll out each trained SONIC-residual
-# GRAB G1+Shadow loco-manip clip and aggregate metrics.
+# evaluate_sequences_sonic_residual_mppi.sh — Roll out each SONIC-residual clip trained on the MPPI
+# hand refine (train_sequences_sonic_residual_mppi.sh) and aggregate metrics.
 #
-# Mirrors evaluate_sequences.sh but targets the SONIC-residual task
-# (Robotis-G1-Shadow-Locomanip-SonicResidual-Direct-v0) and the tree written by
-# train_sequences_sonic_residual.sh. rollout.py never arms the RSI warm-start, so
+# evaluate_sequences_sonic_residual.sh for the MPPI stage-1 variant: task
+# Robotis-G1-Shadow-Locomanip-SonicResidual-Mppi-Direct-v0 (the env loads the same MPPI hand targets,
+# residual base and density object mass as in training) and the g1_shadow_sonic_residual_mppi tree.
+# Everything below is unchanged from that script. rollout.py never arms the RSI warm-start, so
 # evaluation runs the policy with vanilla frame-0 resets (same protocol as the
 # other variants). The frozen SONIC base + the per-clip sonic_smpl_50fps.npz /
 # trajectory_pyroki.npz produced during training are consumed by the env at load;
 # no extra prep here (evaluation is env_isaaclab only — no PyRoki needed).
 #
 # For each clip:
-#   1. Load agent.pt from the g1_shadow_sonic_residual tree.
+#   1. Load agent.pt from the g1_shadow_sonic_residual_mppi tree.
 #   2. rollout.py → metrics.csv (obj pos/rot + whole-body kpt + fingertip errors).
 #   3. After all clips, evaluate.bash aggregates per-method CSVs.
 #
 # Output tree (evaluate.bash compatible — clip_name lands at path parts[1]):
-#   data/processed/grab/g1_shadow_sonic_residual/<clip_class>/<clip_name>/0/
+#   data/processed/parahome/g1_shadow_sonic_residual_mppi/<clip_class>/<clip_name>/0/
 #       agent.pt / pretrain.pt
 #       evaluation_ep_le_<TIMESTEPS>/metrics.csv
-# Aggregates → data/processed/grab/g1_shadow_sonic_residual/method{1,2,3}.csv
+# Aggregates → data/processed/parahome/g1_shadow_sonic_residual_mppi/method{1,2,3}.csv
 #
 # Which clips run: edit CLIPS=(...) (comment lines to filter) or CLIPS_OVERRIDE="a b c".
-# Keep in sync with train_sequences_sonic_residual.sh.
+# Keep in sync with train_sequences_sonic_residual_mppi.sh.
 # Env vars: FORCE=1 (re-run rollouts), CLIP_CLASS=..., CLIPS_OVERRIDE="a b c",
 #   N_ROLLOUTS, TIMESTEPS (dir tag only), VIDEO=1, PY=<env_isaaclab python>,
 #   SEED=42, TWO_CAM=1, SBS=1, VIDEO_RESOLUTION=WxH.
@@ -46,15 +47,11 @@
 # NOTE the two views are produced by two RENDER PASSES, not by two camera sensors: constructing an
 # isaaclab.sensors.Camera sets the process-global /isaaclab/render/rtx_sensors flag, which moves the
 # sole sim.render() into the physics loop and would retime the "current" pane.
-#
-# GRAB variant of scripts/benchmark/parahome/evaluate_sequences_sonic_residual.sh: same steps, but the data is
-# data/processed/grab (scripts/process_dataset/dataset/grab.py + assets/grab_convert_obj_to_usd.py),
-# every per-clip script gets --dataset grab and train.py / rollout.py get env.dataset_root=<processed/grab>.
 # =============================================================================
 set -euo pipefail
 
 # ── User configuration ────────────────────────────────────────────────────────
-TASK="Robotis-G1-Shadow-Locomanip-SonicResidual-Direct-v0"
+TASK="Robotis-G1-Shadow-Locomanip-SonicResidual-Mppi-Direct-v0"
 CLIP_CLASS="${CLIP_CLASS:-single_rigid}"
 N_ROLLOUTS="${N_ROLLOUTS:-32}"
 TIMESTEPS="${TIMESTEPS:-60000}"   # directory-naming tag only (evaluation_ep_le_<TIMESTEPS>)
@@ -72,29 +69,40 @@ OLD_METRICS="metrics_camold.csv"   # pass-2 CSV = determinism receipt (invisible
 RES_ARGS=(); [[ -n "${VIDEO_RESOLUTION:-}" ]] && RES_ARGS=(--video_resolution "${VIDEO_RESOLUTION}")
 
 # Clip names to evaluate. Comment out lines to filter (like the hocap scripts). Keep this list in
-# sync with train_sequences_sonic_residual.sh. Or override with CLIPS_OVERRIDE="clipA clipB".
-# Must match train_sequences_sonic_residual.sh — see the selection criteria documented there.
+# sync with train_sequences_sonic_residual_mppi.sh. Or override with CLIPS_OVERRIDE="clipA clipB".
 CLIPS=(
-    "s1_cup_pour_1"
-    "s1_hammer_use_1"
-    "s4_waterbottle_pour_1"
-    "s8_banana_peel_2"
-    "s10_knife_chop_1"
-    "s1_fryingpan_cook_2"
-    "s9_teapot_pour_2"
-    "s10_stapler_staple_2"
-    "s6_bowl_drink_1"
-    "s2_flashlight_on_1"
-    "s3_apple_lift"
-    "s1_camera_browse_1"
-    "s1_toothpaste_squeeze_1"
-    "s10_scissors_use_1"
-    "s8_mouse_lift"
-    "s9_watch_set_2"
-    "s5_gamecontroller_play_1"
-    "s3_stamp_lift"
-    "s7_eyeglasses_clean_1"
-    "s10_headphones_lift"
+    # the first 8 (train_sequences_sonic_residual.sh's set, with RL hand-pretrain results to compare against)
+    "s100_seg00_pan"
+    "s101_seg12_knife"
+    "s101_seg29_pot"
+    "s101_seg30_bowl"
+    "s66_seg26_pan"
+    "s53_seg19_knife"
+    "s152_seg21_pot"
+    "s71_seg27_bowl"
+    # added 2026-09-29: three clips per ParaHome single_rigid object
+    "s12_seg07_book"
+    "s11_seg07_book"
+    "s155_seg11_book"
+    "s126_seg19_bowl"
+    "s109_seg02_cup"
+    "s105_seg21_cup"
+    "s101_seg00_cup"
+    "s197_seg07_cuttingboard"
+    "s145_seg22_cuttingboard"
+    "s198_seg29_cuttingboard"
+    "s117_seg09_kettle"
+    "s113_seg01_kettle"
+    "s207_seg06_kettle"
+    "s125_seg23_knife"
+    "s104_seg18_pan"
+    "s142_seg00_pot"
+    "s44_seg00_potlid"
+    "s1_seg06_potlid"
+    "s92_seg16_potlid"
+    "s123_seg21_salt"
+    "s126_seg14_salt"
+    "s111_seg20_salt"
 )
 # Optional: replace the whole list from the environment (space-separated).
 [[ -n "${CLIPS_OVERRIDE:-}" ]] && read -ra CLIPS <<< "${CLIPS_OVERRIDE}"
@@ -102,8 +110,8 @@ CLIPS=(
 # ── Path setup ────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/grab"
-CHECKPOINT_BASE="${DATA_BASE}/g1_shadow_sonic_residual/${CLIP_CLASS}"
+DATA_BASE="${PROJECT_DIR}/source/robotis_sh5/data/processed/parahome"
+CHECKPOINT_BASE="${DATA_BASE}/g1_shadow_sonic_residual_mppi/${CLIP_CLASS}"
 FORCE="${FORCE:-0}"
 
 # ── Rollout loop ──────────────────────────────────────────────────────────────
@@ -117,18 +125,18 @@ for clip in "${CLIPS[@]}"; do
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "[eval-sonic ${IDX}/${TOTAL}] class=${CLIP_CLASS}  clip=${clip}"
+    echo "[eval-sonic-mppi ${IDX}/${TOTAL}] class=${CLIP_CLASS}  clip=${clip}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [[ ! -f "${CKPT_FILE}" ]]; then
-        echo "[eval-sonic] ERROR: checkpoint not found — run train_sequences_sonic_residual.sh first.  ${CKPT_FILE}"
+        echo "[eval-sonic-mppi] ERROR: checkpoint not found — run train_sequences_sonic_residual_mppi.sh first.  ${CKPT_FILE}"
         continue
     fi
     # Skip the SIMULATION but still let the compose step run on existing mp4s, so a side-by-side can
     # be (re)built without paying for the rollouts again.
     DO_ROLLOUT=1
     if [[ -f "${OUT_DIR}/metrics.csv" && "${FORCE}" -eq 0 ]]; then
-        echo "[eval-sonic] metrics.csv exists — skipping rollouts.  (FORCE=1 to override)"
+        echo "[eval-sonic-mppi] metrics.csv exists — skipping rollouts.  (FORCE=1 to override)"
         DO_ROLLOUT=0
     fi
 
@@ -142,24 +150,24 @@ for clip in "${CLIPS[@]}"; do
         # ── PASS 1/2 — CANONICAL: cfg camera + metrics.csv. No --cam_preset, so the cfg's own
         #    viewer_* fields are untouched and this pass is behaviourally identical to before
         #    (only --seed, previously the argparse default 42, is now explicit).
-        echo "[eval-sonic] pass 1/2 — CURRENT camera (cfg viewer_yaw/elev/look_obj) → ${NEW_PREFIX}-step-0.mp4"
+        echo "[eval-sonic-mppi] pass 1/2 — CURRENT camera (cfg viewer_yaw/elev/look_obj) → ${NEW_PREFIX}-step-0.mp4"
         "${PY}" scripts/skrl/rollout.py \
             --task "${TASK}" --checkpoint "${CKPT_FILE}" \
             --output_dir "${OUT_DIR}" --n_rollouts "${N_ROLLOUTS}" --headless \
             --seed "${SEED}" "${VIDEO_ARGS[@]}" "${RES_ARGS[@]}" \
-            --clip_class "${CLIP_CLASS}" --clip_name "${clip}" env.dataset_root="${DATA_BASE}" \
+            --clip_class "${CLIP_CLASS}" --clip_name "${clip}" \
             --video_name_prefix "${NEW_PREFIX}"
 
         # ── PASS 2/2 — SAME rollout, PREVIOUS camera angle. Identical seed / checkpoint / clip and
         #    a deterministic policy, so this re-simulates the same trajectory; only
         #    cfg.viewer.eye/lookat differ. Separate mp4 AND separate CSV.
         if [[ "${VIDEO}" -eq 1 && "${TWO_CAM}" -eq 1 ]]; then
-            echo "[eval-sonic] pass 2/2 — PREVIOUS camera (yaw 45 / elev 0 / root-aimed) → ${OLD_PREFIX}-step-0.mp4"
+            echo "[eval-sonic-mppi] pass 2/2 — PREVIOUS camera (yaw 45 / elev 0 / root-aimed) → ${OLD_PREFIX}-step-0.mp4"
             "${PY}" scripts/skrl/rollout.py \
                 --task "${TASK}" --checkpoint "${CKPT_FILE}" \
                 --output_dir "${OUT_DIR}" --n_rollouts "${N_ROLLOUTS}" --headless \
                 --seed "${SEED}" "${VIDEO_ARGS[@]}" "${RES_ARGS[@]}" \
-                --clip_class "${CLIP_CLASS}" --clip_name "${clip}" env.dataset_root="${DATA_BASE}" \
+                --clip_class "${CLIP_CLASS}" --clip_name "${clip}" \
                 --cam_preset old \
                 --video_name_prefix "${OLD_PREFIX}" --metrics_name "${OLD_METRICS}"
         fi
@@ -174,15 +182,15 @@ for clip in "${CLIPS[@]}"; do
         "${PY}" scripts/benchmark/parahome/compose_side_by_side.py \
             --dir "${OUT_DIR}" --left_prefix "${NEW_PREFIX}" --right_prefix "${OLD_PREFIX}" \
             --left_metrics metrics.csv --right_metrics "${OLD_METRICS}" \
-            || echo "[eval-sonic] WARNING: compose failed; the two single-view mp4s are still on disk."
+            || echo "[eval-sonic-mppi] WARNING: compose failed; the two single-view mp4s are still on disk."
     fi
 done
 
 # ── Aggregate metrics ─────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "[eval-sonic] Aggregating metrics under ${DATA_BASE} ..."
+echo "[eval-sonic-mppi] Aggregating metrics under ${DATA_BASE} ..."
 bash "${SCRIPT_DIR}/../evaluate.bash" "${DATA_BASE}"
 echo ""
-echo "[eval-sonic] Done.  → ${DATA_BASE}/g1_shadow_sonic_residual/method{1,2,3}.csv"
+echo "[eval-sonic-mppi] Done.  → ${DATA_BASE}/g1_shadow_sonic_residual_mppi/method{1,2,3}.csv"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

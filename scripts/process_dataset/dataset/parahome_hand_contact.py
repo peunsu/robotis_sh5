@@ -126,6 +126,9 @@ def main():
     ap.add_argument("--normal-source", choices=("surface", "to-hand"), default="surface",
                     help="접촉 방향을 물체 메시의 표면 법선에서 얻을지(surface, 기본), "
                          "표면점→손 정점 방향에서 얻을지(to-hand, 이전 동작).")
+    ap.add_argument("--out-name", default="hand_contact.npz",
+                    help="클립 폴더 안의 출력 파일 이름. monodex MPPI 는 to-hand 맵을 쓰므로 "
+                         "hand_contact_tohand.npz 처럼 따로 써서 env 가 읽는 surface 맵을 건드리지 않는다.")
     ap.add_argument("--use-velocity-gate", action="store_true",
                     help="also require the object to be moving (old behavior); default OFF (DexMachina geometric-only)")
     args = ap.parse_args()
@@ -201,7 +204,7 @@ def main():
             continue
         mask[t], target[t], normal[t], n_contacts_log[t] = fc
 
-    out = clip_dir / "0" / "hand_contact.npz"
+    out = clip_dir / "0" / args.out_name
     # normal_source is recorded so a consumer can tell which convention a file was written with.
     np.savez(out, link_names=np.array(link_names), mask=mask,
              target=target.astype(np.float32), normal=normal.astype(np.float32),
