@@ -370,8 +370,10 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
     # 조작 물체의 질량 출처 (2026-09-29). "usd": 변환기가 USD 에 구운 질량(기본 0.5 kg)을 그대로.
     # "density": USD 질량을 0 으로 지우고 object_density 를 준다 — PhysX 가 충돌체 부피 × 밀도로 질량을 낸다
     # (USD MassAPI 는 mass > 0 이면 density 보다 우선하므로 mass 를 0 으로 지워야 density 가 쓰인다).
-    object_mass_source: str = "usd"  # "usd" | "density"
+    # "mass": USD 질량 대신 object_mass 를 준다 (관성·무게중심은 PhysX 가 충돌체에서 이 질량에 맞춰 낸다).
+    object_mass_source: str = "usd"  # "usd" | "density" | "mass"
     object_density: float = 1000.0  # kg/m^3, object_mass_source="density" 일 때 (monodex MuJoCo 기본값과 같음)
+    object_mass: float = 0.5  # kg, object_mass_source="mass" 일 때
 
     # ---- RSI / 시작 프레임 샘플링 ----
     use_rsi: bool = True  # False 면 항상 frame 0 레퍼런스 자세에서 시작
@@ -426,7 +428,7 @@ class G1ShadowSonicResidualEnvCfg(DirectRLEnvCfg):
 
     # ---- CWS 접촉 렌치 보상 ----
     contact_reward_mode: str = "cws"  # "cws" | "force" | "both"
-    rew_cws: float = 1.00 # 0.50  # CWS 보상 가중치
+    rew_cws: float = 0.50  # CWS 보상 가중치
     cws_beta: float = 0.1  # 로봇 렌치가 사람의 (1±beta)배 안이면 만점
     cws_v: float = 0.1  # 부족/과잉 벌점 세기
     cws_n_dir: int = 512  # 비교 방향 수 (논문 값)
@@ -472,12 +474,13 @@ class G1ShadowSonicResidualMppiEnvCfg(G1ShadowSonicResidualEnvCfg):
       hand_pretrain_subdir     MPPI 결과 트리 g1_shadow_hand_mppi
       sonic_hand_residual_base 실제 관절각(finger_qpos). MPPI 의 finger_target 은 MuJoCo 위치 액추에이터
                                (강성 300) 목표라, 이 env 의 손가락 PD(강성 1.0) 목표와 뜻이 다르다.
-      object_mass_source       밀도 1000 kg/m^3 — MPPI 가 물체 질량을 이 밀도로 낸다 (USD 의 0.5 kg 이 아니다).
+      object_mass_source       모든 물체 고정 질량 0.3 kg (2026-09-30). 밀도로 두면 스캔 충돌체 부피에 따라
+                               knife 0.12 kg ~ book 약 2 kg 으로 흔들린다. MPPI(MuJoCo) 쪽은 밀도 1000 그대로다.
     """
 
     stage1_hand_source: str = "mppi"
     hand_pretrain_subdir: str = "g1_shadow_hand_mppi"
     sonic_hand_residual_base: str = "hand_pretrain_qpos"
-    object_mass_source: str = "density"
-    object_density: float = 1000.0
+    object_mass_source: str = "mass"
+    object_mass: float = 0.3
 

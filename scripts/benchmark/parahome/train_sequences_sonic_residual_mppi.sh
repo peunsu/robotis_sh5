@@ -10,8 +10,8 @@
 # Isaac hand's tendon moves it (J0 = 1.142 J1). No RL is trained for stage 1; one MPPI run per clip
 # (~7-18 min on an RTX 5090; ParaHome furniture CoACD is cached after the first clip that uses it).
 #   Task: Robotis-G1-Shadow-Locomanip-SonicResidual-Mppi-Direct-v0 (G1ShadowSonicResidualMppiEnvCfg:
-#   stage-1 tree g1_shadow_hand_mppi, residual base = the MPPI joint angles, object mass from
-#   density 1000 kg/m^3 as in MPPI).
+#   stage-1 tree g1_shadow_hand_mppi, residual base = the MPPI joint angles, object mass fixed at 0.3 kg;
+#   MPPI itself keeps monodex's density 1000 kg/m^3).
 #
 # Per clip:
 #   1. Verify the processed SMPL-X clip exists; add smplx_joints / fingertip_pad_pos if it was processed
@@ -25,10 +25,8 @@
 #           (the MPPI reward was tuned on to-hand normals; the surface file above stays as it is)
 #        b. monodex launch.py (conda env retargeting) → g1_shadow_hand_mppi/_runs/... (stages 1-5); its log is
 #           shown live and kept in <clip>/0/mppi.log
-#        c. export_mppi_hand_traj.py → hand_traj_best.npz + hand_traj_best_metrics.json
-#           A run that misses the monodex success rule (object within 5 cm throughout, rotation p90
-#           < 25 deg) is kept as hand_traj_best.failed.npz, so the env falls back to the SMPL-X hand
-#           targets for that clip (MPPI_KEEP_FAILED=1 uses it anyway).
+#        c. export_mppi_hand_traj.py → hand_traj_best.npz + hand_traj_best_metrics.json (object tracking
+#           error, for inspection). Every MPPI run is used for stage 2; there is no pass/fail gate.
 #        d. VIDEO_MPPI=1: mppi_refine.mp4 (kinematic reference | MPPI rollout, object camera)
 #        e. stage1_hand_contact.py (env_isaaclab) → hand_contact_stage1.npz (the MPPI hands' contacts)
 #   6. Train stage 2 → g1_shadow_sonic_residual_mppi/<class>/<clip>/0/agent.pt
@@ -43,7 +41,7 @@
 #
 # Which clips run: edit CLIPS=(...) (comment lines to filter) or CLIPS_OVERRIDE="a b c".
 # Env vars: FORCE=1 (re-run all), FORCE_MPPI=1 (re-run only step 5), SKIP_RETARGET=1, SKIP_TRAIN=1 (steps 1-5
-#   only), MPPI_KEEP_FAILED=1, VIDEO_MPPI=0, CLIP_CLASS=..., CLIPS_OVERRIDE="a b c", NUM_ENVS / TIMESTEPS,
+#   only), VIDEO_MPPI=0, CLIP_CLASS=..., CLIPS_OVERRIDE="a b c", NUM_ENVS / TIMESTEPS,
 #   VIDEO=1, PY / PY_PYROKI / PY_RETARGET / MONODEX_ROOT.
 # =============================================================================
 set -euo pipefail
@@ -58,7 +56,6 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/local_paths.sh"
 require_local_path PY PY_PYROKI PY_RETARGET MONODEX_ROOT
 SKIP_RETARGET="${SKIP_RETARGET:-0}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
-MPPI_KEEP_FAILED="${MPPI_KEEP_FAILED:-0}"
 VIDEO_MPPI="${VIDEO_MPPI:-1}"
 
 # Set VIDEO=1 to record a training mp4 every VIDEO_INTERVAL steps.
@@ -214,11 +211,11 @@ for clip in "${CLIPS[@]}"; do
 
     # ── Step 5: MPPI hand refine → g1_shadow_hand_mppi/<class>/<clip>/0/ ─────
     RUN_DIR="${MPPI_RUNS}/shadow_hand/bimanual/${clip}/PARAHOME/default/${MPPI_ID}"
-    if [[ ( -f "${S1_TRAJ}" || -f "${S1_DIR}/hand_traj_best.failed.npz" ) && "${FORCE_MPPI}" -eq 0 ]]; then
+    if [[ -f "${S1_TRAJ}" && "${FORCE_MPPI}" -eq 0 ]]; then
         echo "[sonic-mppi] Step 5/6 — MPPI refine exists — skipping.  ${S1_DIR}"
     else
         mkdir -p "${S1_DIR}"
-        rm -f "${S1_TRAJ}" "${S1_DIR}/hand_traj_best.failed.npz" "${S1_DIR}/hand_contact_stage1.npz"
+        rm -f "${S1_TRAJ}" "${S1_DIR}/hand_contact_stage1.npz"
         echo "[sonic-mppi] Step 5/6 a — to-hand contact map (env_isaaclab) → hand_contact_tohand.npz"
         "${PY}" scripts/process_dataset/dataset/parahome_hand_contact.py --class "${CLIP_CLASS}" --clip "${clip}" \
             --normal-source to-hand --out-name hand_contact_tohand.npz
@@ -232,15 +229,6 @@ for clip in "${CLIPS[@]}"; do
         echo "[sonic-mppi] Step 5/6 c — export → ${S1_TRAJ}"
         "${PY_RETARGET}" scripts/process_dataset/retarget/export_mppi_hand_traj.py --run-dir "${RUN_DIR}" --out "${S1_TRAJ}" \
             || { echo "[sonic-mppi] ERROR: export failed; skipping clip."; continue; }
-        if ! "${PY}" -c "import json,sys; sys.exit(0 if json.load(open('${S1_DIR}/hand_traj_best_metrics.json'))['success'] else 1)"; then
-            if [[ "${MPPI_KEEP_FAILED}" -eq 1 ]]; then
-                echo "[sonic-mppi] WARN: MPPI misses the success rule — kept anyway (MPPI_KEEP_FAILED=1)."
-            else
-                mv "${S1_TRAJ}" "${S1_DIR}/hand_traj_best.failed.npz"
-                echo "[sonic-mppi] WARN: MPPI misses the success rule — kept as hand_traj_best.failed.npz; stage 2 of"
-                echo "             this clip falls back to the SMPL-X hand targets (MPPI_KEEP_FAILED=1 to use it)."
-            fi
-        fi
         if [[ "${VIDEO_MPPI}" -eq 1 ]]; then
             echo "[sonic-mppi] Step 5/6 d — MPPI video → ${S1_DIR}/mppi_refine.mp4"
             ( cd "${MONODEX_ROOT}/retargeting" && MUJOCO_GL=egl "${PY_RETARGET}" tools/render_run.py \

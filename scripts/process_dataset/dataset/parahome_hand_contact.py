@@ -17,6 +17,10 @@ MandiZhao/dexmachina retargeting/map_contacts.py), adapted to be INDEPENDENT of 
      + target (F,L,3) = mean world position of that link's OBJECT contacts (on the object surface, i.e. WHERE
      the robot link should touch). The retarget pulls each in-contact robot link there.
 
+HUMOTO (PROXY_DATASETS): 물체가 artist-made 메시라 3·4 단계를 contact_proxy.py 의 proxy 로 한다 — 손 정점마다
+proxy 최근접점, 실제 표면까지 gamma 안이면 접촉점, 링크는 그 점에서 가장 가까운 손 정점 (위와 같은 규칙).
+proxy 는 contact_proxy.py --dataset humoto 로 먼저 만든다. 기존 정점 기준 파일은 hand_contact_vertex_backup.npz 로 옮긴다.
+
 Runs in env_isaaclab (needs smplx + torch + trimesh):
     python scripts/process_dataset/dataset/parahome_hand_contact.py \
         --clip s100_seg00_pan [--class single_rigid] [--gamma 0.015] [--num-contacts 50]
@@ -38,6 +42,9 @@ _SMPLX_MODEL_DIR = dataset_paths.SMPLX_MODEL_DIR
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 _FPS = 30.0
+# 접촉 기하를 contact proxy 로 계산하는 데이터셋 (artist-made 메시; contact_proxy.py 참조). 나머지는 물체 정점 기준 그대로.
+PROXY_DATASETS = ("humoto",)
+BACKUP_SUFFIX = "_vertex_backup"   # proxy 로 바꿀 때 기존(정점 기준) 파일을 이 이름으로 옮겨 둔다
 _OBJ_LINVEL_TH, _OBJ_ANGVEL_TH = 0.05, 0.25
 
 
@@ -184,9 +191,14 @@ def main():
     dotq = np.abs((oq[:-1] * oq[1:]).sum(-1)).clip(0, 1)
     ang = np.zeros(F); ang[:-1] = 2 * np.arccos(dotq) * _FPS
     vel = (spd > _OBJ_LINVEL_TH) | (ang > _OBJ_ANGVEL_TH)
-    mesh = trimesh.load(str(dataset_paths.object_mesh(args.dataset, obj_name)), process=False, force="mesh")
-    V = np.asarray(mesh.vertices, np.float64)
-    VN = np.asarray(mesh.vertex_normals, np.float64)                # (n_objv,3) object-LOCAL outward normals
+    use_proxy = args.dataset in PROXY_DATASETS
+    if use_proxy:
+        import contact_proxy as CP                                  # artist-made 메시: 손 정점 → proxy 최근접점
+        proxy = CP.ContactProxy(dataset_paths.contact_proxy_dir(args.dataset, obj_name))
+    else:
+        mesh = trimesh.load(str(dataset_paths.object_mesh(args.dataset, obj_name)), process=False, force="mesh")
+        V = np.asarray(mesh.vertices, np.float64)
+        VN = np.asarray(mesh.vertex_normals, np.float64)            # (n_objv,3) object-LOCAL outward normals
 
     from scipy.spatial import cKDTree
     L = len(link_names)
@@ -198,20 +210,39 @@ def main():
             continue
         R = _quat2R(oq[t])                                         # object local→world rotation
         # 프레임 코어는 frame_contacts (아래) — 1단계 맵 스크립트와 공유
-        fc = frame_contacts(verts[t], hand_v_link, V, VN, R, op[t], L,
-                            args.gamma, args.num_contacts, args.normal_source)
+        if use_proxy:
+            fc = CP.frame_contacts(verts[t], hand_v_link, proxy, R, op[t], L, args.gamma, args.num_contacts,
+                                   args.normal_source, _farthest_point_sample)
+        else:
+            fc = frame_contacts(verts[t], hand_v_link, V, VN, R, op[t], L,
+                                args.gamma, args.num_contacts, args.normal_source)
         if fc is None:
             continue
         mask[t], target[t], normal[t], n_contacts_log[t] = fc
 
     out = clip_dir / "0" / args.out_name
+    method = "proxy" if use_proxy else "vertex"
+    if use_proxy and out.exists():
+        # 덮어쓰지 않는다: 정점 기준으로 만든 기존 파일은 <이름>_vertex_backup.npz 로 옮긴다. 이미 proxy 로 만든
+        # 파일이면(다시 실행) 그대로 새로 쓴다. 백업이 이미 있는데 또 정점 기준 파일이 있으면 멈춘다.
+        prev = np.load(out, allow_pickle=True)
+        prev_method = str(prev["contact_method"]) if "contact_method" in prev.files else "vertex"
+        prev.close()
+        if prev_method != "proxy":
+            bak = out.with_name(out.stem + BACKUP_SUFFIX + out.suffix)
+            if bak.exists():
+                raise SystemExit(f"[hand-contact] {bak} 가 이미 있어 {out} 을 백업할 수 없습니다 — 확인 후 옮기세요")
+            out.rename(bak)
+            print(f"[hand-contact] 기존 정점 기준 맵 백업: {out.name} -> {bak.name}")
     # normal_source is recorded so a consumer can tell which convention a file was written with.
     np.savez(out, link_names=np.array(link_names), mask=mask,
              target=target.astype(np.float32), normal=normal.astype(np.float32),
-             normal_source=np.array(args.normal_source))
+             normal_source=np.array(args.normal_source),
+             **({"contact_method": np.array(method)} if use_proxy else {}))   # 키가 없으면 정점 기준
     nfire = (mask.sum(0) > 0)
     active = n_contacts_log[n_contacts_log > 0]
-    print(f"[hand-contact/OptionA] {args.clip}: obj={obj_name}  gamma={args.gamma}  vel_gate={args.use_velocity_gate}")
+    print(f"[hand-contact/OptionA] {args.clip}: obj={obj_name}  gamma={args.gamma}  vel_gate={args.use_velocity_gate}  "
+          f"geometry={method}")
     print(f"[hand-contact] frames with contact: {int((n_contacts_log>0).sum())}/{F}  "
           f"obj-contacts/frame(when any): mean {active.mean():.0f} max {int(active.max()) if active.size else 0} "
           f"(cap {args.num_contacts})" if active.size else "[hand-contact] NO contact frames — loosen --gamma")

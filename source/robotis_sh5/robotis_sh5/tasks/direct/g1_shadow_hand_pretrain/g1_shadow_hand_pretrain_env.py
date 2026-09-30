@@ -339,11 +339,16 @@ class G1ShadowHandPretrainEnv(DirectRLEnv):
         if not os.path.exists(usd):
             return   # converted USD not built yet → object stays inert (robot-only kinematic path)
         p0 = self._np_obj_base[0]
-        # cfg.object_mass_source: "usd" 는 USD 에 구운 질량 그대로, "density" 는 USD 질량을 지우고 밀도로 (cfg 주석)
-        if cfg.object_mass_source not in ("usd", "density"):
-            raise ValueError(f"object_mass_source must be 'usd' or 'density', got {cfg.object_mass_source!r}")
-        mass_props = (sim_utils.MassPropertiesCfg(mass=0.0, density=float(cfg.object_density))
-                      if cfg.object_mass_source == "density" else None)
+        # cfg.object_mass_source: "usd" 는 USD 에 구운 질량 그대로, "density" 는 USD 질량을 지우고 밀도로,
+        # "mass" 는 USD 질량을 object_mass 로 바꾼다 (cfg 주석)
+        if cfg.object_mass_source == "usd":
+            mass_props = None
+        elif cfg.object_mass_source == "density":
+            mass_props = sim_utils.MassPropertiesCfg(mass=0.0, density=float(cfg.object_density))
+        elif cfg.object_mass_source == "mass":
+            mass_props = sim_utils.MassPropertiesCfg(mass=float(cfg.object_mass))
+        else:
+            raise ValueError(f"object_mass_source must be 'usd', 'density' or 'mass', got {cfg.object_mass_source!r}")
         self._object_cfg = RigidObjectCfg(
             prim_path="/World/envs/env_.*/Object",
             spawn=sim_utils.UsdFileCfg(
@@ -563,8 +568,8 @@ class G1ShadowHandPretrainEnv(DirectRLEnv):
         view = self._object.root_physx_view
         m = float(view.get_masses()[0].reshape(-1)[0])
         inert = view.get_inertias()[0].reshape(-1)[[0, 4, 8]].tolist()
-        src = (f"density {self.cfg.object_density:g} kg/m^3" if self.cfg.object_mass_source == "density"
-               else "USD mass")
+        src = {"density": f"density {self.cfg.object_density:g} kg/m^3",
+               "mass": f"object_mass {self.cfg.object_mass:g} kg"}.get(self.cfg.object_mass_source, "USD mass")
         print(f"[object-mass] {self._obj_name}: {m:.4f} kg from {src}; "
               f"inertia diag {[round(x, 6) for x in inert]} kg m^2")
 
@@ -2229,14 +2234,20 @@ class G1ShadowHandPretrainEnv(DirectRLEnv):
                 cand_state = self._pend_state[rows[sel[:, 0]], sel[:, 1]]    # (K,_STATE_DIM)
                 cand_frame = self._pend_frame[rows[sel[:, 0]], sel[:, 1]]    # (K,)
                 cand_r = cand_state[:, 0]
-                # per frame: best candidate in this flush, then the usual "only if better" vs cache
-                for uf in torch.unique(cand_frame):
-                    m = cand_frame == uf
-                    j = cand_r[m].argmax()
-                    best = cand_state[m][j]
-                    if best[0] > self._state_cache[uf, 0]:
-                        self._state_cache[uf] = best
-                        self._init_flg[uf] = False
-                        self._reached_frame = max(self._reached_frame, int(uf.item()))
+                # 프레임마다 이번 flush 의 최고 후보(동점이면 앞의 것 = argmax 와 같음)를 고르고,
+                # 캐시보다 좋을 때만 쓴다. 프레임별 루프(프레임마다 GPU 동기화 3~4회) 대신 scatter 로 한 번에 계산한다.
+                n_f, n_k = self._state_cache.shape[0], cand_r.shape[0]
+                best_r = torch.full((n_f,), float("-inf"), device=cand_r.device, dtype=cand_r.dtype)
+                best_r = best_r.scatter_reduce(0, cand_frame, cand_r, reduce="amax", include_self=True)
+                k_idx = torch.arange(n_k, device=cand_r.device)
+                first = torch.full((n_f,), n_k, device=cand_r.device, dtype=torch.long).scatter_reduce(
+                    0, cand_frame, torch.where(cand_r == best_r[cand_frame], k_idx, n_k),
+                    reduce="amin", include_self=True)
+                win = (first < n_k) & (best_r > self._state_cache[:, 0])
+                if bool(win.any()):
+                    wf = torch.nonzero(win).squeeze(-1)
+                    self._state_cache[wf] = cand_state[first[wf]]
+                    self._init_flg[wf] = False
+                    self._reached_frame = max(self._reached_frame, int(wf.max()))
         # clear staging for ALL terminating envs (kept or dropped) so the next episode starts clean
         self._pend_valid[env_ids] = False

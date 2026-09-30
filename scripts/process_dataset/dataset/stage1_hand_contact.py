@@ -1,6 +1,7 @@
 """1단계(hand pretrain) 롤아웃 → 32링크 접촉 맵 (hand_contact_stage1.npz).  [stage1-contact-map]
 
-사람 접촉 맵(parahome_hand_contact.py)과 같은 방식·같은 코어(frame_contacts)로 만든다:
+사람 접촉 맵(parahome_hand_contact.py)과 같은 방식·같은 코어(frame_contacts)로 만든다 (HUMOTO 는 사람 맵처럼
+contact proxy: contact_proxy.frame_contacts, 손 점은 링크 표면 샘플 — load_link_surface_samples):
   물체 정점마다 가장 가까운 손 표면 점을 찾아 gamma 안이면 접촉 → FPS 로 num_contacts 개 이하 → 링크별 평균 위치·평균 법선.
 차이는 손 표면 점의 출처만이다. SMPL-X 정점 대신 Shadow 링크 시각 메시(URDF <visual>, origin 적용) 정점을,
 롤아웃에 기록된 시뮬레이션 링크 자세(link_pos/link_quat; rollout.py --dump_hand_traj)로 월드에 놓는다.
@@ -35,7 +36,7 @@ import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from parahome_hand_contact import (  # noqa: E402  같은 코어·같은 상수
-    _OBJ_ANGVEL_TH, _OBJ_LINVEL_TH, _quat2R, frame_contacts,
+    PROXY_DATASETS, _OBJ_ANGVEL_TH, _OBJ_LINVEL_TH, _farthest_point_sample, _quat2R, frame_contacts,
 )
 import dataset_paths  # noqa: E402
 
@@ -85,6 +86,45 @@ def load_link_meshes(urdf_path: str, link_names: list[str]) -> dict[str, np.ndar
     return out
 
 
+def load_link_surface_samples(urdf_path: str, link_names: list[str], spacing: float) -> dict[str, np.ndarray]:
+    """load_link_meshes 와 같은 메시·같은 scale/origin, 정점 대신 표면을 고르게 뽑은 점 (+정점). proxy 경로 전용.
+
+    proxy 방식은 손 점이 접촉 후보라 손 점 밀도가 곧 접촉 밀도다. Shadow 시각 메시도 CAD 라 넓은 면은 꼭짓점만 있다
+    (손바닥 모서리 최대 80 mm, 표면→가장 가까운 정점 최대 15 mm) → 정점만 쓰면 막대 같은 물체를 면 가운데로 누를 때
+    후보가 없다. 시드 고정이라 같은 URDF 면 같은 점."""
+    root = ET.parse(urdf_path).getroot()
+    links = {l.get("name"): l for l in root.iter("link")}
+    out = {}
+    for n in link_names:
+        if n not in links:
+            raise KeyError(f"URDF 에 링크 {n} 이 없습니다: {urdf_path}")
+        pts = []
+        for v in links[n].findall("visual"):
+            m = v.find("geometry/mesh")
+            if m is None:
+                continue
+            fn = m.get("filename")
+            fn = fn[len("file://"):] if fn.startswith("file://") else fn
+            if not os.path.isabs(fn):
+                fn = str(Path(urdf_path).parent / fn)
+            mesh = trimesh.load(fn, process=False, force="mesh")
+            mesh.merge_vertices()
+            if m.get("scale"):
+                mesh.apply_scale([float(x) for x in m.get("scale").split()])
+            S, _ = trimesh.sample.sample_surface(mesh, max(1, int(np.ceil(mesh.area / spacing ** 2))), seed=0)
+            V = np.concatenate([np.asarray(mesh.vertices, np.float64), np.asarray(S, np.float64)], 0)
+            o = v.find("origin")
+            if o is not None:
+                xyz = np.array([float(x) for x in (o.get("xyz") or "0 0 0").split()])
+                rpy = [float(x) for x in (o.get("rpy") or "0 0 0").split()]
+                V = V @ _rpy2R(*rpy).T + xyz
+            pts.append(V)
+        if not pts:
+            raise ValueError(f"링크 {n} 에 시각 메시가 없습니다")
+        out[n] = np.concatenate(pts, 0)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
@@ -98,6 +138,8 @@ def main() -> None:
     ap.add_argument("--pad-check-max-mm", type=float, default=10.0, help="pad↔distal 메시 표면 거리 중앙값 상한 (초과 시 exit 3)")
     ap.add_argument("--skip-pad-check", action="store_true")
     ap.add_argument("--force-thresh", type=float, default=1.0, help="검증용: 1단계 접촉력 임계 (N)")
+    ap.add_argument("--hand-sample-spacing", type=float, default=0.0025,
+                    help="proxy 경로(HUMOTO)에서 손 링크 표면 샘플 간격 (m). 정점 경로에는 쓰지 않는다.")
     args = ap.parse_args()
 
     hd = np.load(args.hand_traj, allow_pickle=True)
@@ -119,14 +161,23 @@ def main() -> None:
     oq = np.asarray(hd["obj_quat"], np.float64)      # (T,4)   wxyz
     assert lp.shape == (T, L, 3) and lq.shape == (T, L, 4) and op.shape == (T, 3), (lp.shape, lq.shape, op.shape)
 
-    meshes = load_link_meshes(args.urdf, link_names)
+    # HUMOTO (PROXY_DATASETS): 사람 맵과 같이 contact proxy 로 접촉을 계산한다 (contact_proxy.py). 손 점은 링크 표면 샘플.
+    use_proxy = args.dataset in PROXY_DATASETS
+    meshes = (load_link_surface_samples(args.urdf, link_names, args.hand_sample_spacing) if use_proxy
+              else load_link_meshes(args.urdf, link_names))
     hand_local = [meshes[n] for n in link_names]
     hand_link = np.concatenate([np.full(len(v), i, np.int64) for i, v in enumerate(hand_local)])
     H = int(hand_link.shape[0])
-    obj_mesh = trimesh.load(str(dataset_paths.object_mesh(args.dataset, obj)), process=False, force="mesh")
-    V = np.asarray(obj_mesh.vertices, np.float64)
-    VN = np.asarray(obj_mesh.vertex_normals, np.float64)           # object-LOCAL outward normals (사람 맵과 동일)
-    print(f"[stage1-contact] {args.hand_traj}\n    롤아웃 {T} 행 @ {fps:.0f} Hz, 물체 {obj} ({len(V)} 정점), "
+    if use_proxy:
+        import contact_proxy as CP
+        proxy = CP.ContactProxy(dataset_paths.contact_proxy_dir(args.dataset, obj))
+        geo = f"contact proxy {len(proxy.m.faces)} 면, 손 점 = 링크 표면 샘플 {args.hand_sample_spacing * 1000:.1f} mm + 정점"
+    else:
+        obj_mesh = trimesh.load(str(dataset_paths.object_mesh(args.dataset, obj)), process=False, force="mesh")
+        V = np.asarray(obj_mesh.vertices, np.float64)
+        VN = np.asarray(obj_mesh.vertex_normals, np.float64)       # object-LOCAL outward normals (사람 맵과 동일)
+        geo = f"{len(V)} 정점, 손 점 = 링크 메시 정점"
+    print(f"[stage1-contact] {args.hand_traj}\n    롤아웃 {T} 행 @ {fps:.0f} Hz, 물체 {obj} ({geo}), "
           f"손 표면 점 {H} (링크 {L}, URDF {os.path.basename(args.urdf)}), gamma {args.gamma*100:.1f} cm, FPS 상한 {args.num_contacts}")
 
     def hand_world(t: int) -> np.ndarray:
@@ -171,6 +222,12 @@ def main() -> None:
             continue
         hw = hand_world(t)
         R = _quat2R(oq[t])
+        if use_proxy:
+            fc = CP.frame_contacts(hw, hand_link, proxy, R, op[t], L, args.gamma, args.num_contacts,
+                                   args.normal_source, _farthest_point_sample)
+            if fc is not None:
+                mask[t], tgt_w[t], nrm[t], ncon[t] = fc
+            continue
         # 손 주변 상자(gamma 여유) 밖의 물체 정점은 어떤 손 점과도 gamma 안에 있을 수 없다 → 미리 걸러 속도만 높인다 (결과 동일).
         Vw_all = V @ R.T + op[t]
         lo, hi = hw.min(0) - args.gamma, hw.max(0) + args.gamma
@@ -193,7 +250,9 @@ def main() -> None:
              coord=np.array("object"), normal_source=np.array(args.normal_source), control_fps=np.array(fps),
              obj_pose_source=np.array("stage1"), gamma=np.array(args.gamma), num_contacts=np.array(args.num_contacts),
              velocity_gate=np.array(bool(args.use_velocity_gate)),
-             source_hand_traj=np.array(os.path.abspath(args.hand_traj)), urdf=np.array(os.path.abspath(args.urdf)))
+             source_hand_traj=np.array(os.path.abspath(args.hand_traj)), urdf=np.array(os.path.abspath(args.urdf)),
+             **({"contact_method": np.array("proxy"), "hand_sample_spacing": np.array(args.hand_sample_spacing)}
+                if use_proxy else {}))                                    # 키가 없으면 정점 기준
     m = mask > 0.5
     print(f"    → {out}\n    {time.time() - t0:.0f} s; 접촉 프레임 {int(m.any(1).sum())}/{T}, 프레임당 접촉 링크 {m.sum(1).mean():.1f}, "
           f"프레임당 접촉 정점(FPS 후) 평균 {ncon[ncon > 0].mean() if (ncon > 0).any() else 0:.0f}")

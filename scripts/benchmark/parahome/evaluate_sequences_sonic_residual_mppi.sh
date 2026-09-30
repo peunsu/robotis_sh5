@@ -5,7 +5,7 @@
 #
 # evaluate_sequences_sonic_residual.sh for the MPPI stage-1 variant: task
 # Robotis-G1-Shadow-Locomanip-SonicResidual-Mppi-Direct-v0 (the env loads the same MPPI hand targets,
-# residual base and density object mass as in training) and the g1_shadow_sonic_residual_mppi tree.
+# residual base and 0.3 kg object mass as in training) and the g1_shadow_sonic_residual_mppi tree.
 # Everything below is unchanged from that script. rollout.py never arms the RSI warm-start, so
 # evaluation runs the policy with vanilla frame-0 resets (same protocol as the
 # other variants). The frozen SONIC base + the per-clip sonic_smpl_50fps.npz /

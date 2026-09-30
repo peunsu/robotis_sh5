@@ -20,6 +20,8 @@ Context objects are drawn at their FRAME-0 pose, matching how the env spawns the
 at frame 0 — g1_shadow_sonic_residual_env.py:490-496). The manipulated object is drawn per frame.
 
 CPU/GPU-agnostic offscreen render via pyrender's EGL/OSMesa backend — NO Isaac Sim.
+--cpu renders on the CPU (Mesa llvmpipe through EGL; safe next to a training run — no GPU context).
+--dataset grab|omomo renders those datasets' processed clips (GRAB: subject template mesh, table context).
 Run with an interpreter that has smplx + torch + pyrender + trimesh:
     /home/peunsu/anaconda3/envs/env_isaaclab/bin/python
 
@@ -27,6 +29,7 @@ Run with an interpreter that has smplx + torch + pyrender + trimesh:
     ... render_clip_gt.py --clip a --clip b --clip c        # several
     ... render_clip_gt.py --class single_rigid --all        # every clip in a class
     ... render_clip_gt.py --clip x --out /tmp/x.mp4 --fps 30 --size 1280x720
+    ... render_clip_gt.py --dataset grab --clip s1_cup_pour_1 --cpu
 """
 
 from __future__ import annotations
@@ -36,7 +39,12 @@ import json
 import os
 from pathlib import Path
 
+import sys
+
 import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "dataset"))
+import dataset_paths  # noqa: E402
 
 # pyrender needs a headless GL backend chosen BEFORE it is imported.
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -44,8 +52,8 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 _ROOT = Path(__file__).resolve().parents[3]
 _DATA = _ROOT / "source" / "robotis_sh5" / "data"
 _SMPLX_DIR = _ROOT / "models_smplx_v1_1" / "models"      # same location parahome.py uses
-_SCAN = _DATA / "raw" / "parahome" / "data" / "scan"
-_PROC = _DATA / "processed" / "parahome" / "smplx"
+_PROC = _DATA / "processed" / "parahome" / "smplx"      # --dataset replaces it
+_DATASET = "parahome"
 
 BG = np.array([0.09, 0.10, 0.16])       # dark navy, matching the existing clip_viz.mp4
 C_BODY = (0.94, 0.85, 0.76, 1.0)        # skin
@@ -83,9 +91,15 @@ def smplx_vertices(npz, gender: str):
                          flat_hand_mean=True, num_betas=20, num_expression_coeffs=10,
                          batch_size=F)
     hp = np.asarray(npz["smplx_hand_pose"], np.float32)          # (F,90) = left45 | right45
+    # GRAB gives the subject's template mesh instead of betas (grab.py): template + zero betas.
+    if "smplx_v_template" in npz.files:
+        model.v_template = torch.as_tensor(npz["smplx_v_template"], dtype=torch.float32)
+        betas = np.zeros((F, 20), np.float32)
+    else:
+        betas = np.tile(npz["smplx_betas"][None], (F, 1))
     with torch.no_grad():
         out = model(
-            betas=torch.as_tensor(np.tile(npz["smplx_betas"][None], (F, 1)), dtype=torch.float32),
+            betas=torch.as_tensor(betas, dtype=torch.float32),
             global_orient=torch.as_tensor(npz["smplx_global_orient"], dtype=torch.float32),
             body_pose=torch.as_tensor(npz["smplx_body_pose"], dtype=torch.float32),
             left_hand_pose=torch.as_tensor(hp[:, :45], dtype=torch.float32),
@@ -97,7 +111,7 @@ def smplx_vertices(npz, gender: str):
 
 def load_scan(obj: str):
     import trimesh
-    p = _SCAN / obj / "simplified" / "base.obj"
+    p = dataset_paths.object_mesh(_DATASET, obj)     # ParaHome: raw scan; GRAB / OMOMO: processed mesh
     if not p.exists():
         return None
     return trimesh.load(str(p), force="mesh", process=False)
@@ -253,6 +267,8 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
 
     W, H = size
     r = pyrender.OffscreenRenderer(W, H)
+    from OpenGL.GL import GL_RENDERER, glGetString
+    print(f"  renderer: {glGetString(GL_RENDERER).decode()}")
     out_path = out_path or (clip_dir / "clip_viz.mp4")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(str(out_path), fps=fps, macro_block_size=1) as w:
@@ -278,6 +294,9 @@ def render_clip(clip: str, klass: str, out_path: Path | None, size, fps: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", choices=dataset_paths.DATASETS, default="parahome")
+    ap.add_argument("--cpu", action="store_true",
+                    help="render on the CPU (Mesa llvmpipe via EGL) — no GPU context, safe during training")
     ap.add_argument("--clip", action="append", default=[], help="clip name (repeatable)")
     ap.add_argument("--class", dest="klass", default="single_rigid")
     ap.add_argument("--all", action="store_true", help="every clip in --class")
@@ -299,6 +318,15 @@ def main() -> int:
     ap.add_argument("--ctx_radius", type=float, default=1.0)
     ap.add_argument("--ctx_support_radius", type=float, default=1.5)
     a = ap.parse_args()
+    global _PROC, _DATASET
+    _DATASET = a.dataset
+    _PROC = dataset_paths.processed_root(a.dataset) / "smplx"
+    if a.cpu:
+        # Mesa's EGL vendor only; its device 1 is the llvmpipe software renderer here (device 0 is the
+        # NVIDIA PCI device, which Mesa cannot drive). Set before pyrender (libEGL) is first imported.
+        os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+        os.environ.setdefault("EGL_DEVICE_ID", "1")
+        os.environ["PYOPENGL_PLATFORM"] = "egl"
 
     clips = a.clip
     if a.all:
